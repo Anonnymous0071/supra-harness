@@ -121,6 +121,11 @@ endif()
 
 include(cmake/CppSupra.cmake)
 
+# Shared test helpers, declared before the libraries that consume them.
+if(SUPRA_BUILD_TESTS)
+    add_subdirectory(cpp/testing)
+endif()
+
 supra_add_library_if_present(libsupra_width)   # T2
 supra_add_library_if_present(libsupra_ansi)    # T3
 supra_add_library_if_present(libsupra_sandbox) # T4

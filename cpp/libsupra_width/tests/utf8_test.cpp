@@ -9,7 +9,7 @@
 #include <string>
 
 #include "supra/width.h"
-#include "test_assert.hpp"
+#include "supra/testing.hpp"
 
 namespace {
 

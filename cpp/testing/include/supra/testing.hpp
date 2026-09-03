@@ -1,15 +1,17 @@
-// Minimal assertion helpers shared by the libsupra_width CTest executables.
+// Minimal assertion helpers shared by the C++20 library test suites.
 //
 // No test framework enters the dependency graph: these are plain executables
 // asserting on exit code. A framework would add a build dependency and a
-// compile-time cost for behaviour four macros already cover.
+// compile cost for behaviour four macros already cover.
+//
+// Extracted from cpp/libsupra_width/tests when libsupra_ansi became the second
+// consumer. Header-only INTERFACE target, so it links nothing.
 
-#ifndef SUPRA_WIDTH_TEST_ASSERT_HPP
-#define SUPRA_WIDTH_TEST_ASSERT_HPP
+#ifndef SUPRA_TESTING_HPP
+#define SUPRA_TESTING_HPP
 
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <string>
 
 namespace supra::test {
@@ -26,7 +28,8 @@ inline void report(bool ok, const char* file, int line, const std::string& detai
 }
 
 /// Render a byte string as escaped hex so failure output is diffable for
-/// non-ASCII input, where the raw bytes would be unreadable in a CI log.
+/// non-ASCII and escape-bearing input, where raw bytes would be unreadable in a
+/// CI log - and where an ESC would reprogram the log viewer's own terminal.
 inline std::string hex(const std::string& bytes) {
     static const char* digits = "0123456789ABCDEF";
     std::string out;
@@ -39,6 +42,28 @@ inline std::string hex(const std::string& bytes) {
         out.push_back('x');
         out.push_back(digits[byte >> 4]);
         out.push_back(digits[byte & 0x0F]);
+    }
+    return out;
+}
+
+/// Render bytes readably: ESC as `\e`, other controls as hex, printable ASCII
+/// as itself. Escape sequences are far easier to diagnose in this form than in
+/// pure hex, and it still cannot emit a live ESC into the log.
+inline std::string vis(const std::string& bytes) {
+    static const char* digits = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (const char signed_byte : bytes) {
+        const auto byte = static_cast<unsigned char>(signed_byte);
+        if (byte == 0x1B) {
+            out += "\\e";
+        } else if (byte >= 0x20 && byte < 0x7F) {
+            out.push_back(static_cast<char>(byte));
+        } else {
+            out += "\\x";
+            out.push_back(digits[byte >> 4]);
+            out.push_back(digits[byte & 0x0F]);
+        }
     }
     return out;
 }
@@ -64,13 +89,16 @@ inline int finish(const char* suite) {
 #define SUPRA_CHECK(cond)                                                      \
     ::supra::test::report((cond), __FILE__, __LINE__, "expected: " #cond)
 
+#define SUPRA_CHECK_MSG(cond, msg)                                             \
+    ::supra::test::report((cond), __FILE__, __LINE__, std::string(msg))
+
 #define SUPRA_CHECK_EQ(actual, expected)                                       \
     do {                                                                       \
         const auto supra_actual_ = (actual);                                   \
         const auto supra_expected_ = (expected);                               \
         ::supra::test::report(                                                 \
             supra_actual_ == supra_expected_, __FILE__, __LINE__,              \
-            std::string(#actual " == " #expected " (got ") +                    \
+            std::string(#actual " == " #expected " (got ") +                   \
                 std::to_string(supra_actual_) + ", want " +                    \
                 std::to_string(supra_expected_) + ")");                        \
     } while (false)
@@ -81,8 +109,18 @@ inline int finish(const char* suite) {
         const auto supra_expected_ = (expected);                               \
         ::supra::test::report(                                                 \
             supra_actual_ == supra_expected_, __FILE__, __LINE__,              \
-            std::string(msg) + " (got " + std::to_string(supra_actual_) +       \
+            std::string(msg) + " (got " + std::to_string(supra_actual_) +      \
                 ", want " + std::to_string(supra_expected_) + ")");            \
     } while (false)
 
-#endif  // SUPRA_WIDTH_TEST_ASSERT_HPP
+#define SUPRA_CHECK_STR_EQ(actual, expected, msg)                              \
+    do {                                                                       \
+        const std::string supra_a_ = (actual);                                 \
+        const std::string supra_b_ = (expected);                               \
+        ::supra::test::report(supra_a_ == supra_b_, __FILE__, __LINE__,         \
+                             std::string(msg) + " (got \"" +                   \
+                                 ::supra::test::vis(supra_a_) + "\", want \"" + \
+                                 ::supra::test::vis(supra_b_) + "\")");        \
+    } while (false)
+
+#endif  // SUPRA_TESTING_HPP

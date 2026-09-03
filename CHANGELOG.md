@@ -9,6 +9,34 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T3** `cpp/libsupra_ansi`: escape sequence parsing, SGR state, style-safe
+  truncation.
+  - Resumable state machine over the DEC STD 070 / VT500 grammar, covering the
+    cases a regex cannot: both OSC terminators (`ESC \` and `BEL`), colon
+    sub-parameters (`ESC[4:3m`, `ESC[38:2::255:0:0m`), 8-bit C1 introducers,
+    DCS/APC strings, and sequences split across chunk boundaries.
+  - `supra_ansi_plan_truncate` returns a plan rather than a copy: prefix length
+    plus a trailer, guaranteeing `cells <= max_cells`, no cut inside an escape
+    sequence, no split grapheme cluster, and a terminal left in its default
+    state. An unstyled line gets an empty trailer.
+  - Positional C1 disambiguation. The C1 range `0x80..0x9F` is a subset of the
+    UTF-8 continuation range, so U+6587 (`E6 96 87`, second byte = C1 SGA) and
+    U+1F600 (three C1-range bytes) would be torn apart by a byte-wise test. The
+    scanner carries the outstanding continuation count, so the distinction
+    survives a chunk boundary landing mid-character.
+  - Full SGR model: 8 attribute bits, 6 underline styles including the
+    sub-parameter form, indexed and RGB colour in both the semicolon and colon
+    encodings, underline colour, and OSC 8 hyperlink state. Folding and
+    serialisation round-trip, which is what makes the truncation trailer sound.
+  - Four CTest suites passing under RelWithDebInfo and ASan+UBSan, clean under
+    clang-tidy: chunk-size invariance at every size from 1 up, truncation across
+    12 inputs x 26 limits x 2 locales, and totality over all 256 single bytes.
+  - Eight deliberate mutations introduced, all eight caught. One initially
+    survived - the byte-wise C1 test - proving no test actually exercised the
+    invariant; a split-boundary regression test now does.
+  - `cpp/testing`: shared assertion helpers, extracted from
+    `libsupra_width/tests` when libsupra_ansi became the second consumer.
+
 - **T2** `cpp/libsupra_width`: terminal cell width and grapheme segmentation.
   - Flat C ABI: UTF-8 decoding, per-code-point width, UAX #29 grapheme cluster
     segmentation, string measurement, cluster-safe truncation, validation, and a

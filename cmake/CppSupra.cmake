@@ -83,7 +83,7 @@ function(supra_add_test name)
     endif()
 
     add_executable(${name} ${ARG_SOURCES})
-    target_link_libraries(${name} PRIVATE supra_cxx_flags ${ARG_LINK})
+    target_link_libraries(${name} PRIVATE supra_cxx_flags supra_testing ${ARG_LINK})
     set_target_properties(${name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
     add_test(NAME ${name} COMMAND ${name})

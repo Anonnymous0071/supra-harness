@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T2 complete. Stages T3 onward are unimplemented.
+Status: T1-T3 complete. Stages T4 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -492,6 +492,27 @@ ones do not, and the bar silently changes length. Neither glyph is wrong; the
 pairing is. T28.5 must probe each gauge glyph individually rather than treating
 "block elements" as one class, and T29 must not assume the gauge has a fixed
 cell cost.
+
+**Verified in T3, and binding on every component that scans terminal bytes**: the
+8-bit C1 control range `0x80..0x9F` is a **subset** of the UTF-8 continuation
+range `0x80..0xBF`. U+6587 encodes as `E6 96 87`, whose second byte is the C1
+code for START OF GUARDED AREA; U+1F600 encodes as `F0 9F 98 80`, containing
+three C1-range bytes including `0x9B`, which is CSI. Any byte-wise test for C1
+membership tears such characters apart and then invents a spurious escape
+sequence that swallows the text after it.
+
+The disambiguation must be **positional**: no byte in `0x80..0xBF` is a valid
+UTF-8 lead, so such a byte is a C1 control exactly when it falls on a scalar
+boundary. This binds T16.5, whose output shaping scans untrusted subprocess
+bytes, and T29, whose renderer scans its own output - neither may reimplement
+the check; both route through `libsupra_ansi`.
+
+The mutation-testing corollary is worth stating separately, because it changed
+how confidence is established in this project: the implementation was correct,
+the suite passed, and a mutation that reverted this rule **survived** - meaning
+nothing was actually exercising the invariant. A passing suite is not evidence
+until something has tried to break it. Stages from here on treat mutation
+survival as a test defect, not a curiosity.
 
 **Stated limitations that will not be hidden in the implementation**: syntactic
 rename without LSP can be wrong under shadowing or overloading, so results are

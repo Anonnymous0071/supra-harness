@@ -27,7 +27,9 @@ supra_add_test(hangul_arithmetic_test SOURCES tests/hangul_arithmetic_test.cpp L
 # tables were generated from.
 if(SUPRA_BUILD_TESTS)
     add_executable(grapheme_conformance_test tests/grapheme_conformance_test.cpp)
-    target_link_libraries(grapheme_conformance_test PRIVATE supra_cxx_flags libsupra_width)
+    target_link_libraries(
+        grapheme_conformance_test PRIVATE supra_cxx_flags supra_testing libsupra_width
+    )
     set_target_properties(
         grapheme_conformance_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
