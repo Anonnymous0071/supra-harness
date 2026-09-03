@@ -82,6 +82,10 @@ gained crate inference for this stage). All eleven caught.
 | M9 sealed deserialisation stops verifying | CAUGHT |
 | M10 I8 padding always returns 0 | CAUGHT |
 | M11 interleaved tool traffic accepted | CAUGHT |
+| M12 `admit` truncates k instead of reducing the tier | CAUGHT |
+| M13 `largest_within` admits a tier whose floor does not fit | CAUGHT |
+| M14 `k_for_limit` ignores the limit | CAUGHT |
+| M15 `resolve` lets precedence beat a deny | CAUGHT |
 
 M8 is the one worth reading. The original test compared `("ab","c")` against
 `("a","bc")` and passed *without* the length prefix, because the two fields carry
@@ -105,14 +109,36 @@ from both directions, and the original is renamed to say what it actually shows.
   describes: a state block appended perpetually must not appear in the prefix hash.
   This crate proves the arithmetic (202k against 4k over 100 turns); only a ledger can
   prove the behaviour.
-- **T16.7** owns reversibility classification from the resolved effect, and owes a
-  confirmation of one reading taken here: `resolve` implements "deny always wins"
-  literally, so **any** deny beats **every** allow and precedence orders allows only.
-  The alternative - deny wins only among rules of equal precedence - would make a
-  built-in prohibition session-overridable, which contradicts the guard layers having
-  no off switch. The conservative reading is implemented and flagged rather than
-  assumed settled.
-- **T15.5** consumes `Tier`. Its `k_range` reproduces the architecture table exactly,
-  gaps included: k of 6 and 13-15 belong to no tier, and `Tier::containing` reports
-  `None` rather than rounding to a neighbour. Tier selection runs tier-to-k, so those
-  sizes are unreachable rather than unspecified.
+- **T15.5** consumes `Tier` and `admit`. Tier selection runs tier-to-k, and `admit`
+  resolves a requested tier against the configured peer limit; T15.5 owns how k is
+  chosen *within* a tier from the finer-grained signals.
+- **T16.7** owns reversibility classification from the resolved effect, and the
+  catalogue of what `RuleSource::Builtin` may `Deny`. Since a deny is absolute, that
+  catalogue is small by construction: anything that is merely "usually not" is
+  expressed as no rule and falls through to the consent gate.
+
+## Two decisions settled here rather than deferred
+
+**The tier gaps are now unreachable, not just undocumented.** Cohort sizes 6 and
+13-15 belong to no tier. That is harmless while selection runs tier-to-k, but the
+configurable peer limit makes it reachable: a limit of 6 sits above E2's ceiling of 5
+and below E3's floor of 7. `admit` resolves it by reducing the *tier* rather than
+truncating k, so a limit of 6 turns an E3 task into E2 at k=5. Truncating instead
+would give E3 at k=6 - a cohort in no tier, which makes T30's tier-accuracy metric
+meaningless and reports a scrutiny level nothing was given. `Tier::containing(k) ==
+Some(tier)` is a tested property of every `admit` result across all 480 tier-limit
+combinations.
+
+Finding this also surfaced that the peer limit was **absent from the normative
+document entirely**, despite being a locked requirement - which is precisely how a
+reachable gap goes unnoticed. Section 4 now specifies it, and E5's row gained the
+floor it was missing.
+
+**"Deny always winning" is literal.** Any deny beats every allow; precedence orders
+allows only; a `builtin` deny survives a `session` allow. Three things settle it: the
+design already puts escape hatches in separate confirmed flags rather than
+higher-precedence allows (`--sandbox off`, guard layers with no off switch); the
+softer reading would let a slash command lift a built-in prohibition, which is not a
+prohibition; and unconditional explicit deny is the standard rule in security policy
+engines. The obligation that follows is on rule authors, not on this function: a
+default is the absence of a rule, never a deny.

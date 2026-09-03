@@ -262,18 +262,35 @@ pub struct Rule {
 
 /// Combine competing rules.
 ///
-/// Deny always wins, then the highest-precedence allow, then `None` for "no rule
+/// Deny wins outright, then the highest-precedence allow, then `None` for "no rule
 /// applies" - which leaves the reversibility gate to decide.
 ///
-/// # The reading of "deny always winning"
+/// # "Deny always winning" is literal
 ///
-/// This takes it literally: **any** deny beats **every** allow, whatever their
-/// sources. Precedence therefore orders allows only. The alternative reading -
-/// deny wins among rules of equal precedence, so a `Session` allow could override a
-/// `Builtin` deny - would make a built-in prohibition user-overridable, and this
-/// project has already decided the guard layers have no off switch. The
-/// conservative reading is implemented; T16.7 owns confirming it against real rule
-/// sets, and the README records it as an obligation rather than as settled.
+/// **Any** deny beats **every** allow, whatever their sources, so precedence orders
+/// allows only. Three things settle this reading rather than leaving it open:
+///
+/// 1. **The project already has this shape elsewhere.** Guard layers L1 to L7 have
+///    no off switch, and disabling the sandbox is not a permission rule at all - it
+///    is a separate `--sandbox off` flag with its own confirmation and a persistent
+///    status-line warning. Escape hatches here are explicit and ceremonial, never a
+///    higher-precedence allow quietly winning.
+/// 2. **The alternative inverts the trust boundary.** If deny only won among rules
+///    of equal precedence, a `Session` allow - something a slash command can set
+///    mid-conversation - would override a `Builtin` prohibition. A prohibition that
+///    a session can lift is not a prohibition.
+/// 3. **It is what security policy engines do.** An explicit deny winning
+///    unconditionally is the standard evaluation rule, and matching it means an
+///    operator's intuition transfers.
+///
+/// # What this obliges of rule authors
+///
+/// Because a deny is absolute, `Deny` is the wrong tool for "usually not". The
+/// correct expression of a default is **no rule at all**, which falls through to
+/// [`Mode::decide`] and asks the user. `RuleSource::Builtin` must therefore emit
+/// `Deny` only for effects that must never be permitted under any mode by any user;
+/// everything else it has an opinion about belongs in the reversibility
+/// classification, not here. T16.7 owns that catalogue.
 #[must_use]
 pub fn resolve(rules: &[Rule]) -> Option<RuleEffect> {
     if rules.iter().any(|rule| rule.effect == RuleEffect::Deny) {
@@ -434,6 +451,41 @@ mod tests {
         let deny_builtin = Rule { source: RuleSource::Builtin, effect: RuleEffect::Deny };
         assert_eq!(resolve(&[allow_session, deny_builtin]), Some(RuleEffect::Deny));
         assert_eq!(resolve(&[deny_builtin, allow_session]), Some(RuleEffect::Deny));
+    }
+
+    #[test]
+    fn a_deny_from_the_weakest_source_survives_every_stronger_allow() {
+        // The decision spelled out at its most uncomfortable: a builtin deny beats
+        // an allow from every other source at once, including a session one the user
+        // set deliberately. That is the point - a prohibition a slash command can
+        // lift is not a prohibition, and the escape hatches in this design are
+        // separate confirmed flags rather than higher-precedence allows.
+        let deny = Rule { source: RuleSource::Builtin, effect: RuleEffect::Deny };
+        let allows = [
+            Rule { source: RuleSource::User, effect: RuleEffect::Allow },
+            Rule { source: RuleSource::Project, effect: RuleEffect::Allow },
+            Rule { source: RuleSource::Cli, effect: RuleEffect::Allow },
+            Rule { source: RuleSource::Session, effect: RuleEffect::Allow },
+        ];
+
+        let mut rules = allows.to_vec();
+        rules.push(deny);
+        assert_eq!(resolve(&rules), Some(RuleEffect::Deny));
+
+        // And order of evaluation cannot change it, which is what "unconditionally"
+        // has to mean if an operator is to reason about a rule set at all.
+        rules.reverse();
+        assert_eq!(resolve(&rules), Some(RuleEffect::Deny));
+    }
+
+    #[test]
+    fn a_default_is_the_absence_of_a_rule_not_a_deny() {
+        // The obligation the literal reading places on rule authors. "Usually not"
+        // must be expressed as no rule, so the consent gate can still ask; writing
+        // it as a deny would make it unaskable.
+        assert_eq!(resolve(&[]), None);
+        assert_eq!(Mode::Ask.decide(Reversibility::R2), Decision::Prompt);
+        assert_eq!(Mode::Auto.decide(Reversibility::R3), Decision::Prompt);
     }
 
     #[test]

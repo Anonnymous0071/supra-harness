@@ -131,14 +131,51 @@ impl Tier {
 
     /// The tier that selects `k`, if any.
     ///
-    /// `None` for the values the table skips. See the module documentation: those
-    /// sizes are unreachable rather than unspecified.
+    /// `None` for the sizes the table skips - 6, and 13 to 15. Those are
+    /// **unreachable rather than unspecified**, and the resolution below is what
+    /// makes that true rather than hopeful. Reporting `None` is the honest answer:
+    /// rounding to a neighbouring tier would attribute a level of scrutiny the
+    /// cohort was never given.
     #[must_use]
     pub fn containing(k: usize) -> Option<Self> {
         Self::ALL.into_iter().find(|tier| {
             let (low, high) = tier.k_range();
             (low..=high).contains(&k)
         })
+    }
+
+    /// The strongest tier that can run within a configured peer limit.
+    ///
+    /// A tier is usable when its *smallest* cohort fits, because a tier may run
+    /// anywhere in its range. `None` when the limit is zero, which means nothing can
+    /// run at all.
+    ///
+    /// This exists because the peer limit is user-configurable from 1 to
+    /// [`PEER_CEILING`], and a limit below a tier's floor has to resolve to
+    /// something. Reducing the **tier** rather than truncating k is the choice: a
+    /// tier means a level of scrutiny, so "your limit caps this task at E2" is a
+    /// statement a user can act on, whereas "you get 6 peers" is a number belonging
+    /// to no tier and reporting nothing.
+    #[must_use]
+    pub fn largest_within(limit: usize) -> Option<Self> {
+        Self::ALL.into_iter().rev().find(|tier| {
+            let (low, _) = tier.k_range();
+            low <= limit
+        })
+    }
+
+    /// Cohort size for this tier under a peer limit.
+    ///
+    /// The tier's ceiling, or the limit, whichever is smaller. Returns 0 when the
+    /// tier cannot run within the limit at all - use [`Tier::largest_within`] first
+    /// so that case does not arise.
+    #[must_use]
+    pub const fn k_for_limit(self, limit: usize) -> usize {
+        let (low, high) = self.k_range();
+        if low > limit {
+            return 0;
+        }
+        if high < limit { high } else { limit }
     }
 
     /// Whether verification at this tier is self-consistency rather than
@@ -160,6 +197,26 @@ impl Tier {
         let (low, _) = self.k_range();
         byzantine_tolerance(low) > 0
     }
+}
+
+/// Resolve a requested tier against the configured peer limit.
+///
+/// Returns the tier that will actually run and its cohort size, or `None` when the
+/// limit is zero. The result always satisfies
+/// `Tier::containing(k) == Some(tier)`, which is the property that keeps the tier
+/// gaps unreachable rather than merely undocumented - there is a test that walks
+/// every requested tier against every limit from 1 to [`PEER_CEILING`].
+///
+/// The peer limit is a user setting: any value from 1 to [`PEER_CEILING`], defaulting
+/// to [`DEFAULT_PEER_LIMIT`]. It is a cap on scrutiny, not a target, so a task that
+/// scores E1 still runs two peers under a limit of 80.
+#[must_use]
+pub fn admit(requested: Tier, limit: usize) -> Option<(Tier, usize)> {
+    let ceiling = Tier::largest_within(limit)?;
+    // A limit reduces the tier; it never raises one. `min` over the tier ordering
+    // does both halves of that at once.
+    let tier = requested.min(ceiling);
+    Some((tier, tier.k_for_limit(limit)))
 }
 
 /// A validator's answer to a claim.
@@ -551,6 +608,75 @@ mod tests {
         assert_eq!(Tier::containing(12), Some(Tier::E3));
         assert_eq!(Tier::containing(32), Some(Tier::E4));
         assert_eq!(Tier::containing(PEER_CEILING), Some(Tier::E5));
+    }
+
+    #[test]
+    fn admission_never_produces_a_cohort_size_without_a_tier() {
+        // The property that turns "the gaps are unreachable" from an assertion into
+        // a fact. Every requested tier, against every configured limit: the cohort
+        // that comes out is always inside exactly one tier's range.
+        //
+        // Without this, a limit of 6 against an E3 task would truncate k to 6 - a
+        // size belonging to no tier, which would make T30's tier-accuracy metric
+        // meaningless and leave the guard reporting a scrutiny level nothing had.
+        for limit in 1..=PEER_CEILING {
+            for requested in Tier::ALL {
+                let (tier, k) = admit(requested, limit).expect("a non-zero limit admits");
+                assert_eq!(
+                    Tier::containing(k),
+                    Some(tier),
+                    "requested {requested:?} at limit {limit} produced k={k}"
+                );
+                assert!(k <= limit, "k={k} exceeds the limit {limit}");
+                assert!(k >= 1, "a cohort must have at least one peer");
+                assert!(tier <= requested, "a limit must not raise the tier");
+            }
+        }
+    }
+
+    #[test]
+    fn a_limit_reduces_the_tier_rather_than_truncating_the_cohort() {
+        // The concrete case that motivated `admit`: a limit of 6 sits between E2's
+        // ceiling and E3's floor.
+        assert_eq!(admit(Tier::E3, 6), Some((Tier::E2, 5)));
+        assert_eq!(admit(Tier::E5, 6), Some((Tier::E2, 5)));
+
+        // Inside a tier's range, the limit caps k without changing the tier.
+        assert_eq!(admit(Tier::E3, 10), Some((Tier::E3, 10)));
+        assert_eq!(admit(Tier::E5, 40), Some((Tier::E5, 40)));
+
+        // 13 to 15 is the other gap: E3 tops out at 12 and E4 needs 16.
+        assert_eq!(admit(Tier::E4, 14), Some((Tier::E3, 12)));
+
+        // A generous limit never inflates a cheap task.
+        assert_eq!(admit(Tier::E0, PEER_CEILING), Some((Tier::E0, 1)));
+        assert_eq!(admit(Tier::E1, PEER_CEILING), Some((Tier::E1, 2)));
+
+        // The default limit, which is what most sessions will run under.
+        assert_eq!(admit(Tier::E5, DEFAULT_PEER_LIMIT), Some((Tier::E4, 16)));
+    }
+
+    #[test]
+    fn a_zero_limit_admits_nothing() {
+        assert_eq!(Tier::largest_within(0), None);
+        for requested in Tier::ALL {
+            assert_eq!(admit(requested, 0), None, "{requested:?}");
+        }
+    }
+
+    #[test]
+    fn largest_within_is_monotonic_in_the_limit() {
+        // A higher limit never permits a weaker tier. Stated because a
+        // non-monotonic resolution would make the setting confusing to reason about
+        // and would break the "reduces, never raises" claim in `admit`.
+        let mut previous = Tier::E0;
+        for limit in 1..=PEER_CEILING {
+            let tier = Tier::largest_within(limit).expect("a non-zero limit");
+            assert!(tier >= previous, "limit {limit} went backwards to {tier:?}");
+            previous = tier;
+        }
+        assert_eq!(Tier::largest_within(1), Some(Tier::E0));
+        assert_eq!(Tier::largest_within(PEER_CEILING), Some(Tier::E5));
     }
 
     #[test]

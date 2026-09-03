@@ -47,7 +47,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - 47 event variants across 11 topics, with the topic partition and a serde
     round trip both walked through an exhaustive sample list that fails to compile
     when a variant is added without one.
-  - 116 tests. Eleven mutations against the load-bearing invariants, all caught.
+  - `admit` resolves a requested tier against the configurable peer limit by
+    reducing the **tier** rather than truncating k, because a limit of 6 sits
+    between E2's ceiling and E3's floor and truncating would yield a cohort in no
+    tier. `Tier::containing(k) == Some(tier)` is tested across all 480 tier-limit
+    combinations, which is what makes the table's gaps at 6 and 13-15 unreachable
+    rather than merely noted.
+  - 122 tests. Fifteen mutations against the load-bearing invariants, all caught.
 
 - `scripts/check-invariants.sh`, wired into `just lint`: the CI half of "enforced by
   types and by CI, not by convention", covering what a type system cannot assert -
@@ -133,6 +139,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- `docs/ARCHITECTURE.md` section 4 was **missing the configurable peer limit
+  entirely**, despite it being a locked requirement (1..=80, default 16). Its
+  absence is how a reachable gap in the tier table went unnoticed: the limit can
+  fall between a tier's floor and the tier below it, and nothing said what happens
+  then. The section now specifies the limit, its default, and the resolution rule.
+  E5's row also read `<=80` with no floor, leaving the tiers non-disjoint on paper;
+  it now reads `33-80` with its derived quorum and byzantine columns filled in.
+- `docs/ARCHITECTURE.md` section 6 stated "deny always winning" as a phrase with
+  two possible readings. It now carries the decision and the reasoning: any deny
+  beats every allow, precedence orders allows only, and a default is the absence of
+  a rule rather than a deny. T16.7 inherits the catalogue of what `builtin` may
+  deny, not the question of what deny means.
 - `rustfmt.toml` claimed deterministic import ordering through
   `imports_granularity` and `group_imports`, which are nightly-only options: on
   the pinned stable toolchain they emitted a warning on every run and took no

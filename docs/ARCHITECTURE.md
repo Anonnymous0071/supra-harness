@@ -180,7 +180,39 @@ come from the digest (blast radius, churn, anchor count), the tool registry
 | E2 | 3-5 | 2-4 | 0-1 | multi-file, blast radius <=10 |
 | E3 | 7-12 | 5-8 | 2-3 | cross-module, high churn |
 | E4 | 16-32 | 11-22 | 5-10 | auth, crypto, migrations, active findings |
-| E5 | <=80 | <=54 | <=26 | user-requested, or repeated-failure escalation |
+| E5 | 33-80 | 22-54 | 10-26 | user-requested, or repeated-failure escalation |
+
+The ranges are **not contiguous**: cohort sizes 6 and 13-15 belong to no tier.
+That is a consequence of the tiers being discrete escalation steps rather than a
+partition of 1..80, and it is safe only because selection runs **tier to k** -
+evidence scores into a tier, and the tier fixes the range.
+
+### The peer limit
+Cohort size has two ceilings. `PEER_CEILING` is 80 and no configuration raises
+it. Beneath it sits a **user-configurable limit**, any value in 1..=80,
+defaulting to 16. The limit caps scrutiny; it is not a target, so a task scoring
+E1 still fields two peers under a limit of 80.
+
+A limit can fall between a tier's floor and the tier below it - a limit of 6 sits
+above E2's ceiling of 5 and below E3's floor of 7. Resolution **reduces the
+tier**, it does not truncate k:
+
+```
+admit(requested, limit) = (min(requested, largest_tier_whose_floor_fits(limit)),
+                           min(that_tier_ceiling, limit))
+```
+
+So a limit of 6 turns an E3 task into E2 at k=5, and a limit of 14 turns an E4
+task into E3 at k=12. Truncating instead - E3 at k=6 - would produce a cohort
+belonging to no tier, which makes T30's tier-accuracy metric meaningless and
+reports a level of scrutiny nothing was given. Reducing the tier is also the more
+useful thing to tell a user: "your limit caps this task at E2" is actionable,
+"you got 6 peers" is not.
+
+`admit` is total for any non-zero limit, and `Tier::containing(k) ==
+Some(tier)` holds for every result - which is what makes the gaps unreachable
+rather than merely undocumented. A test walks every tier against every limit
+from 1 to 80.
 
 At k=1, the second pass receives the claim **without the reasoning that
 produced it** and re-derives independently. This is **self-consistency, not
@@ -262,8 +294,29 @@ is measurable rather than felt.
 `auto` is the default only because T16.6 `supra_journal` exists. Without an undo
 stack, "auto" would be a hope rather than an engineering decision.
 
-Rule precedence, deny always winning: `session` > `cli` > `project` > `user` >
-`builtin`.
+Rule precedence: `session` > `cli` > `project` > `user` > `builtin`, with **deny
+always winning**. That is meant literally: *any* deny beats *every* allow
+regardless of source, so precedence orders allows only. A `builtin` deny survives
+a `session` allow.
+
+Three reasons this is the reading rather than the softer one, where deny wins
+only among rules of equal precedence:
+
+- It matches the shape the design already uses. Guard layers L1-L7 have no off
+  switch, and disabling the sandbox is not a rule at all but a separate
+  `--sandbox off` flag with its own confirmation and a persistent status-line
+  warning. Escape hatches here are explicit and ceremonial.
+- The softer reading inverts the trust boundary. A `session` allow is something a
+  slash command sets mid-conversation, and a prohibition a slash command can lift
+  is not a prohibition.
+- Unconditional explicit deny is the standard evaluation rule in security policy
+  engines, so an operator's intuition transfers.
+
+The obligation this places on rule authors: a deny is absolute, so `Deny` is the
+wrong tool for "usually not". A default is expressed as **no rule at all**, which
+falls through to the reversibility gate and asks. `builtin` therefore emits `Deny`
+only for effects that must never be permitted under any mode by any user; T16.7
+owns that catalogue.
 
 **Mode changes cost zero tokens.** The mode is an `EphemeralBlock`, so
 `Shift+Tab` fifty times in a session produces zero cache writes.
@@ -587,23 +640,27 @@ is refused by the build script's `static_assert` - so a future contributor
 "fixing" a layout mismatch by loosening an assertion is removing the only
 mechanism standing between the FFI and silently wrong answers.
 
-**Clarified in T6, because section 4's tier table has gaps**: the k ranges are
-E0 `1`, E1 `2`, E2 `3-5`, E3 `7-12`, E4 `16-32`, E5 `<=80`. Cohort sizes 6 and
-13-15 belong to no tier. That is not an omission to be interpolated away:
-selection runs **tier to k** - T15.5 scores evidence into a tier and the tier
-fixes the range - so those sizes are unreachable rather than unspecified.
-`Tier::containing` reports `None` for them rather than rounding to a neighbour,
-and E5's floor is 33 so the tiers stay disjoint. Every derived column of that
-table was recomputed in T6 and matches: quorum 5-8 across E3, byzantine 5-10
-across E4, quorum 54 and byzantine 26 at k=80, six shards at k=80.
+**Clarified in T6, because section 4's tier table has gaps**: cohort sizes 6 and
+13-15 belong to no tier, and that is now safe rather than merely noted. The gap
+is reachable through the configurable peer limit - a limit of 6 sits between E2's
+ceiling and E3's floor - so `admit` resolves it by **reducing the tier** rather
+than truncating k, and `Tier::containing(k) == Some(tier)` is a tested property of
+every result across all 480 tier-limit combinations. `Tier::containing` still
+reports `None` for 6 and 13-15, which is the correct answer now that nothing
+produces them.
 
-**Decided in T6 and awaiting confirmation by T16.7**: "deny always winning" in
-the rule precedence sentence is implemented **literally** - any deny beats every
-allow, and precedence orders allows only. The alternative reading, where deny
-wins only among rules of equal precedence, would let a `session` allow override
-a `builtin` deny, which contradicts the guard layers having no off switch. The
-conservative reading is what `permission::resolve` does; T16.7 owns confirming
-it against real rule sets rather than inheriting it as settled.
+Two related corrections to this document came out of that work. The peer limit
+itself was **missing from section 4 entirely** despite being a locked requirement,
+which is how the reachable gap went unnoticed; it is now specified with its
+default and its resolution rule. And E5's row read `<=80` with no floor, leaving
+the tiers non-disjoint on paper; it now reads `33-80` with the derived quorum and
+byzantine columns filled in.
+
+**Decided in T6**: "deny always winning" in the rule-precedence sentence is
+literal, and section 6 now carries the reasoning rather than the phrase alone. Any
+deny beats every allow; precedence orders allows only; a default is the absence of
+a rule, not a deny. T16.7 inherits the catalogue of what `builtin` may deny, not
+the question of what deny means.
 
 **Method note from T6, extending the T4 correction**: a mutation-harness bug is
 one failure mode; a *test* that appears to cover an invariant while depending on
