@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T5 complete. Stages T6 onward are unimplemented.
+Status: T1-T6 complete. Stages T7 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -586,3 +586,38 @@ compile time from both directions, and mutation M1 confirmed a drifted constant
 is refused by the build script's `static_assert` - so a future contributor
 "fixing" a layout mismatch by loosening an assertion is removing the only
 mechanism standing between the FFI and silently wrong answers.
+
+**Clarified in T6, because section 4's tier table has gaps**: the k ranges are
+E0 `1`, E1 `2`, E2 `3-5`, E3 `7-12`, E4 `16-32`, E5 `<=80`. Cohort sizes 6 and
+13-15 belong to no tier. That is not an omission to be interpolated away:
+selection runs **tier to k** - T15.5 scores evidence into a tier and the tier
+fixes the range - so those sizes are unreachable rather than unspecified.
+`Tier::containing` reports `None` for them rather than rounding to a neighbour,
+and E5's floor is 33 so the tiers stay disjoint. Every derived column of that
+table was recomputed in T6 and matches: quorum 5-8 across E3, byzantine 5-10
+across E4, quorum 54 and byzantine 26 at k=80, six shards at k=80.
+
+**Decided in T6 and awaiting confirmation by T16.7**: "deny always winning" in
+the rule precedence sentence is implemented **literally** - any deny beats every
+allow, and precedence orders allows only. The alternative reading, where deny
+wins only among rules of equal precedence, would let a `session` allow override
+a `builtin` deny, which contradicts the guard layers having no off switch. The
+conservative reading is what `permission::resolve` does; T16.7 owns confirming
+it against real rule sets rather than inheriting it as settled.
+
+**Method note from T6, extending the T4 correction**: a mutation-harness bug is
+one failure mode; a *test* that appears to cover an invariant while depending on
+something else is another. T6's length-prefix test compared two two-field values
+and passed with the length prefix removed, because the differing field tags
+already separated them. The prefix only matters when the same tag repeats and the
+payload contains that tag byte - a reachable case, since block text is arbitrary
+model output. The lesson generalises: when a mutation survives, the first
+question is not "which test is missing" but "what is the test I already have
+actually depending on".
+
+The same applies to the checks in `scripts/check-invariants.sh`. Its first
+version truncated each file at the first `#[cfg(test)]` marker, leaving every
+line below the test module unscanned; a fourteen-case probe found it missed
+seven violations out of eight while reporting success. A guard with a blind spot
+is worse than no guard, because it certifies. Any future structural check must
+be probed against deliberate violations before it is trusted.

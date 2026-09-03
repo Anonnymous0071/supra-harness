@@ -65,9 +65,18 @@ if [[ "$applied" != "OK" ]]; then
 fi
 
 if [[ "$file" == *.rs ]]; then
+    # Which crate owns the file. Derived rather than hardcoded so this works for
+    # every crate the workspace grows; a file outside crates/ falls back to the
+    # whole workspace.
+    if [[ "$file" =~ ^crates/([^/]+)/ ]]; then
+        target=(-p "${BASH_REMATCH[1]}")
+    else
+        target=(--workspace)
+    fi
+
     # One invocation compiles and runs, so the exit code alone cannot say
     # whether a failure was a compile failure or a caught mutation.
-    if cargo test -p supra_ffi --locked >/tmp/mutate-build.log 2>&1; then
+    if cargo test "${target[@]}" --locked >/tmp/mutate-build.log 2>&1; then
         printf 'SURVIVED   %s  <-- TEST GAP\n' "$desc"
     elif grep -qE 'could not compile|failed to run custom build command' /tmp/mutate-build.log; then
         printf 'BUILD_FAIL %s\n' "$desc"

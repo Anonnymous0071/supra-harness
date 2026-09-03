@@ -158,7 +158,13 @@ deny:
 tidy: build-cpp
     @bash scripts/run-clang-tidy.sh {{ build_dir }}
 
-lint: fmt-check clippy deny
+# Structural invariant checks the compiler cannot express: no mutation path on
+# `Sealed`, no `Sealable` on `EphemeralBlock`, no `Mode` on the authority axis,
+# quorum as an integer rational, `unsafe` nowhere but supra_ffi.
+invariants:
+    @bash scripts/check-invariants.sh
+
+lint: fmt-check clippy deny invariants
 
 # What CI runs. Ordered cheapest-first so failures surface fast.
 ci: lint test-cpp build-wasm test-rust

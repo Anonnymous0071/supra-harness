@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/supra_ffi"]
+members = ["crates/supra_ffi", "crates/supra_types"]
 
 # ---------------------------------------------------------------------------
 # Shared package metadata. Every member crate inherits these with

@@ -1,0 +1,31 @@
+[package]
+name = "supra_types"
+description = "Core contracts for supra-harness: the append-only prompt ledger primitives, event taxonomy, and permission/cohort types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# T6 is the contract layer: types and pure functions only. It deliberately
+# depends on nothing that performs I/O, so every later stage can hold these types
+# without inheriting a runtime, a database handle, or a provider client.
+#
+# In particular it does NOT depend on serde_json. Canonical JSON is T13's
+# responsibility, and holding a pre-canonicalised string here means the bytes
+# that were hashed are the bytes that reach the wire (see I7).
+[dependencies]
+ulid = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+# Tests need *a* serde format to prove that a tampered `Sealed` is refused on
+# load. A dev-dependency keeps that out of the crate's runtime graph, so the
+# claim above - that T6 does not depend on serde_json - stays exactly true.
+[dev-dependencies]
+serde_json = { workspace = true }

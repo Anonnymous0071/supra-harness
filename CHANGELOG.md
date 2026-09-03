@@ -9,6 +9,55 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T6** `crates/supra_types`: the contract layer, where the architecture's
+  invariants stop being prose.
+  - **I1** is the type: `Sealed<T>` has no `DerefMut`, no `as_mut`, and no
+    `into_inner` - the last one because moving the value out would allow
+    edit-and-reseal at the same sequence number, which is a rewrite wearing an
+    append's clothes. Every reader that legitimately needs the contents needs only
+    `&T`.
+  - **I2** is a type error rather than a runtime refusal: the `Sealable` bound sits
+    on `Sealed`'s type definition, so `Sealed<EphemeralBlock>` cannot be *written
+    down*. The 202k-against-4k arithmetic that justifies the invariant is a test, so
+    the reason for the type is executable.
+  - Content hashing runs over a length-prefixed canonical encoding owned by this
+    crate, deliberately **not** the T13 wire serialiser. Hashing the wire bytes
+    would make every stored digest move whenever the wire format did, and I4's
+    guarantee that a recalled turn is byte-identical would be measured against a
+    moving target. No `serde_json` in the dependency graph at all.
+  - Every validated type re-runs its constructor on deserialisation - `Sealed`,
+    `Segment`, `MemoryIndexEntry`, `Lineage`, `Verdict`. Deriving `Deserialize`
+    would be a hole straight through each invariant: a session file could
+    reintroduce exactly the shapes the constructor rejects, and that content is
+    about to be sealed into a prefix and paid for on every later turn.
+  - No floats anywhere: `MicroUsd` is integer micro-dollars, `Confidence` is an
+    enum, cache multipliers are integer percentages, and quorum is `(2k).div_ceil(3)`
+    because `(0.67 * 3).ceil()` is 3 and would silently demand unanimity from a
+    three-peer cohort. Every documented figure is reproduced as arithmetic: the
+    tier table's quorum and byzantine columns at every k, the 15 req/min shard
+    count landing on 6 for k=80, the $6.30 hundred-turn baseline, the I8 padding
+    trade-off.
+  - `Lineage` caps depth at 1 and refuses an id already in the chain, so a peer
+    cannot spawn and a model cannot spawn itself. A cohort of 80 is siblings at
+    equal depth with no peer in another's ancestry, which is the structural
+    statement of "not an orchestrator".
+  - The permission model keeps its two axes apart: `decide` consults `ToolClass`
+    before `Mode`, and an exhaustive walk of class x invoker x mode x reversibility
+    shows no mode - `yolo` included - can turn an authority refusal into permission.
+  - 47 event variants across 11 topics, with the topic partition and a serde
+    round trip both walked through an exhaustive sample list that fails to compile
+    when a variant is added without one.
+  - 116 tests. Eleven mutations against the load-bearing invariants, all caught.
+
+- `scripts/check-invariants.sh`, wired into `just lint`: the CI half of "enforced by
+  types and by CI, not by convention", covering what a type system cannot assert -
+  an absence. Checks for a mutation path on `Sealed`, a `Sealable` impl for
+  `EphemeralBlock`, ephemeral state reaching a segment, a `Mode` on the authority
+  axis, a float in the quorum module, and `unsafe` outside `supra_ffi`.
+
+- `scripts/mutate.sh` infers the crate from the mutated file's path, so the Rust
+  branch works for every crate the workspace grows rather than only `supra_ffi`.
+
 - **T5** `crates/supra_ffi`: safe Rust bindings to the three C++ libraries, and
   the only crate permitted to contain `unsafe`.
   - Bidirectional layout ratchet: `abi_sizes.rs` is the single source for every
