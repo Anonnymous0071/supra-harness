@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T3 complete. Stages T4 onward are unimplemented.
+Status: T1-T4 complete. Stages T5 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -514,6 +514,44 @@ nothing was actually exercising the invariant. A passing suite is not evidence
 until something has tried to break it. Stages from here on treat mutation
 survival as a test defect, not a curiosity.
 
+**Verified in T4, and it changed the plan**: bubblewrap cannot be used the way
+supra needs. Applying a Landlock ruleset and then exec'ing `bwrap` fails with
+"Failed to make / slave: Operation not permitted", and still fails under a
+maximally permissive ruleset that grants write access everywhere - so the cause is
+bwrap's mount setup, not policy tightness. `no_new_privs` alone does not break it.
+The reverse ordering works but inverts the trust boundary: the confined program
+would apply its own confinement. The Linux backend is therefore
+`unshare(NEWUSER|NEWNET|NEWPID|NEWIPC|NEWUTS)` plus Landlock with no mount
+operations, which also yields per-port TCP policy that a network namespace cannot
+express. T16 wraps this rather than shelling out to `bwrap`.
+
+**Also verified in T4**: `landlock_add_rule` rejects directory-only access bits
+applied to a regular file (`EINVAL`), but accepts file bits on a directory. That
+asymmetry means every rule must be masked to its target's file type, and the
+return value must be checked - a rejected rule is an *absent* rule, which widens
+the sandbox rather than narrowing it. Probed directly: with correct masking,
+`add_rule` succeeds for directories, regular files, device nodes, `/proc`, `/sys`,
+and 20 000 consecutive rules, so its failure path is reachable only through a
+second simultaneous defect.
+
+**Method correction from T4, which supersedes how earlier stages reported
+mutation results**: a mutation harness must verify that the mutation *compiled*.
+An inline loop used during T4 ignored the build exit code, so a mutation rejected
+by `-Werror` left the previous correct binary in place, the suite passed, and it
+was reported as SURVIVED. Three mutations were recorded as test gaps having never
+been built. `scripts/mutate.sh` now distinguishes CAUGHT, SURVIVED, and
+BUILD_FAIL, and BUILD_FAIL is explicitly not a verdict.
+
+Two consequences worth carrying forward. First, a test can pass because of
+*leftover state* rather than correct behaviour: T4's workspace write test
+overwrote a file persisting between runs, so truncation stood in for creation and
+no directory-only permission was ever exercised. Suites must clean their own
+fixtures. Second, a fail-closed refusal that protects weaker platforms is
+unreachable on a strong one, so it goes untested exactly where it matters least
+and is trusted where it matters most; T4 added a testing-only tier override to
+reach those branches, and later stages with capability tiers should expect to need
+the same.
+
 **Stated limitations that will not be hidden in the implementation**: syntactic
 rename without LSP can be wrong under shadowing or overloading, so results are
 flagged `semantic: false`; the env-marker guard layer can be stripped by a
@@ -521,3 +559,9 @@ command that deliberately clears the environment, and the process-tree budget
 catches the consequence rather than the intent; interactive-prompt detection is
 heuristic and will produce false positives, which is why its action is to ask
 the user rather than to kill silently.
+
+**T4 boundary, stated so it is not over-trusted**: the sandbox is not a syscall
+filter (no seccomp-bpf), `rlimit` is scheduling pressure rather than cgroup
+accounting, a kernel bug defeats both mechanisms, and descriptors inherited across
+`exec` remain usable. T16 and T16.5 must close descriptors they do not intend to
+pass.
