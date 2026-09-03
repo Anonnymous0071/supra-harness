@@ -2,9 +2,18 @@ edition = "2024"
 max_width = 110
 use_small_heuristics = "Max"
 newline_style = "Unix"
-# Deterministic import order. Import churn shows up as diff noise in a
-# workspace this wide, and diff noise hides real changes during review.
-imports_granularity = "Module"
-group_imports = "StdExternalCrate"
+# Deterministic import order. Import churn shows up as diff noise in a workspace
+# this wide, and diff noise hides real changes during review.
+#
+# `imports_granularity` and `group_imports` would express this directly but are
+# nightly-only: on the pinned stable toolchain they emit a warning on every run
+# and take no effect, so setting them here would document a guarantee that does
+# not exist. What stable actually provides is `reorder_imports`, which sorts each
+# contiguous run of `use` statements but never moves one across a blank line.
+#
+# The grouping is therefore a convention the author maintains and review checks:
+# `std`/`core` first, then external crates, then `crate`/`self`/`super`, each
+# group separated by one blank line. rustfmt makes the order within each group
+# deterministic; it cannot assign a new import to the right group.
 reorder_imports = true
 reorder_modules = true

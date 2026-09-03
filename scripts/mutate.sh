@@ -17,6 +17,13 @@
 #              -Werror) before it says anything
 #
 # Usage: mutate.sh <file> <find-file> <replace-file> <description>
+#
+# The target's extension picks the build+test pair: C++ sources go through
+# `just build-cpp` + `ctest`, Rust sources through `cargo test -p supra_ffi`.
+# The same build-failure discipline applies to both, and for Rust the check is
+# stricter, because one `cargo test` invocation both compiles and runs: the log
+# must be inspected to tell "did not compile" (BUILD_FAIL, not a verdict) from
+# "compiled and failed" (CAUGHT).
 
 set -uo pipefail
 
@@ -54,6 +61,20 @@ PY
 
 if [[ "$applied" != "OK" ]]; then
     printf 'SKIP       %s (site not found)\n' "$desc"
+    exit 0
+fi
+
+if [[ "$file" == *.rs ]]; then
+    # One invocation compiles and runs, so the exit code alone cannot say
+    # whether a failure was a compile failure or a caught mutation.
+    if cargo test -p supra_ffi --locked >/tmp/mutate-build.log 2>&1; then
+        printf 'SURVIVED   %s  <-- TEST GAP\n' "$desc"
+    elif grep -qE 'could not compile|failed to run custom build command' /tmp/mutate-build.log; then
+        printf 'BUILD_FAIL %s\n' "$desc"
+        printf '           %s\n' "$(grep -m1 -E '^error' /tmp/mutate-build.log || echo 'see /tmp/mutate-build.log')"
+    else
+        printf 'CAUGHT     %s\n' "$desc"
+    fi
     exit 0
 fi
 

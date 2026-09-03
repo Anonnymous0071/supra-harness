@@ -9,6 +9,43 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T5** `crates/supra_ffi`: safe Rust bindings to the three C++ libraries, and
+  the only crate permitted to contain `unsafe`.
+  - Bidirectional layout ratchet: `abi_sizes.rs` is the single source for every
+    structure's size and alignment, asserted against C++ `sizeof` by a
+    `static_assert` in the build script and against Rust `size_of`/`align_of`
+    in `sys.rs`. A hand-written `extern` declaration drifting from its header
+    fails to compile instead of silently reading wrong offsets, and both checks
+    are compile-time, so they stay valid when cross-compiling.
+  - Sentinels become types at the boundary: width `-1` becomes
+    `Width::NonPrintable` (distinct from `Width::Zero`, because output
+    sanitising must tell them apart), East Asian Ambiguous stays a caller
+    parameter per the T2 finding, and every C++ `bool`/`int` protocol becomes a
+    real `bool` or enum.
+  - Ownership is designed in, not documented in: `Token` owns its 432-byte
+    structure and borrows slices from `&self`; `Policy` owns its paths as
+    `CString`s and materialises the borrowed-pointer raw form only per call;
+    `Process` kills and reaps on drop. Raw policy construction goes through the
+    ABI's own `allow`/`allow_port` constructors rather than writing fields, so
+    the C side's normalisation rules cannot drift from a second implementation.
+  - 47 Rust tests, including cross-library agreement (a styled string measures
+    the same as its stripped form), chunk-boundary scanner resumption, sandbox
+    execution end-to-end (exit codes, environment non-inheritance, drop-kills),
+    and fail-closed refusals reached via `force_tier_for_testing`.
+  - Five deliberate mutations via the Rust branch of `scripts/mutate.sh`; four
+    caught, one (the layout ratchet) refused at build time by the
+    `static_assert`, which is that invariant's designed enforcement point. One
+    gap found and closed: nothing asserted `fixed_string` stops at the first
+    NUL or preserves bytes >= 0x80 through the negative-`c_char` conversion.
+  - `crates/supra_ffi/README.md` records the ratchet rationale, sentinel
+    discipline, and the full mutation table.
+
+- `scripts/mutate.sh` gained a Rust branch: for `.rs` targets it runs
+  `cargo test -p supra_ffi --locked` and inspects the log to keep the T4
+  discipline intact - one invocation both compiles and runs, so "could not
+  compile" is reported BUILD_FAIL (not a verdict) and only a compiled-then-
+  failed run counts as CAUGHT.
+
 - **T4** `cpp/libsupra_sandbox`: OS-level process isolation behind one C ABI.
   - Linux backend is native rather than a bubblewrap wrapper, decided by
     measurement: applying a Landlock ruleset and then exec'ing `bwrap` fails with
@@ -47,6 +84,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- `rustfmt.toml` claimed deterministic import ordering through
+  `imports_granularity` and `group_imports`, which are nightly-only options: on
+  the pinned stable toolchain they emitted a warning on every run and took no
+  effect, so the documented guarantee did not exist. Removed; what stable
+  actually provides (`reorder_imports`, which sorts within contiguous runs but
+  never across blank lines) is kept, and the std/external/crate grouping is
+  documented as an author-maintained convention rather than a formatter
+  guarantee.
 - `scripts/mutate.sh` replaces an inline mutation loop that **produced false
   results**: it ignored the build exit code, so a mutation rejected by `-Werror`
   left the previous correct binary in place, ctest passed, and it reported

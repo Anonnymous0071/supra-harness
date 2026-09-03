@@ -55,12 +55,18 @@ function(supra_declare_library target)
 
     target_link_libraries(${target} PRIVATE supra_cxx_flags)
 
+    # Archive naming must match what a linker expects from `-l<name>`, which is
+    # `lib<name>.a`. The CMake targets are already called `libsupra_*`, so the
+    # default prefix would produce `liblibsupra_width.a` and force callers to
+    # link `-l libsupra_width`. Stripping the redundant prefix from OUTPUT_NAME
+    # yields `libsupra_width.a` and the natural `-l supra_width`.
+    string(REGEX REPLACE "^lib" "" supra_archive_name "${target}")
+
     set_target_properties(
         ${target}
         PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-                   # Deterministic archive names: T5's build.rs links by path.
                    PREFIX "lib"
-                   OUTPUT_NAME "${target}"
+                   OUTPUT_NAME "${supra_archive_name}"
     )
 endfunction()
 

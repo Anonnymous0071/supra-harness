@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T4 complete. Stages T5 onward are unimplemented.
+Status: T1-T5 complete. Stages T6 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -565,3 +565,24 @@ filter (no seccomp-bpf), `rlimit` is scheduling pressure rather than cgroup
 accounting, a kernel bug defeats both mechanisms, and descriptors inherited across
 `exec` remain usable. T16 and T16.5 must close descriptors they do not intend to
 pass.
+
+**Verified in T5, and a warning about documented guarantees**: `rustfmt.toml`
+set `imports_granularity` and `group_imports`, which are nightly-only options.
+On the pinned stable toolchain they emitted a warning on every run and took no
+effect - the config documented a deterministic import order that did not exist,
+and nothing failed until a diff was actually inspected. The same failure shape
+applies to any tool configuration read from a channel other than the one that
+runs: a guarantee stated in a file is not a guarantee the tool enforces. What
+stable provides (`reorder_imports`, which sorts contiguous runs but never across
+blank lines) is now what the config claims, and the std/external/crate grouping
+is recorded as author-maintained convention, checked in review rather than by
+rustfmt.
+
+Two T5 FFI facts are binding on every later stage. First, `crates/supra_ffi` is
+the only crate permitted to contain `unsafe`; anything above it that reaches for
+`extern` is wrong and must either extend this crate's surface or justify a
+second confined crate deliberately. Second, the layout ratchet is enforced at
+compile time from both directions, and mutation M1 confirmed a drifted constant
+is refused by the build script's `static_assert` - so a future contributor
+"fixing" a layout mismatch by loosening an assertion is removing the only
+mechanism standing between the FFI and silently wrong answers.
