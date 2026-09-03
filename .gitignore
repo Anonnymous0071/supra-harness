@@ -1,0 +1,54 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# C++ / CMake (T2-T4)
+/build/
+/cpp/**/build/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+compile_commands.json
+Testing/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# WASM artefacts (T20)
+*.wasm
+/agents/**/target/
+
+# supra runtime state — never committed
+.supra/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Secrets. T12 writes an encrypted fallback; the plaintext form must never
+# reach a commit even transiently.
+*.enc
+.env
+.env.*
+!.env.example
+secrets.toml
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local scratch
+/tmp/
+/scratch/
+
+# ASan build tree
+/build-asan/

@@ -1,0 +1,85 @@
+name: security
+
+on:
+  schedule:
+    # Weekly, off the hour to avoid the cron rush.
+    - cron: "37 6 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "deny.toml"
+      - ".github/workflows/security.yml"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "deny.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  advisories:
+    name: advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Licence and banned-crate policy. Separate from the advisory job so a new
+  # CVE and a licence violation are distinguishable at a glance.
+  policy:
+    name: licence + bans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
+  codeql:
+    name: codeql
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, c-cpp]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y clang ninja-build
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Build C++ libraries
+        if: matrix.language == 'c-cpp'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build --parallel
+
+      - name: Build Rust workspace
+        if: matrix.language == 'rust'
+        run: cargo build --workspace --locked --all-targets
+
+      - uses: github/codeql-action/analyze@v3
+
+  # T12 writes an encrypted secrets fallback, and provider keys pass through
+  # this repository's config paths. A committed key is unrecoverable once
+  # pushed, so scan history rather than only the diff.
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

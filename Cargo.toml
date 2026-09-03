@@ -1,0 +1,148 @@
+[workspace]
+resolver = "3"
+members = []
+
+# ---------------------------------------------------------------------------
+# Shared package metadata. Every member crate inherits these with
+# `field.workspace = true` so version/licence/MSRV live in exactly one place.
+# ---------------------------------------------------------------------------
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trubs/supra-harness"
+authors = ["supra-harness contributors"]
+
+# ---------------------------------------------------------------------------
+# Dependency pinning policy
+#
+# Versions here carry a full major.minor.patch. Exact `=` pins are deliberately
+# NOT used: several dependency families (RustCrypto digest/hmac/aes-gcm,
+# rusqlite/libsqlite3-sys, wasmtime/cranelift) must agree on shared transitive
+# majors, and `=` pins make that unsolvable without vendoring.
+#
+# Reproducibility comes from the committed Cargo.lock plus `--locked` in every
+# CI invocation. Security patches stay reachable through `cargo update -p <x>`.
+#
+# Entries are declared ahead of the stage that consumes them so the stage map in
+# docs/ARCHITECTURE.md and this table stay in sync. An unused entry costs
+# nothing: Cargo only resolves a workspace dependency once a member selects it.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# async runtime + streams
+tokio = { version = "1.53.1", default-features = false }
+tokio-util = "0.7.19"
+futures = "0.3.34"
+bytes = "1.12.1"
+
+# serialisation. Canonical (sorted-key) emission is implemented in T13
+# supra_llm::ser::canonical; serde_json is the substrate, not the guarantee.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.5"
+
+# errors
+thiserror = "2.0.20"
+anyhow = "1.0.104"
+
+# diagnostics (T8)
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# identity + hashing (T6 Sealed<Segment>, T14 prefix hashing, T16.6 journal CAS)
+ulid = "3.0.0"
+blake3 = "1.8.7"
+
+# collections with the shapes T6/T14 need
+indexmap = "2.14.1"
+smallvec = "1.16.0"
+
+# storage (T10, T11)
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+# secrets (T12)
+keyring = "4.2.0"
+aes-gcm = "0.11.1"
+pbkdf2 = "0.13.0"
+sha2 = "0.11.0"
+hmac = "0.13.0"
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+# provider transport (T13)
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+
+# wasm host (T20)
+wasmtime = "48.0.1"
+
+# code intelligence (T15, T15.7)
+tree-sitter = "0.27.0"
+
+# shell sessions (T16.5)
+portable-pty = "0.9.0"
+
+# filesystem watching (T15 incremental digest, T19 skill hot-reload)
+notify = "8.2.0"
+
+# cli surface (T30)
+clap = { version = "4.6.6", features = ["derive", "env"] }
+
+# ---------------------------------------------------------------------------
+# Lints applied to every member via `[lints] workspace = true`.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code = "warn"           # T5 supra_ffi re-allows this; nowhere else may.
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Fail on the classes that silently corrupt a long-running agent process.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"          # stdout belongs to the protocol channel.
+print_stderr = "warn"          # diagnostics go through T8 supra_log.
+# Non-determinism is a cache-correctness bug here, not a style question.
+mutable_key_type = "deny"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.test]
+inherits = "dev"
+
+# Ships as a single static binary; optimise for size and startup, not for
+# build time. panic = "abort" also removes unwind tables from the binary.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+overflow-checks = true
+
+# Release codegen with symbols retained, for profiling the startup and
+# render budgets recorded in docs/ARCHITECTURE.md.
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = 1
+
+[profile.bench]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
+strip = "none"
+debug = 1

@@ -1,0 +1,10 @@
+edition = "2024"
+max_width = 110
+use_small_heuristics = "Max"
+newline_style = "Unix"
+# Deterministic import order. Import churn shows up as diff noise in a
+# workspace this wide, and diff noise hides real changes during review.
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"
+reorder_imports = true
+reorder_modules = true

@@ -1,0 +1,140 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Cheapest gates first: a formatting or licence failure should not wait on a
+  # C++ build.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show
+      - name: Install just
+        uses: extractions/setup-just@v3
+      - uses: Swatinem/rust-cache@v2
+      # Routed through just so the workspace-scope guard (no Rust members
+      # before T5) is applied identically here and locally.
+      - run: just fmt-check
+      - run: just clippy
+
+  supply-chain:
+    name: supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Count Rust members
+        id: members
+        run: echo "count=$(bash scripts/rust-members.sh)" >> "$GITHUB_OUTPUT"
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        if: steps.members.outputs.count != '0'
+        with:
+          command: check
+          arguments: --all-features
+
+  cpp:
+    name: cpp (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang clang-tidy ninja-build
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Build
+        run: cmake --build build --parallel
+      # --no-tests=error once libraries exist; before T2 an empty suite is the
+      # expected state and must not fail the pipeline.
+      - name: Test
+        shell: bash
+        run: |
+          if compgen -G "cpp/libsupra_*/CMakeLists.txt" >/dev/null; then
+            ctest --test-dir build --output-on-failure --no-tests=error
+          else
+            echo "no C++ libraries yet (T2-T4)"
+          fi
+
+  # C++ built with sanitizers on. The width and ANSI libraries index into
+  # static tables from untrusted byte input, so out-of-bounds reads must fail
+  # loudly in CI rather than silently returning a wrong cell width.
+  cpp-sanitizers:
+    name: cpp sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang ninja-build
+      - name: Configure
+        run: |
+          cmake -S . -B build-asan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DSUPRA_ENABLE_SANITIZERS=ON \
+            -DCMAKE_CXX_COMPILER=clang++
+      - name: Build
+        run: cmake --build build-asan --parallel
+      - name: Test
+        shell: bash
+        run: |
+          if compgen -G "cpp/libsupra_*/CMakeLists.txt" >/dev/null; then
+            ctest --test-dir build-asan --output-on-failure --no-tests=error
+          else
+            echo "no C++ libraries yet (T2-T4)"
+          fi
+
+  wasm:
+    name: wasm components
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add targets
+        run: rustup target add wasm32-wasip2 wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/build-wasm.sh wasm32-wasip2
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Install just
+        uses: extractions/setup-just@v3
+      - uses: Swatinem/rust-cache@v2
+      - run: just test-rust
+
+  # Guards the economics claims in docs/ARCHITECTURE.md. Not yet wired: the
+  # gate lands with T30 supra_eval. Left visible so the pipeline shows the
+  # obligation rather than hiding it.
+  economy-gate:
+    name: economy gate (T30)
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - uses: actions/checkout@v4
+      - run: just eval

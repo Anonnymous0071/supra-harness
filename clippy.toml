@@ -1,0 +1,32 @@
+# Clippy configuration. Complements [workspace.lints.clippy] in Cargo.toml.
+msrv = "1.85"
+
+# A coding agent runs unattended for hours. A single panic in a tool call path
+# ends the session, so deep call graphs are reviewed rather than tolerated.
+too-many-arguments-threshold = 8
+type-complexity-threshold = 350
+cognitive-complexity-threshold = 25
+
+# Names that carry meaning in this codebase and must not be flagged.
+doc-valid-idents = [
+    "SQLite",
+    "WASM",
+    "WASI",
+    "WIT",
+    "TTL",
+    "ANSI",
+    "UTF",
+    "CJK",
+    "LSP",
+    "DAP",
+    "MCP",
+    "PTY",
+    "AST",
+    "BM25",
+    "LRU",
+    "USD",
+    "OAuth",
+    "PKCE",
+    "TUI",
+    "..",
+]

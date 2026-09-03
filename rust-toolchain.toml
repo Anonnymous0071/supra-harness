@@ -1,0 +1,15 @@
+# Pinned so every contributor and CI runner compiles with the same rustc.
+# Bumping this is a deliberate, reviewable change.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy", "llvm-tools", "rust-src"]
+targets = [
+    # Host.
+    "x86_64-unknown-linux-gnu",
+    # T20 agent components. wasip2 is the component-model target the WIT ABI
+    # targets; wasip1 is retained as the fallback while component tooling
+    # stabilises.
+    "wasm32-wasip2",
+    "wasm32-wasip1",
+]
+profile = "minimal"

@@ -1,0 +1,200 @@
+# supra-harness build orchestration.
+#
+# One entry point for humans and CI. `just ci` is what the pipeline runs and
+# what you should run before pushing.
+#
+# Every cargo invocation passes --locked: Cargo.lock is the reproducibility
+# guarantee, since [workspace.dependencies] uses caret ranges rather than
+# exact pins (see the policy note in Cargo.toml).
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+# Out-of-source CMake build tree for the C++20 libraries (T2-T4).
+build_dir := justfile_directory() / "build"
+cmake_build_type := env("SUPRA_CMAKE_BUILD_TYPE", "RelWithDebInfo")
+
+# clang is the pinned C++ compiler: T22 reuses the clang static analyser, and
+# pinning one frontend keeps -Werror behaviour identical across machines.
+# Override with SUPRA_CXX to build with something else deliberately.
+cxx := env("SUPRA_CXX", "clang++")
+
+# WASM target for agent components (T20).
+wasm_target := "wasm32-wasip2"
+
+[private]
+default:
+    @just --list --unsorted
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
+# Report the toolchain this repository needs and what is actually present.
+doctor:
+    @bash scripts/check-deps.sh
+
+# Install missing rustup targets and components.
+bootstrap:
+    @bash scripts/bootstrap.sh
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+
+# Configure + build the C++20 libraries (T2 width, T3 ansi, T4 sandbox).
+build-cpp:
+    cmake -S . -B {{ build_dir }} -DCMAKE_BUILD_TYPE={{ cmake_build_type }} \
+        -DCMAKE_CXX_COMPILER={{ cxx }} -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+    cmake --build {{ build_dir }} --parallel
+
+# Build the agent WASM components (T20).
+build-wasm:
+    @bash scripts/build-wasm.sh {{ wasm_target }}
+
+# Debug build of the host workspace.
+build: build-cpp
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
+        echo "build: no Rust members yet (crates land from T5)"; exit 0
+    fi
+    cargo build --workspace --locked --all-targets
+
+# Release build: single static binary, size- and startup-optimised.
+release: build-cpp
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
+        echo "release: no Rust members yet (crates land from T5)"; exit 0
+    fi
+    cargo build --workspace --locked --release
+
+# Development loop: fast rebuild plus the host binary.
+dev:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
+        echo "dev: no Rust members yet (crates land from T5)"; exit 0
+    fi
+    cargo build --locked
+
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+
+# CTest suites for the C++20 libraries.
+#
+# An empty suite is expected before T2 but becomes a defect afterwards, so the
+# gate flips to --no-tests=error as soon as the first library directory exists.
+test-cpp: build-cpp
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if compgen -G "cpp/libsupra_*/CMakeLists.txt" >/dev/null; then
+        ctest --test-dir {{ build_dir }} --output-on-failure --no-tests=error
+    else
+        echo "test-cpp: no C++ libraries yet (they land in T2-T4)"
+    fi
+
+# Rust unit + integration tests.
+test-rust:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
+        echo "test-rust: no Rust members yet (crates land from T5)"; exit 0
+    fi
+    cargo test --workspace --locked --all-targets
+    cargo test --workspace --locked --doc
+
+test: test-cpp test-rust
+
+# ---------------------------------------------------------------------------
+# Quality gates
+#
+# The workspace has no Rust members until T5. Cargo's fmt/clippy/metadata
+# front-ends error on a virtual manifest with no members, so each gate reports
+# that it is out of scope rather than failing on tool misuse. Once T5 lands,
+# every gate engages with no justfile change.
+# ---------------------------------------------------------------------------
+
+[private]
+rust-members:
+    @bash scripts/rust-members.sh
+
+fmt:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
+        echo "fmt: no Rust members yet (crates land from T5)"; exit 0
+    fi
+    cargo fmt --all
+
+fmt-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
+        echo "fmt-check: no Rust members yet (crates land from T5)"; exit 0
+    fi
+    cargo fmt --all -- --check
+
+clippy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
+        echo "clippy: no Rust members yet (crates land from T5)"; exit 0
+    fi
+    cargo clippy --workspace --locked --all-targets -- -D warnings
+
+# Supply chain: advisories, licences, banned crates, source allowlist.
+deny:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
+        echo "deny: no dependency graph yet (crates land from T5)"; exit 0
+    fi
+    cargo deny --all-features check
+
+# clang-tidy over the C++20 sources. Requires build-cpp first for
+# compile_commands.json.
+tidy: build-cpp
+    @bash scripts/run-clang-tidy.sh {{ build_dir }}
+
+lint: fmt-check clippy deny
+
+# What CI runs. Ordered cheapest-first so failures surface fast.
+ci: lint test-cpp build-wasm test-rust
+
+# ---------------------------------------------------------------------------
+# Measurement
+# ---------------------------------------------------------------------------
+
+# Criterion benchmarks against the budgets in docs/ARCHITECTURE.md.
+bench:
+    cargo bench --workspace --locked
+
+# Economy gate (T30 supra_eval): cache hit rate, USD/turn, tier accuracy.
+eval:
+    @echo "supra_eval lands in T30; not yet implemented."
+    @exit 1
+
+docs:
+    cargo doc --workspace --locked --no-deps
+
+# ---------------------------------------------------------------------------
+# Distribution
+# ---------------------------------------------------------------------------
+
+package:
+    @echo "Cross-target packaging lands in T30; not yet implemented."
+    @exit 1
+
+# ---------------------------------------------------------------------------
+# Housekeeping
+# ---------------------------------------------------------------------------
+
+clean:
+    cargo clean
+    rm -rf {{ build_dir }}
+
+# Regenerate the third-party licence manifest.
+licenses:
+    @bash scripts/gen-licenses.sh
