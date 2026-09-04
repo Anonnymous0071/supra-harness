@@ -5,6 +5,7 @@ members = [
     "crates/supra_types",
     "crates/supra_config",
     "crates/supra_log",
+    "crates/supra_eventbus",
 ]
 
 # ---------------------------------------------------------------------------

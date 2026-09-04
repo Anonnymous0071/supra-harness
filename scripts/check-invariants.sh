@@ -331,6 +331,44 @@ if [ -d "$log" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T9 - the event bus
+# ---------------------------------------------------------------------------
+eventbus=crates/supra_eventbus/src
+
+if [ -d "$eventbus" ]; then
+    # Publishing must not be able to wait on a consumer. A `Result`, an `async fn`, or a
+    # blocking send in `publish` would let the slowest subscriber set turn latency.
+    publish=$(sed -n '/pub fn publish/,/^    }/p' "$eventbus/bus.rs")
+    if printf '%s' "$publish" | grep -qE 'async|\.await|-> *Result|blocking'; then
+        fail "publish can wait on a consumer" "$publish" \
+            "the publisher is the turn loop; backpressure belongs in the subscriber's ring"
+    fi
+    if ! grep -qE 'pub fn publish\(&self, event: Event\) -> EventSeq' "$eventbus/bus.rs"; then
+        fail "publish no longer has its infallible signature" \
+            "it must be sync, take an owned Event, and return only the sequence number"
+    fi
+
+    # The bus must not depend on an async runtime; waiting is the subscriber's business.
+    if grep -qE '^tokio|^futures' crates/supra_eventbus/Cargo.toml; then
+        fail "the event bus gained an async runtime dependency" \
+            "publishing cannot wait, so it needs none; an adapter belongs to its consumer"
+    fi
+
+    # A ring that drops an event must carry that event's own gap count forward, or a
+    # consumer summing `missed_before` under-reports while `missed_total` stays right.
+    if ! grep -q 'dropped.missed_before + 1' "$eventbus/bus.rs"; then
+        fail "an evicted delivery's gap count is no longer carried forward" \
+            "the two ways of asking about loss would disagree; see the invariant test"
+    fi
+
+    # The bitset width must be read from the topic list, not written as a literal.
+    if ! grep -q 'pub const WIDTH: usize = Topic::ALL.len()' "$eventbus/topic.rs"; then
+        fail "the topic bitset width is no longer derived from Topic::ALL" \
+            "a topic that does not fit would be silently undeliverable"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which
@@ -366,6 +404,7 @@ fi
 
 if [ "$status" -eq 0 ]; then
     echo "invariants: prompt ledger, ephemeral state, authority, quorum, unsafe confinement,"
-    echo "            the configuration schema, diagnostics, and internal versions all hold"
+    echo "            the configuration schema, diagnostics, the event bus, and internal versions"
+    echo "            all hold"
 fi
 exit "$status"

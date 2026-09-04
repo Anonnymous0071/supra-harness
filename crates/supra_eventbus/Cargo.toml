@@ -1,0 +1,23 @@
+[package]
+name = "supra_eventbus"
+description = "Filtered pub/sub for supra-harness: publishing cannot block, and a dropped event is a reported gap rather than silence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# No async runtime. Publishing is a synchronous, non-blocking, infallible call - which
+# is the strongest available form of "a slow subscriber cannot stall the turn loop",
+# because the publisher has no way to await anything. Waiting is the subscriber's
+# business, and it uses a `Condvar` from the standard library.
+#
+# An async adapter belongs to whichever stage first has an async consumer; building one
+# here, with none, would be guessing at its shape.
+[dependencies]
+supra_types = { workspace = true }
+thiserror = { workspace = true }

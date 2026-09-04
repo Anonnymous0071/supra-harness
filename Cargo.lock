@@ -377,6 +377,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_eventbus"
+version = "0.1.0"
+dependencies = [
+ "supra_types",
+ "thiserror",
+]
+
+[[package]]
 name = "supra_ffi"
 version = "0.1.0"
 dependencies = [

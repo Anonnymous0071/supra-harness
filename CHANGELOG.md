@@ -9,6 +9,37 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T9** `crates/supra_eventbus`: filtered publish/subscribe over the T6 event taxonomy.
+  - **Publishing cannot block, by type.** `Bus::publish` is synchronous, returns no
+    `Result`, and has nothing to await. The publisher is the turn loop; any shape that let
+    a consumer's slowness reach it would make turn latency a function of the slowest
+    subscriber. What gives instead is the subscriber's bounded, drop-oldest ring - blocking
+    the publisher stalls the turn, dropping the newest discards what a woken consumer most
+    needs, and an unbounded queue is the same bug with a longer fuse.
+  - Loss is reported twice over and the two agree: `Delivery::missed_before` rides the next
+    delivery a consumer wanted, `Subscription::missed_total` answers without waiting. An
+    invariant test states the relation directly - received plus buffered plus not-yet-
+    attached equals the lifetime total.
+  - No async runtime. Waiting is the subscriber's business and uses a `Condvar`; publishing
+    needs no runtime because it cannot wait. An adapter belongs to the first stage with an
+    async consumer.
+  - Events fan out as `Arc<Event>`, so cost does not scale with consumer count. Sequence
+    numbers are global and come from an atomic, so concurrent publishers produce a dense
+    sequence - a skipped number would be indistinguishable from a dropped event.
+  - `TopicSet` is a bitset whose width is read from `Topic::ALL`, with a compile-time
+    assertion that it still fits and an explicit match for bit positions. A twelfth topic
+    fails to compile rather than becoming silently undeliverable, and reordering the enum
+    cannot silently remap stored filters.
+  - Dropping the bus closes every subscription, so a waiter learns the stream ended instead
+    of retrying for ever; `Closed` takes precedence over `Timeout`. Every lock ignores
+    poisoning, and a test panics inside a subscriber to show the others keep working.
+  - 40 tests plus a doc test. Ten mutations, all caught.
+
+- `scripts/check-invariants.sh` gained the T9 checks: `publish` may not be async, return a
+  `Result`, or block; the crate may not gain an async runtime; an evicted delivery's gap
+  count must be carried forward; and the bitset width must stay derived from `Topic::ALL`.
+  All five probed against deliberate violations.
+
 - **T8** `crates/supra_log`: structured diagnostics, and the one crate permitted to
   write to stderr.
   - **Redaction happens at the sink**, over the whole formatted line, after every call
@@ -231,6 +262,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The event bus under-reported loss** (T9, found before shipping). A delivery evicted from
+  the front of the ring carries its own gap count, and discarding it made a consumer summing
+  `missed_before` under-report while `missed_total` stayed right. Two sources of truth that
+  disagree are worse than one that is approximate. The count is carried forward, and an
+  invariant test states the relation rather than sampling it.
+- **Two T9 tests looked like they covered a property while depending on something else** -
+  the same shape as the T6 length-prefix test and the T8 fast path. `publish`-side pruning
+  was checked through `subscriber_count()`, which prunes as it counts, so the check proved
+  nothing; closed with a non-pruning accessor. And the wakeup test asserted only that a
+  delivery arrived, when with no `notify_all` at all `wait_timeout_while` re-checks its
+  predicate at timeout expiry, finds the event, and returns it *successfully* ten seconds
+  later; closed by asserting the elapsed time is a fraction of the timeout.
 - **A FIFO log target hung the process at startup** (T8). Opening a FIFO for *writing*
   blocks until a reader appears, and the sink opens before any UI exists to explain the
   stall. T7 already guarded the equivalent on its read path and T8 had not - the same bug
