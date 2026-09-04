@@ -107,6 +107,27 @@ needs a value in a field of the wrong type, and removing it would leave "expecte
 usize" with nothing to compare against. The large, unconditional surface was the source
 excerpt, and that is gone.
 
+## Two defects found by a later audit
+
+**IPv6 loopback was rejected.** The loopback exemption split the authority on `:`, which
+yields `[` for `[::1]:8080` — so `http://[::1]:8080`, an ordinary local proxy, was refused
+with a message about sending credentials in clear. The authority is now parsed properly and
+loopback is decided by `IpAddr::is_loopback`, which covers the whole of `127.0.0.0/8` and
+`::1`.
+
+**And the first fix for it was itself a bypass.** Unwrapping the brackets and ignoring
+whatever followed made `http://[::1].evil.example` read as loopback — an attacker-controlled
+host served plaintext. Its own adversarial test caught it before it shipped. After the
+closing bracket the only thing permitted is a numeric port.
+
+The same reasoning is why loopback is *parsed* rather than prefix-matched:
+`starts_with("127.")` would have accepted `127.evil.example`.
+
+**Redaction echoed short multibyte values in full.** The guard was on `len()` — bytes —
+while the truncation took characters, so a two-character CJK value was six bytes, passed the
+guard, and was reproduced whole by the message whose entire purpose is not to reproduce it.
+Both now count characters.
+
 ## Reading files
 
 **The permission check is on the open handle.** Checking a path's mode and then opening
@@ -149,6 +170,10 @@ Twelve mutations, all caught.
 | M10 the env layer skips validation | CAUGHT |
 | M11 resolution takes arrival order | CAUGHT |
 | M12 the parse error echoes the file again | CAUGHT |
+| FIX-C IPv6 loopback endpoints rejected | CAUGHT |
+| FIX-C2 trailing junk after `]` treated as loopback | CAUGHT |
+| FIX-C3 loopback prefix-matched instead of parsed | CAUGHT |
+| FIX-D redaction guards on bytes, truncates characters | CAUGHT |
 
 M9 is caught as a **hang** rather than a failed assertion — removing the pre-flight
 `stat` makes the FIFO test block instead of fail, which is the behaviour the check

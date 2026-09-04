@@ -252,6 +252,18 @@ if [ -d "$config" ]; then
 render one verbatim"
     fi
 
+    # A loopback exemption must parse an address, never match a prefix. `127.evil.example`
+    # begins with the right digits and is an attacker-controlled hostname, and a bracketed
+    # IPv6 literal must not be unwrapped without checking what follows the `]`.
+    if ! grep -q 'is_loopback()' "$config/layer.rs"; then
+        fail "the loopback exemption no longer parses an address" \
+            "a prefix match would accept 127.evil.example and serve it plaintext"
+    fi
+    if ! grep -q 'if !port_is_well_formed' "$config/layer.rs"; then
+        fail "the bracketed-IPv6 authority is no longer refused when malformed" \
+            "unwrapping [::1] and ignoring the remainder accepted [::1].evil.example"
+    fi
+
     # Unknown keys must be refused, or a typo is silently ignored.
     for shape in ConfigLayer ThinkingLayer CohortLayer PermissionLayer PromptLayer ProviderLayer; do
         if ! grep -B4 "pub struct $shape" "$config/layer.rs" | grep -q 'deny_unknown_fields'; then
@@ -297,6 +309,18 @@ if [ -d "$log" ]; then
     if grep -qE 'SECRET_FIELDS[^;]*starts_with\(field\)|field[^;]*is_prefix' "$log/redact.rs"; then
         fail "the secret-field rule became a prefix match" \
             "api_key_env is a signpost, not a secret; the difference is four characters"
+    fi
+
+    # An open that can block for ever must be pre-flighted. T7 guards its read path and
+    # T8 initially did not, so pointing the log at a FIFO hung startup before any UI
+    # existed to explain it. The lesson generalises, so both are checked here.
+    if ! sed -n '/^fn open_append/,/^}/p' "$log/sink.rs" | grep -q 'refuse_blocking_target'; then
+        fail "open_append no longer calls the blocking-target pre-flight" \
+            "opening a FIFO for writing blocks until a reader appears, which hangs startup"
+    fi
+    if ! grep -q 'is_fifo()' "$log/sink.rs"; then
+        fail "the log sink's pre-flight no longer tests for a FIFO" \
+            "that is the one file type whose open blocks; /dev/null must stay usable"
     fi
 
     # The log file is owner-only, for the same reason T7 holds config to 0600.

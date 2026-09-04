@@ -672,6 +672,27 @@ model output. The lesson generalises: when a mutation survives, the first
 question is not "which test is missing" but "what is the test I already have
 actually depending on".
 
+**Three method notes from the post-T8 audit**, each a class rather than an
+incident.
+
+*A bug found once must be looked for everywhere.* T7 established that an `open`
+which can block needs a pre-flight `stat`, and T8 opened a log file without one -
+so a FIFO target hung startup before any UI existed to explain it. Fixing a class
+in one crate is not fixing the class. Both are now guarded, both are probed, and
+the guard covers every future crate that opens a path.
+
+*A fix is a change, and changes need adversarial tests.* The first correction for
+the IPv6 loopback bug was itself a bypass: unwrapping `[::1]` and ignoring what
+followed made `http://[::1].evil.example` read as loopback. It was caught by the
+test written alongside it, before it shipped. A security check that decides
+"is this the safe case" must be tested with inputs designed to look like the safe
+case and not be it.
+
+*Guards must test enforcement, not vocabulary.* Two checks added with these fixes
+grepped for an identifier that still existed after the mutation deleted the call
+site that used it. Both reported success on broken code. A check that a name
+appears somewhere in a file is not a check that the name does anything.
+
 The same applies to the checks in `scripts/check-invariants.sh`. Its first
 version truncated each file at the first `#[cfg(test)]` marker, leaving every
 line below the test module unscanned; a fourteen-case probe found it missed

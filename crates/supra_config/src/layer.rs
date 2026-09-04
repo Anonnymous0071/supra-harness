@@ -397,8 +397,7 @@ fn check_endpoint(layer: ConfigSource, setting: &str, value: &str) -> Result<(),
     }
 
     if let Some(rest) = value.strip_prefix("http://") {
-        let host = rest.split(['/', ':']).next().unwrap_or_default();
-        if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1") {
+        if is_loopback_authority(authority_host(rest)) {
             return Ok(());
         }
         return Err(ConfigError::Rejected {
@@ -417,6 +416,60 @@ fn check_endpoint(layer: ConfigSource, setting: &str, value: &str) -> Result<(),
         value: value.to_owned(),
         because: "an endpoint must start with https:// (or http:// on loopback)".to_owned(),
     })
+}
+
+/// The host part of an authority, with a bracketed IPv6 literal unwrapped.
+///
+/// Splitting on `:` alone is wrong for IPv6: `[::1]:8080` would yield `[`, so
+/// `http://[::1]:8080` - an ordinary local proxy - was rejected as though it pointed at
+/// the open internet, with a message about sending credentials in clear. Found by an
+/// audit after T7 shipped.
+///
+/// The **first fix for that was itself a bypass**, caught by its own adversarial test:
+/// unwrapping the brackets and ignoring whatever followed made
+/// `http://[::1].evil.example` read as loopback, so an attacker-controlled host would
+/// have been served plaintext. After the closing bracket the only thing permitted is a
+/// numeric port; anything else means the authority is malformed and is not loopback.
+///
+/// Returns an empty string for anything malformed, which no loopback test accepts.
+fn authority_host(rest: &str) -> &str {
+    // The authority ends at the first path, query, or fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        let Some(close) = after_bracket.find(']') else {
+            // Unclosed bracket: not a host at all.
+            return "";
+        };
+        let (host, remainder) = after_bracket.split_at(close);
+        // `remainder` starts with the `]` itself.
+        let after_close = remainder.get(1..).unwrap_or_default();
+        let port_is_well_formed = match after_close.strip_prefix(':') {
+            Some(port) => !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()),
+            None => after_close.is_empty(),
+        };
+        if !port_is_well_formed {
+            return "";
+        }
+        return host;
+    }
+
+    // Userinfo is not supported in an endpoint, so anything before an `@` stays in the
+    // host and fails the loopback test rather than being parsed away.
+    authority.split(':').next().unwrap_or_default()
+}
+
+/// Whether a host is loopback.
+///
+/// `localhost` by name, and anything the standard library itself considers loopback -
+/// which is the whole of `127.0.0.0/8` and `::1`, and correctly excludes a *hostname*
+/// like `127.evil.example` that merely begins with the right digits. A hand-rolled
+/// `starts_with("127.")` would have accepted that.
+fn is_loopback_authority(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>().is_ok_and(|address| address.is_loopback())
 }
 
 /// Describe a TOML failure without quoting the file.
@@ -466,13 +519,18 @@ fn line_and_column(text: &str, offset: usize) -> Option<(usize, usize)> {
 /// A rejected value may be the credential the reader mistakenly pasted, so the
 /// message shows enough to identify the field and no more. It is the *field* that
 /// needs naming, not the secret.
+///
+/// Counts **characters** throughout. An earlier version guarded on `len()` - bytes - and
+/// truncated with `chars().take()`, so a two-character CJK value was six bytes, passed
+/// the guard, and was then echoed in full. An audit caught it.
 fn redact(value: &str) -> String {
     const KEEP: usize = 4;
-    if value.len() <= KEEP {
+    let total = value.chars().count();
+    if total <= KEEP {
         return "\u{2026}".to_owned();
     }
     let head: String = value.chars().take(KEEP).collect();
-    format!("{head}\u{2026} ({} characters)", value.chars().count())
+    format!("{head}\u{2026} ({total} characters)")
 }
 
 #[cfg(test)]
@@ -794,6 +852,120 @@ mod tests {
         // Inside a multi-byte character, and past the end.
         assert_eq!(line_and_column(text, 2), None);
         assert_eq!(line_and_column(text, 9_999), None);
+    }
+
+    #[test]
+    fn an_ipv6_loopback_endpoint_is_accepted_in_every_form() {
+        // A real bug, found by an audit after T7 shipped. Splitting the authority on `:`
+        // alone yields `[` for `[::1]:8080`, so an ordinary local proxy over IPv6 was
+        // rejected with a message about sending credentials in clear.
+        for endpoint in [
+            "http://[::1]",
+            "http://[::1]:8080",
+            "http://[::1]:8080/v1",
+            "http://[::1]/v1?x=1",
+            "http://[0:0:0:0:0:0:0:1]:9",
+        ] {
+            let text = format!("[providers.p]\nendpoint = \"{endpoint}\"\n");
+            parse_and_validate(&text, ConfigSource::User)
+                .unwrap_or_else(|error| panic!("{endpoint} should be accepted: {error}"));
+        }
+    }
+
+    #[test]
+    fn the_whole_loopback_range_counts_not_just_one_address() {
+        // Loopback is 127.0.0.0/8, and the standard library already knows that. A
+        // hand-rolled list would have accepted only 127.0.0.1.
+        for endpoint in ["http://127.0.0.1", "http://127.0.0.2:8080", "http://127.1.2.3/v1"] {
+            let text = format!("[providers.p]\nendpoint = \"{endpoint}\"\n");
+            parse_and_validate(&text, ConfigSource::User)
+                .unwrap_or_else(|error| panic!("{endpoint} should be accepted: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_hostname_that_merely_looks_loopback_is_refused() {
+        // The trap in the other direction, and the reason the check parses an address
+        // rather than matching a prefix: `starts_with("127.")` would have accepted a
+        // hostname an attacker controls.
+        for endpoint in [
+            "http://127.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example",
+            "http://[::1].evil.example",
+            "http://[::1",
+            "http://[::1]:evil",
+            "http://user@127.0.0.1",
+        ] {
+            let text = format!("[providers.p]\nendpoint = \"{endpoint}\"\n");
+            assert!(
+                parse_and_validate(&text, ConfigSource::User).is_err(),
+                "{endpoint} must not pass as loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_parsing_isolates_the_host() {
+        assert_eq!(authority_host("localhost:8080/v1"), "localhost");
+        assert_eq!(authority_host("[::1]:8080/v1"), "::1");
+        assert_eq!(authority_host("[::1]"), "::1");
+        assert_eq!(authority_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(authority_host("host/path:with:colons"), "host");
+        assert_eq!(authority_host("host?query=:"), "host");
+        assert_eq!(authority_host(""), "");
+
+        // Malformed authorities yield nothing, which no loopback test accepts. The
+        // second of these was a bypass in the first version of this fix.
+        assert_eq!(authority_host("[::1"), "", "an unclosed bracket is not a host");
+        assert_eq!(authority_host("[::1].evil.example"), "", "trailing junk after `]`");
+        assert_eq!(authority_host("[::1]:evil"), "", "a non-numeric port");
+        assert_eq!(authority_host("[::1]:"), "", "an empty port");
+    }
+
+    #[test]
+    fn loopback_recognition_matches_the_standard_library() {
+        assert!(is_loopback_authority("localhost"));
+        assert!(is_loopback_authority("LOCALHOST"), "a hostname is case-insensitive");
+        assert!(is_loopback_authority("127.0.0.1"));
+        assert!(is_loopback_authority("127.255.255.254"));
+        assert!(is_loopback_authority("::1"));
+
+        assert!(!is_loopback_authority("128.0.0.1"));
+        assert!(!is_loopback_authority("127.evil.example"));
+        assert!(!is_loopback_authority(""));
+        assert!(!is_loopback_authority("::2"));
+    }
+
+    #[test]
+    fn redaction_counts_characters_not_bytes() {
+        // A real bug, found by an audit after T7 shipped. The guard was on `len()` -
+        // bytes - while the truncation took characters, so a two-character CJK value was
+        // six bytes, passed the guard, and was then echoed in full by the message whose
+        // whole purpose is not to echo it.
+        let two_chars = "\u{4E2D}\u{6587}";
+        assert_eq!(two_chars.len(), 6, "six bytes, two characters");
+        assert_eq!(redact(two_chars), "\u{2026}", "a short value reveals nothing at all");
+
+        // And a longer one keeps at most four characters, never more.
+        let five_chars = "\u{4E2D}\u{6587}\u{6E2C}\u{8A66}\u{5024}";
+        let shortened = redact(five_chars);
+        assert!(!shortened.contains(five_chars), "the whole value leaked: {shortened}");
+        assert!(shortened.contains("(5 characters)"), "{shortened}");
+        assert_eq!(
+            shortened.chars().take_while(|c| *c != '\u{2026}').count(),
+            4,
+            "exactly four characters of head: {shortened}"
+        );
+    }
+
+    #[test]
+    fn a_multibyte_value_is_not_echoed_by_the_validator() {
+        // The same property through the public path that produces the message.
+        let value = "\u{4E2D}\u{6587}";
+        let text = format!("[providers.p]\napi_key_env = \"{value}\"\n");
+        let error = parse_and_validate(&text, ConfigSource::User).expect_err("not a var name");
+        assert!(!error.to_string().contains(value), "the value leaked: {error}");
     }
 
     #[test]

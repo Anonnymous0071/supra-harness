@@ -231,6 +231,31 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **A FIFO log target hung the process at startup** (T8). Opening a FIFO for *writing*
+  blocks until a reader appears, and the sink opens before any UI exists to explain the
+  stall. T7 already guarded the equivalent on its read path and T8 had not - the same bug
+  class, missed on carry-over. An audit test hung until a pre-flight `stat` was added. Only
+  FIFOs are refused, so `/dev/null` stays a legitimate target.
+- **IPv6 loopback endpoints were rejected** (T7). The loopback exemption split the authority
+  on `:`, which yields `[` for `[::1]:8080`, so an ordinary local proxy was refused with a
+  message about sending credentials in clear. The authority is now parsed and loopback is
+  decided by `IpAddr::is_loopback`, covering all of `127.0.0.0/8` and `::1`.
+- **The first fix for that was itself a bypass** (T7). Unwrapping the brackets and ignoring
+  the remainder made `http://[::1].evil.example` read as loopback - an attacker-controlled
+  host served plaintext. Caught by its own adversarial test before shipping. After the
+  closing bracket only a numeric port is permitted. Loopback is parsed rather than
+  prefix-matched for the same reason: `starts_with("127.")` would accept
+  `127.evil.example`.
+- **Redaction echoed a short multibyte value in full** (T7). The guard was on `len()` -
+  bytes - while the truncation took characters, so a two-character CJK value was six bytes,
+  passed the guard, and was reproduced whole by the message whose purpose is not to
+  reproduce it. Both now count characters.
+- `write_to_file` had two identical `if`/`else` branches after a rotation attempt.
+  Collapsed; the tolerated-failure reasoning moved into a comment.
+- Two of the guard checks added with these fixes tested that a **name existed** rather than
+  that it was **enforced**: deleting only the call site, or only the `if`, left the grep
+  satisfied. A probe caught both. They now scan `open_append`'s body and the `if
+  !port_is_well_formed` gate specifically, and all four detect their violations.
 - **The redaction fast path silently let a whole class of credential through.** The
   pre-check that lets ordinary lines skip the matcher listed its own literals - `"sk-"`,
   `"gh"`, `"xox"` - and one was wrong: **`github_pat_` does not contain `gh`**, because

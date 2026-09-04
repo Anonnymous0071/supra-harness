@@ -216,14 +216,11 @@ impl Sink {
             // Close before renaming: on Windows an open handle blocks the rename, and
             // on Unix keeping it open would append to the rotated file instead.
             *guard = None;
-            if rotate(&self.config.path, self.config.keep).is_ok() {
-                *guard = Some(open_append(&self.config.path)?);
-            } else {
-                // Rotation failed - a read-only directory, a permission change. Keep
-                // writing to the current file rather than losing the diagnostics: an
-                // oversized log is a smaller problem than no log.
-                *guard = Some(open_append(&self.config.path)?);
-            }
+            // A rotation failure - a read-only directory, a permission change - is
+            // tolerated rather than propagated: an oversized log is a smaller problem
+            // than no log, and the reopen below is the same either way.
+            let _ = rotate(&self.config.path, self.config.keep);
+            *guard = Some(open_append(&self.config.path)?);
         }
 
         let open = guard.as_mut().ok_or_else(|| io::Error::other("log file is not open"))?;
@@ -283,6 +280,8 @@ impl std::fmt::Debug for Sink {
 /// redactor - whatever a message put in it. T7 holds the user's configuration to
 /// `0600`; a log written beside it at `0644` would make that pointless.
 fn open_append(path: &Path) -> io::Result<Open> {
+    refuse_blocking_target(path)?;
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -304,6 +303,49 @@ fn open_append(path: &Path) -> io::Result<Open> {
     // right direction when the alternative is losing diagnostics.
     let written = file.metadata().map_or(0, |meta| meta.len());
     Ok(Open { file, written })
+}
+
+/// Refuse a target whose `open` would block for ever.
+///
+/// Opening a FIFO for writing blocks until a **reader** appears. Since the sink is
+/// opened at startup, pointing the log at a pipe turns a misconfiguration into a hang
+/// with no diagnosis - before any UI exists to explain it. Verified by a test that hung
+/// until this check was added.
+///
+/// This is the same failure T7 guards against when reading configuration, and it was
+/// missed here: the lesson generalises, so it is now checked in both places and probed
+/// in both.
+///
+/// Only FIFOs are refused, not every non-regular file. `/dev/null` is a legitimate
+/// "discard the log" target and `/dev/full` is how the failure path is tested; both are
+/// character devices and both open immediately. A character device could in principle
+/// block, but refusing the class would cost more than it buys.
+///
+/// The pre-flight `stat` races with the open, exactly as in T7, and for the same reason
+/// that does not matter: exploiting it needs write access to the log directory, and
+/// anyone with that can simply replace the log.
+#[cfg(unix)]
+fn refuse_blocking_target(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.file_type().is_fifo() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a FIFO; opening one for writing blocks until a reader appears, \
+                 which would hang startup",
+                path.display()
+            ),
+        )),
+        // Anything else, including a path that does not exist yet, is handled by the
+        // open itself - a directory reports EISDIR with a clear message already.
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn refuse_blocking_target(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Shift `path` to `path.1`, `path.1` to `path.2`, and so on, dropping the oldest.
@@ -665,6 +707,50 @@ mod tests {
         for line in lines {
             assert!(line.starts_with("thread-") && line.contains("-line-"), "a line was torn: {line:?}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_fifo_log_target_is_refused_rather_than_hanging() {
+        // A real bug, found by an audit after T8 shipped. Opening a FIFO for *writing*
+        // blocks until a reader appears, and the sink opens at startup - so pointing the
+        // log at a pipe hung the process before any UI existed to explain why. T7 already
+        // guarded the equivalent on its read path; T8 had not.
+        //
+        // If this test ever hangs rather than fails, the pre-flight check has been
+        // removed. `scripts/mutate.sh` wraps the Rust branch in `timeout` for exactly
+        // this shape of regression.
+        let scratch = Scratch::new("fifo-target");
+        let fifo = scratch.log();
+        let made =
+            std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|status| status.success());
+        if !made {
+            eprintln!("skipped: mkfifo unavailable");
+            return;
+        }
+
+        let error = Sink::open(SinkConfig::new(&fifo).with_stderr(false))
+            .expect_err("a FIFO must be refused, not opened");
+        let text = error.to_string();
+        assert!(text.contains("FIFO"), "{text}");
+        assert!(text.contains("hang startup"), "the reason must be stated: {text}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_character_device_is_still_a_valid_target() {
+        // The complement: only FIFOs are refused. `/dev/null` is a legitimate "discard
+        // the log" target, and rejecting the whole non-regular class would break it - and
+        // would break the /dev/full test that covers the failure path.
+        let null = Path::new("/dev/null");
+        if !null.exists() {
+            eprintln!("skipped: /dev/null is unavailable");
+            return;
+        }
+        let sink =
+            Sink::open(SinkConfig::new(null).with_stderr(false)).expect("/dev/null must remain usable");
+        sink.write_line("discarded");
+        assert_eq!(sink.dropped_lines(), 0, "writing to /dev/null succeeds");
     }
 
     #[test]

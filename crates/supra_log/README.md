@@ -84,6 +84,20 @@ about the record.
 has nowhere to go. Rather than swallow it, the sink counts it and prepends a notice to the
 next line that succeeds. A gap in a log is only debuggable if the log says there is one.
 
+## A defect found by a later audit
+
+**A FIFO log target hung the process.** Opening a FIFO for *writing* blocks until a reader
+appears, and the sink opens at startup — so pointing the log at a pipe hung before any UI
+existed to explain why. T7 already guarded the equivalent on its read path; T8 had not, and
+the audit test hung until a pre-flight `stat` was added.
+
+Only FIFOs are refused, not every non-regular file: `/dev/null` is a legitimate "discard the
+log" target and `/dev/full` is how the failure path is tested, and both open immediately.
+
+The generalised lesson is recorded in `docs/ARCHITECTURE.md`: an `open` that can block for
+ever needs a pre-flight, and finding that bug once means checking every other place that
+opens a path.
+
 ## Whole-event granularity
 
 Redaction is only sound if it sees a complete line. The `fmt` layer calls
@@ -139,6 +153,8 @@ Twelve mutations. Eleven caught; one survives for a reason worth stating.
 | M10 a failed write is forgotten | CAUGHT *(survived first)* |
 | M11 an existing file's length is ignored | CAUGHT |
 | M12 `flush` leaves the buffer, double-emitting | CAUGHT |
+| FIX-A the FIFO pre-flight is removed | CAUGHT (as a hang) |
+| FIX-A2 the pre-flight refuses every non-regular file | CAUGHT |
 
 **M7 is not a test gap.** On Unix, `rename` replaces an existing target, so removing the
 oldest file first is redundant; on Windows, `rename` to an existing path fails and the
