@@ -9,6 +9,37 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T10** `crates/supra_store`: SQLite in WAL mode, forward-only migrations, and the
+  verbatim turn store invariant I4 rests on.
+  - Bodies are stored as `BLOB` and **never re-rendered**. Storing a structure and rendering
+    it back would make byte-identical recall depend on the renderer staying identical for the
+    life of the store, which nobody can promise across versions.
+  - Every row carries a digest of its own body; recall recomputes it and returns `Corrupt`
+    with **no bytes** on a mismatch. Returning them with a warning would be worse than
+    returning nothing - the model would carry on with content that is no longer what the
+    conversation contained. Tests cover all 256 byte values, an empty body, a megabyte of
+    non-repeating bytes, a tampered body, and a truncated one.
+  - A turn has one body: evicting identical bytes twice is a no-op so a retry is safe, and
+    evicting *different* bytes under the same id is refused.
+  - Eviction takes an `IMMEDIATE` transaction. It reads then writes, and a deferred
+    transaction that has read must *upgrade* - which SQLite refuses rather than deadlocking,
+    and `busy_timeout` cannot help because the upgrade is unsafe to retry.
+  - `synchronous = FULL` by default. In WAL, `NORMAL` can lose the last commits on power
+    loss, and this store holds turns the prefix has already dropped, so a lost commit is a
+    lost conversation. Affordable because eviction happens at a generation rewrite, not per
+    turn. **T14 must commit the eviction before dropping the turn from the prefix** - no
+    setting here makes the other order safe.
+  - Migrations are forward only; a store written by a newer supra is refused rather than
+    read with older code, which would misinterpret rather than fail.
+  - Establishes the canonical-kind convention: **T6 owns `0x00`-`0x0F`, downstream crates
+    take `0x10` upward, `0xF0`+ stays for tests**, enforced by a compile-time assertion
+    because a collision makes two different values hash alike.
+  - 45 tests plus a doc test. Ten mutations, all caught.
+
+- `scripts/check-invariants.sh` gained nine T10 checks and a `scan_sql` helper: `scan` blanks
+  string literals so a banned word in a message is not a hit, which made a check on embedded
+  SQL blind. All nine probed against deliberate violations.
+
 - **T9** `crates/supra_eventbus`: filtered publish/subscribe over the T6 event taxonomy.
   - **Publishing cannot block, by type.** `Bus::publish` is synchronous, returns no
     `Result`, and has nothing to await. The publisher is the turn loop; any shape that let
@@ -262,6 +293,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`STRICT` alone did not protect the turn id column** (T10, found before shipping). A
+  probe appeared to show SQLite rejecting an integer in a `TEXT` column; a test contradicted
+  it and the shell settled it - a STRICT `TEXT` column *accepts* an integer and converts it,
+  and the probe's rejection had come from the `BLOB` column beside the id. A turn id written
+  as `1` would have become the text `'1'`, parsed as nothing, and surfaced at recall. The
+  invariants the code depends on are now `CHECK` constraints: a 26-character id, a 32-byte
+  digest, `byte_len = length(body)`, a non-negative timestamp.
+- **`total()` returns a REAL** (T10, found before shipping). Chosen over `sum()` because
+  `sum()` of an empty table is `NULL`, and it silently traded that for a float - which failed
+  to deserialise, and would have started losing whole bytes above 2^53.
+  `coalesce(sum(...), 0)` gets both properties, and a test pins the types.
+- **Two T10 mutations survived a full suite.** Eviction's `IMMEDIATE` transaction was
+  untested because one process's connection mutex serialises writers; closed with two `Store`
+  handles on one file racing behind a barrier. And `decode_digest`'s wrong-width path was
+  unreachable through SQLite thanks to the `CHECK`; closed with a direct unit test, because
+  the distinction it preserves - `Malformed` means the file was edited around SQLite,
+  `Corrupt` means the bytes changed under a valid digest - points at different remedies.
+- **Two T10 guard checks were blind when first written**, both in the way the method note
+  predicts. One grepped for `SchemaTooNew` across the whole file and was satisfied by the
+  mention in the test module; it now scans `migrate` itself. The other used `scan`, which
+  blanks string literals - so a check for `total(byte_len)` could not see SQL living inside a
+  literal; `scan_sql` keeps string contents for exactly that case.
 - **The event bus under-reported loss** (T9, found before shipping). A delivery evicted from
   the front of the ring carries its own gap count, and discarding it made a consumer summing
   `missed_before` under-report while `missed_total` stayed right. Two sources of truth that

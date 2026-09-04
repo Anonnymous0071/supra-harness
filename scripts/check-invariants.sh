@@ -39,11 +39,15 @@ fail() {
 # Emit a file's shipped code as `path:line:text`, skipping cfg(test) bodies,
 # comments, and string literal contents.
 production_lines() {
-    python3 - "$1" <<'PY'
+    python3 - "$1" "${2:-blank-strings}" <<'PY'
 import re
 import sys
 
 path = sys.argv[1]
+# "blank-strings" (the default) erases literal contents, which is what an identifier check
+# wants. "keep-strings" leaves them, which is what a check on embedded SQL needs: there the
+# literal is the subject, and blanking it made the float check blind.
+keep_strings = len(sys.argv) > 2 and sys.argv[2] == "keep-strings"
 
 # Order matters: strings before line comments, so a "//" inside a literal is not
 # mistaken for a comment, and block comments before both.
@@ -53,9 +57,10 @@ LINE_COMMENT = re.compile(r"//.*$")
 
 
 def strip(line: str) -> str:
-    """Remove literals and comments so braces and identifiers are code only."""
-    line = STRING.sub('""', line)
-    line = CHAR.sub("''", line)
+    """Remove comments, and literals unless the caller asked to keep them."""
+    if not keep_strings:
+        line = STRING.sub('""', line)
+        line = CHAR.sub("''", line)
     return LINE_COMMENT.sub("", line)
 
 
@@ -113,10 +118,18 @@ with open(path, encoding="utf-8") as handle:
 PY
 }
 
-# Report matches of an extended regex against a file's shipped code.
+# Report matches of an extended regex against a file's shipped code, with string literals
+# blanked. Right for identifiers, wrong for embedded SQL.
 scan() {
     local file=$1 pattern=$2
     production_lines "$file" | grep -E "$pattern" || true
+}
+
+# As `scan`, but keeping string contents. For checks on embedded SQL, where the literal is
+# the subject rather than a place a banned word might innocently appear.
+scan_sql() {
+    local file=$1 pattern=$2
+    production_lines "$file" keep-strings | grep -E "$pattern" || true
 }
 
 crate=crates/supra_types/src
@@ -369,6 +382,70 @@ if [ -d "$eventbus" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T10 - durable storage
+# ---------------------------------------------------------------------------
+store=crates/supra_store/src
+
+if [ -d "$store" ]; then
+    # Invariant I4 promises a recalled turn comes back byte-identical. Recall must verify
+    # the digest and must NOT return the bytes when it fails: a caller cannot tell altered
+    # content from the real thing once it has it.
+    recall=$(sed -n '/pub fn recall_turn/,/^    }/p' "$store/turns.rs")
+    if ! printf '%s' "$recall" | grep -q 'StoreError::Corrupt'; then
+        fail "recall_turn no longer verifies the stored digest" \
+            "invariant I4 promises byte-identical recall; unverified bytes are a silent lie"
+    fi
+    if ! printf '%s' "$recall" | grep -q 'if computed != stored'; then
+        fail "recall_turn no longer compares the digests" \
+            "see ARCHITECTURE.md invariant I4"
+    fi
+
+    # Turn bodies are stored as bytes. A TEXT column would invite an encoding assumption
+    # between write and read, which is exactly what byte-identical rules out.
+    if ! grep -q 'body       BLOB    NOT NULL' "$store/schema.rs"; then
+        fail "the turn body column is no longer a BLOB" \
+            "TEXT invites an encoding assumption; I4 promises these bytes back unchanged"
+    fi
+
+    # STRICT alone does not protect a TEXT column - it accepts an integer and converts it.
+    # The invariants the code depends on are CHECK constraints for that reason.
+    for constraint in 'length(turn_id) = 26' 'length(body_hash) = 32' 'byte_len = length(body)'; do
+        if ! grep -qF "$constraint" "$store/schema.rs"; then
+            fail "the schema lost its CHECK on: $constraint" \
+                "STRICT does not cover this; a bad row would surface at recall instead"
+        fi
+    done
+
+    # A store written by a newer supra must be refused, never read with older code. Scoped
+    # to `migrate` itself: a probe showed a file-wide grep satisfied by the mention in the
+    # test module after the real check had been removed.
+    if ! sed -n '/pub fn migrate/,/^}/p' "$store/schema.rs" | grep -q 'SchemaTooNew'; then
+        fail "migrate no longer refuses a newer schema" \
+            "a later schema may reuse a name with different meaning; reading it misinterprets"
+    fi
+
+    # Durability is not a preference here: this store holds turns the prefix has dropped.
+    if ! grep -q 'Self::Full => "FULL"' "$store/lib.rs"; then
+        fail "the durable synchronous setting is gone" \
+            "in WAL, NORMAL can lose the last commits, and a lost commit is a lost turn"
+    fi
+    if ! grep -qE 'pub enum Synchronous \{' "$store/lib.rs" ||
+        ! sed -n '/pub enum Synchronous/,/^}/p' "$store/lib.rs" | grep -q '#\[default\]'; then
+        fail "Synchronous no longer has a default" \
+            "FULL must be what a caller gets without asking"
+    fi
+
+    # No floats. `total()` returns a REAL, which is how this was found. Uses `scan_sql`
+    # because the query lives in a string literal, and `scan` blanks those - a probe caught
+    # this check passing on code that had `total(byte_len)` back.
+    hits=$(scan_sql "$store/turns.rs" 'total\(byte_len\)|\bf32\b|\bf64\b')
+    if [ -n "$hits" ]; then
+        fail "a float reached the store's size accounting" "$hits" \
+            "total() returns REAL and loses whole bytes past 2^53; use coalesce(sum(...), 0)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which
@@ -404,7 +481,7 @@ fi
 
 if [ "$status" -eq 0 ]; then
     echo "invariants: prompt ledger, ephemeral state, authority, quorum, unsafe confinement,"
-    echo "            the configuration schema, diagnostics, the event bus, and internal versions"
-    echo "            all hold"
+    echo "            the configuration schema, diagnostics, the event bus, the turn store,"
+    echo "            and internal versions"
 fi
 exit "$status"

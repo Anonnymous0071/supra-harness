@@ -1,0 +1,24 @@
+[package]
+name = "supra_store"
+description = "Durable storage for supra-harness: verbatim turn eviction with byte-identical recall, on SQLite in WAL mode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# `bundled` compiles SQLite from source rather than linking whatever the host happens
+# to have. That is the point: invariant I4 promises a recalled turn is returned
+# byte-identical, and a guarantee measured against a library version that varies by
+# machine is not a guarantee.
+[dependencies]
+supra_types = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
