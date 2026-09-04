@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T10 complete. Stages T11 onward are unimplemented.
+Status: T1-T11 complete. Stages T12 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -250,6 +250,24 @@ symbol index, dependency graph, and git churn, maintained incrementally by a
 file watcher. A local hybrid BM25 + vector retrieval selects ~10 anchors, or
 ~300 tokens of precise pointers, appended in the suffix.
 
+That retrieval is T11. Two lanes, because they fail differently: the semantic
+lane finds a function that *does* what was asked without sharing a word with the
+question, and the lexical lane finds an identifier the question names outright.
+Fusing them is a union of two competences, not an average of two opinions - so
+fusion is over ranks (`SCALE / (K + rank)`, summed as integers), never over the
+lanes' own scores, which are not comparable and whose scales move with the corpus.
+
+The semantic lane scans one binary code per entry - one bit per dimension, 96
+bytes at 768 dimensions against 3072 for the vector - and then orders the hundred
+nearest by their **exact** vectors. The codes only choose candidates: one bit per
+dimension records a direction, not a magnitude, so it cannot separate the
+near-duplicates a code corpus is full of. Measured, that returns what an
+exhaustive scan would, at 9.6 MB resident per hundred thousand entries instead of
+307 MB. The binarisation threshold and the embedding model's identity are
+**frozen** at first write: a threshold that moves makes every code written before
+it answer a different question from every code written after, and the scan would
+rank them against each other without failing.
+
 ---
 
 ## 6. Permission model
@@ -385,7 +403,7 @@ backtracking.
 | T8 | `supra_log` | structured logs, rotation, redaction, stderr under TUI |
 | T9 | `supra_eventbus` | filtered pub/sub, explicit backpressure |
 | T10 | `supra_store` | SQLite WAL, versioned migrations |
-| T11 | `supra_vector` | sqlite-vec, two-tier LRU, BM25 |
+| T11 | `supra_vector` | FTS5/BM25, binary codes with exact rerank, two-tier LRU, rank fusion |
 | T12 | `supra_secrets` | OS keyring plus encrypted fallback |
 | T12.5 | `supra_guard` | seven anti-self-spawn layers |
 
@@ -501,7 +519,7 @@ Performance budgets:
 | per-turn overhead, no LLM | < 50 ms |
 | render frame | < 16 ms |
 | meter render | < 2 ms |
-| vector retrieval p99, 10k vectors | < 5 ms |
+| vector retrieval p99, 10k vectors | < 5 ms (measured 1.0 ms; 4.3 ms at 100k) |
 | digest, 5k files | < 10 s |
 | incremental digest update | < 100 ms |
 | cohort spawn, k=80 | < 1 s |
@@ -699,3 +717,66 @@ line below the test module unscanned; a fourteen-case probe found it missed
 seven violations out of eight while reporting success. A guard with a blind spot
 is worse than no guard, because it certifies. Any future structural check must
 be probed against deliberate violations before it is trusted.
+
+**Method note from T11, on measurement itself.** Two measurements in this stage
+produced reportable-looking numbers that were about the harness rather than the
+subject, and the same mistake in both cases was condemning an approach on the
+strength of a bad implementation of it.
+
+*A layout is not an approach.* The first exact-scan measurement reported 11.2 ms
+against a 5 ms budget and would have ruled out exhaustive search. It used one
+float accumulator, and float addition is not associative, so LLVM had to keep a
+single dependency chain; four accumulators cut it to 3.05 ms. The nested
+`Vec<Vec<f32>>` layout, which the diagnosis blamed first, made no difference at
+all.
+
+*A degenerate fixture indicts every method at once, and looks like a result.* The
+first recall measurement reported 0.544 for the design that shipped - and 0.055
+for an HNSW index, which is the tell, because no graph index is that bad. The
+corpus generator had normalised each centroid and then added per-component noise
+nine times the size of the centroid's own components, and drawn its queries from
+a differently seeded mixture. That is noise with a faint direction, not a
+clustered corpus: every pairwise similarity collapses onto one value, so nothing
+is retrievable and no method can be blamed for failing to retrieve it.
+
+The general rule: **a fixture must state the property the measurement depends
+on, and the measurement must assert it before reporting anything.** T11 exposes
+`CorpusSignal` for exactly that, and its integration test asserts the corpus is
+separable before it asserts recall. Where a number is impossible rather than
+merely bad, the harness is the first suspect, not the subject.
+
+*Two more instances of "enforcement, not vocabulary".* T11's schema checks were
+satisfied first by the module documentation quoting the constraint they were
+about, then - once comments were stripped - by the migration's own `--`
+commentary inside the SQL string literal. Both passed on a schema with the
+constraint deleted. The same weakness existed in T10's constraint checks and was
+found only because T11's were probed; T10's are now probed too. Twenty-two
+probes cover both stages.
+
+*And one in the harness.* `production_lines | grep -q` reports failure under
+`pipefail`: `grep -q` exits at its first match, closes the pipe, and the producer
+dies of `BrokenPipeError`. Every check written that way fails on a file that
+satisfies it - the opposite failure from a blind guard, and equally silent. A
+helper that searches shipped code must collect the output before searching it.
+
+**Decided in T11**: the stage map named `sqlite-vec`, and the implementation does
+not use it. The decision rests on measurement rather than preference:
+`sqlite-vec` v0.1.x is pre-v1 with breaking changes expected and documents no
+approximate index, so its KNN is exhaustive - the same algorithm, in C, behind an
+unstable API and a new build dependency. Measured, the code scan already meets
+the budget with 9.6 MB resident where an exhaustive f32 scan needs 307 MB, and
+its inner loop is at this host's memory bandwidth limit, so there is nothing left
+for a C kernel to win. An embedded HNSW was measured too and rejected on cost
+rather than accuracy: 67 MB of graph for ten thousand entries against 1 MB of
+codes, and 115 seconds to build a hundred thousand. What would reopen the
+question is a corpus past a few hundred thousand entries; the largest repository
+measured on this machine has 77,250 symbols, which is 7.4 MB of codes.
+
+**Decided in T11**: a second schema ledger. `user_version` is a single 32-bit
+slot and T10's core schema owns it, so every later owner of tables in that file -
+T11's index, T16.6's journal - records its own version in `schema_component`
+through `Store::migrate_component`. Each stage's DDL stays in the stage that owns
+its meaning; the file keeps one schema history. Both ledgers are forward-only,
+refuse a newer file, and carry each step's DDL and version bump in one
+transaction. `CREATE VIRTUAL TABLE ... USING fts5` was checked to roll back with
+its transaction, shadow tables included, rather than assumed to.

@@ -75,6 +75,38 @@ so the fsync never lands on the hot path.
 **T14 must commit the eviction before dropping the turn from the prefix.** No setting here
 can make the other order safe.
 
+## Two ledgers in one file
+
+`user_version` is a **single 32-bit slot per file**, so it can serve exactly one owner. It
+serves this crate's core schema, and it is also the bootstrap: a reader has to know the file is
+a supra store, and at which core version, before it can trust that anything else in the file
+exists.
+
+Every later owner of tables here — T11's vector index, T16.6's journal — records its own
+version in `schema_component`, through `Store::migrate_component`. That keeps each stage's
+table definitions in the stage that owns their meaning while the file still has one schema
+history. The alternative, one list here holding every downstream stage's DDL, would put T11 and
+T16.6 inside T10.
+
+Both ledgers have identical semantics: forward only, refuse a newer file, and one transaction
+per step carrying the DDL and the version bump together.
+
+**A `CREATE VIRTUAL TABLE ... USING fts5` rolls back with its transaction**, shadow tables
+included. Asserted rather than assumed: a virtual table's DDL runs the module's own
+constructor, which writes tables of its own, so there was no reason to expect it to inherit
+ordinary DDL's rollback — and a half-created FTS5 table would leave a component at version 0
+with its shadow tables present, failing every retry for ever on a name that already exists.
+
+## Two doors, and why they exist
+
+`with_connection` and `with_transaction` are how a crate that owns tables in this file reaches
+them. The connection itself stays `pub(crate)`: a caller holding it could take a lock this type
+is responsible for, or hold it past the point where this type expects to own it.
+
+`with_transaction` is generic over the caller's error type rather than returning `StoreError`.
+A downstream owner has its own failure vocabulary, and forcing it through this crate's would
+make every vector-shaped or journal-shaped fault arrive as a storage fault.
+
 ## Other decisions
 
 **A turn has one body.** Evicting identical bytes twice is a no-op, so a retry after a
@@ -135,9 +167,12 @@ rather than contorting the schema to reach it.
 
 ## Obligations left to later stages
 
-- **T11** adds vector search over the same file (`sqlite-vec`, two-tier LRU, BM25) and
-  should extend `MIGRATIONS` rather than open a second database.
+- **T11** is done: it registers the `vector` component in `schema_component` rather than
+  extending `MIGRATIONS`, which is the pattern every later owner of tables here should follow.
+  It uses neither `sqlite-vec` nor an approximate index; see its README for the measurements
+  that decided that.
 - **T14** owns the ordering constraint above, and the ~15 token index entry that replaces an
   evicted turn.
 - **T16.6** needs content-addressed storage for the journal. The digest convention and the
-  `CHECK`-enforced widths here are the pattern to follow.
+  `CHECK`-enforced widths here are the pattern to follow, and it registers its own component
+  rather than extending either existing list.

@@ -62,9 +62,10 @@ pub mod turns;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 pub use error::StoreError;
+pub use schema::ComponentMigration;
 pub use turns::{EvictedTurn, body_digest};
 
 /// The store is used from the turn loop and from a recall on another task, so this is a
@@ -254,6 +255,86 @@ impl Store {
     /// panicked would turn a recoverable fault into a dead session.
     pub(crate) fn connection(&self) -> MutexGuard<'_, Connection> {
         self.connection.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Run read work against this file, for a crate that owns tables in it.
+    ///
+    /// This door exists because `user_version` is one slot per file, so the file's core schema
+    /// history is single-owner and the later stages that own tables here need a way in. The
+    /// alternative was to move every downstream query into this crate, which would put T11's
+    /// and T16.6's logic inside T10.
+    ///
+    /// It is not a general escape hatch: the mutex stays inside, so no caller can hold the
+    /// connection past the closure or take the lock twice.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `work` returns.
+    pub fn with_connection<T, E>(&self, work: impl FnOnce(&Connection) -> Result<T, E>) -> Result<T, E> {
+        work(&self.connection())
+    }
+
+    /// Run write work against this file in one transaction, committing on success.
+    ///
+    /// Rolls back when `work` fails, and when the commit itself fails the error is the
+    /// commit's - so a caller that saw `Ok` here has a durable change and nothing in between
+    /// reports success.
+    ///
+    /// [`TransactionBehavior::Immediate`] is the right choice for anything that reads and then
+    /// writes: a deferred transaction that has already read must *upgrade*, which SQLite
+    /// refuses rather than waiting, and `busy_timeout` cannot help because the upgrade is
+    /// unsafe to retry.
+    ///
+    /// The error type is the caller's, not this crate's: a downstream owner of tables here has
+    /// its own failure vocabulary, and forcing it through [`StoreError`] would make every
+    /// vector-shaped fault arrive as a storage fault. The bound is what lets the transaction's
+    /// own open and commit failures reach the caller in that vocabulary.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `work` returns, or a converted [`rusqlite::Error`] when the transaction cannot
+    /// be opened or committed.
+    pub fn with_transaction<T, E>(
+        &self,
+        behavior: TransactionBehavior,
+        work: impl FnOnce(&Transaction<'_>) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<rusqlite::Error>,
+    {
+        let connection = self.connection();
+        let transaction = Transaction::new_unchecked(&connection, behavior)?;
+        let outcome = work(&transaction)?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    /// Bring one component's tables in this file up to date.
+    ///
+    /// Forward only, and a file whose component is ahead of this build is refused rather than
+    /// downgraded - the same rule as the core schema, for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ComponentSchemaTooNew`] when the file is ahead of this build, or
+    /// [`StoreError::ComponentMigrate`] when a step fails, in which case the recorded version
+    /// is unchanged.
+    pub fn migrate_component(
+        &self,
+        component: &str,
+        migrations: &[ComponentMigration],
+    ) -> Result<u32, StoreError> {
+        let connection = self.connection();
+        schema::migrate_component(&connection, &self.path, component, migrations)
+    }
+
+    /// The schema version recorded for one component. Zero when it has never migrated.
+    ///
+    /// # Errors
+    ///
+    /// Any failure reading the component table.
+    pub fn component_version(&self, component: &str) -> Result<u32, StoreError> {
+        schema::component_version(&self.connection(), component)
     }
 }
 

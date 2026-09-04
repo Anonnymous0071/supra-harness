@@ -54,11 +54,20 @@ keep_strings = len(sys.argv) > 2 and sys.argv[2] == "keep-strings"
 STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
 CHAR = re.compile(r"'(?:[^'\\]|\\.)'")
 LINE_COMMENT = re.compile(r"//.*$")
+# An SQL comment inside a kept literal. Only stripped in keep-strings mode, which exists for
+# checks whose subject is embedded SQL - and there a `--` comment is prose, not enforcement.
+#
+# A probe found this: two constraint checks passed after the constraint had been replaced,
+# because the migration's own `-- Exactly one row, pinned by CHECK (id = 1)` comment satisfied
+# the search. The guard was reading the schema's commentary as if it were the schema.
+SQL_COMMENT = re.compile(r"--.*$")
 
 
 def strip(line: str) -> str:
     """Remove comments, and literals unless the caller asked to keep them."""
-    if not keep_strings:
+    if keep_strings:
+        line = SQL_COMMENT.sub("", line)
+    else:
         line = STRING.sub('""', line)
         line = CHAR.sub("''", line)
     return LINE_COMMENT.sub("", line)
@@ -130,6 +139,24 @@ scan() {
 scan_sql() {
     local file=$1 pattern=$2
     production_lines "$file" keep-strings | grep -E "$pattern" || true
+}
+
+# Whether a fixed string appears in a file's shipped code, with literals kept and comments
+# stripped. For a check whose subject is a literal containing regex metacharacters - an SQL
+# `CHECK (...)` clause, say.
+#
+# The comment stripping is the point. A probe caught a constraint check passing after the
+# constraint had been deleted, because the module documentation quoted it: the guard was
+# testing that the codebase still contained the words, not that the schema still enforced them.
+#
+# The output is collected before it is searched rather than piped into `grep -q`. Under
+# `pipefail`, `grep -q` exits on its first match and closes the pipe, the Python producer dies
+# of `BrokenPipeError`, and the pipeline reports that failure - so every check would have failed
+# on a file that satisfied it. This is why `scan` and `scan_sql` end in `|| true`.
+has_sql() {
+    local file=$1 needle=$2 body
+    body=$(production_lines "$file" keep-strings || true)
+    printf '%s\n' "$body" | grep -qF "$needle"
 }
 
 crate=crates/supra_types/src
@@ -402,15 +429,21 @@ if [ -d "$store" ]; then
 
     # Turn bodies are stored as bytes. A TEXT column would invite an encoding assumption
     # between write and read, which is exactly what byte-identical rules out.
-    if ! grep -q 'body       BLOB    NOT NULL' "$store/schema.rs"; then
+    if ! has_sql "$store/schema.rs" 'body       BLOB    NOT NULL'; then
         fail "the turn body column is no longer a BLOB" \
             "TEXT invites an encoding assumption; I4 promises these bytes back unchanged"
     fi
 
     # STRICT alone does not protect a TEXT column - it accepts an integer and converts it.
     # The invariants the code depends on are CHECK constraints for that reason.
-    for constraint in 'length(turn_id) = 26' 'length(body_hash) = 32' 'byte_len = length(body)'; do
-        if ! grep -qF "$constraint" "$store/schema.rs"; then
+    #
+    # Through `has_sql` rather than a plain grep. The same check written against the whole file
+    # was satisfied by this module's own documentation, which quotes `byte_len = length(body)`
+    # while explaining why the constraint exists - so it would have passed with the constraint
+    # deleted. Found by probing the equivalent check in T11.
+    for constraint in 'CHECK (length(turn_id) = 26)' 'CHECK (length(body_hash) = 32)' \
+        'CHECK (byte_len = length(body))' 'CHECK (stored_at >= 0)'; do
+        if ! has_sql "$store/schema.rs" "$constraint"; then
             fail "the schema lost its CHECK on: $constraint" \
                 "STRICT does not cover this; a bad row would surface at recall instead"
         fi
@@ -442,6 +475,153 @@ if [ -d "$store" ]; then
     if [ -n "$hits" ]; then
         fail "a float reached the store's size accounting" "$hits" \
             "total() returns REAL and loses whole bytes past 2^53; use coalesce(sum(...), 0)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T11 - hybrid retrieval
+# ---------------------------------------------------------------------------
+vector=crates/supra_vector/src
+
+if [ -d "$vector" ]; then
+    # `bm25()` is negative and a better match is MORE negative. Ordering descending, or
+    # taking an absolute value, inverts the lexical lane - and inverts it silently, because
+    # every query still returns the number of results it was asked for.
+    lexical=$(sed -n '/pub fn search_lexical/,/^    }/p' "$vector/index.rs")
+    if ! printf '%s' "$lexical" | grep -q 'ORDER BY bm25(vector_text)'; then
+        fail "the lexical lane no longer ranks by bm25 ascending" \
+            "bm25() is negative; without this the lane returns its worst matches first"
+    fi
+    if printf '%s' "$lexical" | grep -qiE 'bm25\(vector_text\) DESC|abs\(bm25'; then
+        fail "the lexical lane inverted its bm25 ordering" \
+            "a better match is more negative; DESC and abs() both reverse the ranking"
+    fi
+
+    # The candidate stage cannot separate near-duplicates: one bit per dimension records a
+    # direction, not a magnitude. Measured, ranking by Hamming distance alone recovers 0.54
+    # of the exhaustive top-10 where the exact rerank recovers all of it - and nothing fails.
+    semantic=$(sed -n '/pub fn search_semantic/,/^    }/p' "$vector/index.rs")
+    if ! printf '%s' "$semantic" | grep -q 'codes::similarity'; then
+        fail "the semantic lane no longer reranks with exact vectors" \
+            "codes only choose candidates; without the rerank recall@10 falls to about 0.54"
+    fi
+
+    # A stale exact vector under a live slot reranks the new code against the old vector, and
+    # the answer looks ordinary. Both write paths must drop it.
+    for path in upsert remove; do
+        body=$(sed -n "/pub fn $path(/,/^    }/p" "$vector/index.rs")
+        if ! printf '%s' "$body" | grep -q 'cache.invalidate'; then
+            fail "$path no longer invalidates the exact-vector cache" \
+                "a stale vector under a live slot ranks wrongly and reports nothing"
+        fi
+    done
+
+    # An FTS5 row is keyed by rowid, so inserting over one without deleting first leaves two
+    # postings lists for the same entry - and a renamed symbol matches its old name for ever.
+    upsert=$(sed -n '/pub fn upsert(/,/^    }/p' "$vector/index.rs")
+    delete_at=$(printf '%s\n' "$upsert" | grep -n 'DELETE FROM vector_text' | head -1 | cut -d: -f1)
+    insert_at=$(printf '%s\n' "$upsert" | grep -n 'INSERT INTO vector_text' | head -1 | cut -d: -f1)
+    if [ -z "$delete_at" ] || [ -z "$insert_at" ]; then
+        fail "upsert no longer replaces the entry's indexed text" \
+            "it must DELETE then INSERT the fts5 row, or the old text keeps matching"
+    elif [ "$delete_at" -gt "$insert_at" ]; then
+        fail "upsert inserts its fts5 row before deleting the old one" \
+            "the delete must come first, or both postings lists survive"
+    fi
+
+    # The resident tier is a cache of what is durable. Updating it before the commit would
+    # leave it describing a write that failed, and every later query would trust it.
+    commit_at=$(printf '%s\n' "$upsert" | grep -n 'with_transaction' | head -1 | cut -d: -f1)
+    resident_at=$(printf '%s\n' "$upsert" | grep -n 'codes.upsert' | head -1 | cut -d: -f1)
+    if [ -z "$commit_at" ] || [ -z "$resident_at" ]; then
+        fail "upsert no longer writes through a transaction into the resident tier" \
+            "both must happen, in that order"
+    elif [ "$resident_at" -lt "$commit_at" ]; then
+        fail "upsert updates the resident tier before the transaction commits" \
+            "a failed write would leave the tier describing a row that does not exist"
+    fi
+
+    # The binarisation threshold is frozen. If it moves, every code written before the move
+    # answers a different question from every code written after, and the scan ranks them
+    # against each other without failing.
+    hits=$(scan_sql "$vector/index.rs" 'UPDATE vector_meta')
+    if [ -n "$hits" ]; then
+        fail "the frozen index configuration is being updated in place" "$hits" \
+            "moving the threshold silently invalidates every code already written"
+    fi
+    if ! printf '%s' "$(sed -n '/pub fn open(/,/^    }/p' "$vector/index.rs")" |
+        grep -q 'FrozenThresholdMismatch'; then
+        fail "open no longer refuses a changed threshold" \
+            "silently keeping the stored one leaves the caller wrong about its own encoding"
+    fi
+
+    # The two blobs in a row must describe the same width. A CHECK cannot reach vector_meta,
+    # but dims*4 against dims/8 is a fixed ratio for every dims.
+    #
+    # Through `has_sql`, which strips comments: a probe caught the plain `grep -F` version
+    # passing after the constraint had been deleted, satisfied by the module documentation that
+    # quotes it. The guard was testing vocabulary rather than enforcement.
+    for constraint in 'CHECK (length(embedding) = length(code) * 32)' 'CHECK (id = 1)' \
+        'CHECK (length(threshold) = dims * 4)' 'contentless_delete=1'; do
+        if ! has_sql "$vector/schema.rs" "$constraint"; then
+            fail "the vector schema lost: $constraint" \
+                "each of these is an invariant no code path can otherwise be stopped from breaking"
+        fi
+    done
+
+    # MAX_DIMS is stated twice - as a constant and as a literal inside the migration, which
+    # cannot reference it. A drift between them accepts a width the scan cannot meet its
+    # budget at, or refuses one it can.
+    declared=$(sed -n 's/^pub const MAX_DIMS: usize = \([0-9_]*\);/\1/p' "$vector/schema.rs" |
+        tr -d '_')
+    in_sql=$(grep -oE 'dims <= [0-9]+' "$vector/schema.rs" | grep -oE '[0-9]+' | head -1)
+    if [ -z "$declared" ] || [ -z "$in_sql" ]; then
+        fail "could not read MAX_DIMS from both the constant and the migration" \
+            "the agreement between them is what this check is about"
+    elif [ "$declared" != "$in_sql" ]; then
+        fail "MAX_DIMS is $declared but the migration allows $in_sql" \
+            "the CHECK cannot reference the constant, so the two must be edited together"
+    fi
+
+    # `user_version` is one slot and T10's core schema owns it. A second writer there would
+    # make each stage believe the other had regressed.
+    #
+    # Scanned through `scan_sql`, which keeps string literals - a `PRAGMA user_version` lives in
+    # one - but strips comments. A plain recursive grep fired on the module documentation that
+    # explains why this crate uses the component ledger instead, which is the difference between
+    # checking enforcement and checking vocabulary.
+    for file in "$vector"/*.rs; do
+        hits=$(scan_sql "$file" 'user_version')
+        if [ -n "$hits" ]; then
+            fail "supra_vector touches the file's user_version" "$hits" \
+                "it owns a row in schema_component; user_version belongs to T10's core schema"
+        fi
+    done
+
+    # The fused score is an integer. Normalising two lanes' scores onto a shared range makes
+    # the fused ranking depend on corpus size, which is why fusion is over ranks.
+    if ! grep -q 'pub score: u64' "$vector/search.rs"; then
+        fail "the fused score is no longer an integer" \
+            "rank fusion is integer arithmetic so the same inputs fuse identically everywhere"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# The store's connection stays behind its mutex
+#
+# `with_connection` and `with_transaction` are the only doors for a crate that owns
+# tables in T10's file. Handing out the connection itself would let a caller take a
+# lock the `Store` is responsible for, or hold it across an await.
+# ---------------------------------------------------------------------------
+if [ -f "crates/supra_store/src/lib.rs" ]; then
+    if ! grep -qE 'pub\(crate\) fn connection\(' crates/supra_store/src/lib.rs; then
+        fail "Store::connection is no longer crate-private" \
+            "a caller holding the connection can take a lock the Store is responsible for"
+    fi
+    hits=$(scan crates/supra_store/src/lib.rs 'pub fn connection\(')
+    if [ -n "$hits" ]; then
+        fail "Store::connection was made public" "$hits" \
+            "use with_connection or with_transaction, which keep the mutex inside"
     fi
 fi
 
@@ -482,6 +662,6 @@ fi
 if [ "$status" -eq 0 ]; then
     echo "invariants: prompt ledger, ephemeral state, authority, quorum, unsafe confinement,"
     echo "            the configuration schema, diagnostics, the event bus, the turn store,"
-    echo "            and internal versions"
+    echo "            hybrid retrieval, the store's connection, and internal versions"
 fi
 exit "$status"

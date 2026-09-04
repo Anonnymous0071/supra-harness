@@ -9,6 +9,73 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T11** `crates/supra_vector`: hybrid lexical and semantic retrieval over T10's file -
+  FTS5/BM25, binary codes with an exact rerank, a bounded exact-vector cache, and rank fusion.
+  - **The first stage's cost is bytes moved.** At 768 dimensions an exact vector is 3072 bytes
+    and a code is 96. Measured on a 4-core i3-8100T, worst of 20: an exhaustive f32 scan takes
+    24.584 ms and 307 MB resident at a hundred thousand entries, where the code scan takes
+    4.037 ms and 9.6 MB. The exhaustive scan is not slow because of its loop - it runs at about
+    12.5 GB/s, this host's single-core streaming limit - but because it reads 307 MB.
+  - **The codes only choose candidates; the exact vectors order them.** One bit per dimension
+    records a direction, not a magnitude, so it cannot separate the near-duplicates a code
+    corpus is full of. Over a hundred queries on a corpus with cluster structure, a rerank width
+    of 50 recovers the exhaustive top-10 in full, and 100 keeps doing so on every corpus whose
+    top-10 similarity exceeds its mean by 0.29 or more.
+  - **The binarisation threshold is frozen at first write.** A threshold that moves makes every
+    code written before it answer a different question from every code written after, and the
+    scan ranks them against each other without failing. A caller passing a different threshold
+    is told rather than silently overridden, compared over encoded bytes rather than floats.
+  - **A model change is reported, not scored.** Embeddings from two models share no space, so a
+    cosine between them is a number with no meaning - and it would still rank. The caller
+    decides between re-embedding and running lexical-only.
+  - **Fusion is over ranks.** A cosine is bounded; `bm25()` is unbounded, negative, and scaled by
+    corpus term statistics, so normalising them onto a shared range would make the fused ranking
+    depend on corpus size. `SCALE / (K + rank)` summed as integers is reproducible bit-for-bit. A
+    slot missing from a lane contributes nothing rather than a penalty: the lexical lane is
+    always narrower, and scoring silence as negative would let it veto the wider one.
+  - **`bm25()` is negative and better is more negative**, so ordering is ascending; `DESC` or an
+    absolute value inverts the lane while still returning the requested number of results.
+  - **The lexical query is tokenised, not passed through.** FTS5 gives meaning to quotes, stars,
+    parentheses, colons, hyphens, carets and the bare words `AND`/`OR`/`NOT`/`NEAR`, all of which
+    appear in a task description - so `fix the parser (see #12)` passed through is a syntax
+    error. Terms are runs of alphanumerics and underscores, quoted and joined with `OR`.
+  - **The text is indexed but not stored** (`content=''`, `contentless_delete=1`): the corpus is
+    the source of truth for its own text, and `contentless_delete=1` is what lets an
+    incrementally maintained index delete a row at all.
+  - **Both resident tiers are updated only after the commit**, so a failed write cannot leave
+    them describing a row that does not exist.
+  - `RRF_SCALE` was 1,000,000 with a comment claiming rank distinctness to 1000. It collapses at
+    941. The claim is now derived from `MAX_FUSION_DEPTH` and asserted at compile time.
+
+- **T10** `crates/supra_store`: a second schema ledger, and two doors for the stages that own
+  tables in the same file.
+  - `user_version` is a single 32-bit slot and the core schema owns it, so every later owner
+    records its own version in `schema_component` through `Store::migrate_component`. Each
+    stage's DDL stays in the stage that owns its meaning while the file keeps one schema history.
+    Both ledgers are forward-only, refuse a newer file, and carry each step's DDL and version
+    bump in one transaction.
+  - `CREATE VIRTUAL TABLE ... USING fts5` was **verified** to roll back with its transaction,
+    shadow tables included, rather than assumed to: a half-created FTS5 table would leave a
+    component at version 0 with its shadow tables present, failing every retry for ever on a name
+    that already exists.
+  - `Store::with_connection` and `Store::with_transaction` keep the mutex inside, so no caller
+    can hold the connection past its closure or take the lock twice. `with_transaction` is
+    generic over the caller's error type, so a downstream fault does not arrive as a storage
+    fault.
+
+### Fixed
+
+- `scripts/check-invariants.sh`: three defects, all found by probing rather than by review.
+  - A constraint check was satisfied by the module documentation that quotes the constraint, and
+    then - once comments were stripped - by the migration's own `--` commentary inside the SQL
+    string literal. Both passed on a schema with the constraint deleted.
+  - **The same weakness existed in T10's constraint checks** and was found only because T11's
+    were probed. T10's are now probed too; twenty-two probes cover both stages.
+  - `production_lines | grep -q` reports failure under `pipefail`, because `grep -q` exits at its
+    first match, closes the pipe, and the Python producer dies of `BrokenPipeError`. Every check
+    written that way would have failed on a file that satisfied it - the opposite failure from a
+    blind guard, and equally silent.
+
 - **T10** `crates/supra_store`: SQLite in WAL mode, forward-only migrations, and the
   verbatim turn store invariant I4 rests on.
   - Bodies are stored as `BLOB` and **never re-rendered**. Storing a structure and rendering

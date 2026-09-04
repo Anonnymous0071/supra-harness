@@ -41,6 +41,27 @@ pub enum StoreError {
         supported: u32,
     },
 
+    /// A component's tables in this file were written by a newer version of supra.
+    ///
+    /// Separate from [`StoreError::SchemaTooNew`] because the remedy is reported against a
+    /// component rather than the file: the core schema can be current while one owner's
+    /// tables are ahead, which is exactly what happens when a build is downgraded.
+    #[error(
+        "component {component:?} in the store at {} is at schema version {found}, and this \
+         build understands up to {supported}; it was written by a newer supra",
+        path.display()
+    )]
+    ComponentSchemaTooNew {
+        /// The file involved.
+        path: PathBuf,
+        /// Which component owns the tables.
+        component: String,
+        /// Version recorded for that component.
+        found: u32,
+        /// Highest version this build can apply.
+        supported: u32,
+    },
+
     /// A migration failed.
     ///
     /// The schema version is unchanged: each migration runs inside a transaction, and
@@ -48,6 +69,25 @@ pub enum StoreError {
     #[error("migration to schema version {to} failed, store left at {from}: {source}")]
     Migrate {
         /// Version the store was at.
+        from: u32,
+        /// Version being applied.
+        to: u32,
+        /// The underlying failure.
+        source: rusqlite::Error,
+    },
+
+    /// A component's migration failed.
+    ///
+    /// As [`StoreError::Migrate`]: the recorded version is unchanged, because the DDL and
+    /// the version bump share one transaction.
+    #[error(
+        "migration of component {component:?} to schema version {to} failed, left at \
+         {from}: {source}"
+    )]
+    ComponentMigrate {
+        /// Which component owns the tables.
+        component: String,
+        /// Version the component was at.
         from: u32,
         /// Version being applied.
         to: u32,

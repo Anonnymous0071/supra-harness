@@ -1,5 +1,21 @@
 //! Versioned, forward-only schema migrations.
 //!
+//! # Two ledgers, and why there have to be two
+//!
+//! `user_version` is a **single 32-bit slot per file**, so it can serve exactly one owner.
+//! It serves this crate's core schema - the verbatim turn store - and it is also the
+//! bootstrap: a reader has to know the file is a supra store, and at which core version,
+//! before it can trust that anything else in the file exists.
+//!
+//! Every other owner of tables in this file - T11's vector index, T16.6's journal - records
+//! its own version in [`COMPONENT_TABLE`], through [`migrate_component`]. That keeps each
+//! stage's table definitions in the stage that owns their meaning, while the file still has
+//! one schema history. The alternative, a single list here holding every downstream stage's
+//! DDL, would put T11 and T16.6 inside T10.
+//!
+//! Both ledgers have identical semantics: forward only, refuse a newer file, and one
+//! transaction per step carrying the DDL and the version bump together.
+//!
 //! # Forward only
 //!
 //! There are no down migrations. A store written by a newer supra is **refused**, not
@@ -10,21 +26,23 @@
 //! # Atomic, verified rather than assumed
 //!
 //! Each migration runs in one transaction that carries both the DDL and the
-//! `user_version` bump. SQLite rolls those back together, so a failed migration leaves the
+//! version bump. SQLite rolls those back together, so a failed migration leaves the
 //! store exactly where it was rather than half-applied at an unrecorded version.
 //!
 //! That was checked against the bundled SQLite (3.53) before this file was written, and
 //! there is a test here that fails a migration deliberately and asserts the version did
 //! not move - because "SQLite has transactional DDL" is the sort of claim that is true
-//! until some pragma makes it not.
+//! until some pragma makes it not. A second test does the same for a `CREATE VIRTUAL TABLE
+//! ... USING fts5`, because a virtual table's DDL runs the module's own constructor and
+//! there is no reason to assume it inherits the guarantee.
 //!
 //! # Adding one
 //!
-//! Append to [`MIGRATIONS`]. Never edit an entry that has shipped: a store in the field is
-//! already at that version and will not re-run it, so an edit changes what new stores get
-//! and leaves old ones different for ever.
+//! Append to [`MIGRATIONS`], or to the component's own list. Never edit an entry that has
+//! shipped: a store in the field is already at that version and will not re-run it, so an
+//! edit changes what new stores get and leaves old ones different for ever.
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, OptionalExtension as _, Transaction};
 
 use crate::error::StoreError;
 
@@ -35,6 +53,9 @@ struct Migration {
     /// What it does. Runs as a batch, inside a transaction.
     sql: &'static str,
 }
+
+/// Where each non-core owner's schema version is recorded. See the module documentation.
+pub const COMPONENT_TABLE: &str = "schema_component";
 
 /// Every schema step, in order.
 ///
@@ -50,9 +71,10 @@ struct Migration {
 /// path can bypass them. A turn id that is not 26 characters, a digest that is not 32
 /// bytes, or a length column that disagrees with the blob it describes is refused at write
 /// time rather than discovered at recall.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: "
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: "
         CREATE TABLE evicted_turn (
             -- The 26-character Crockford form rather than 16 opaque bytes: it sorts
             -- lexicographically in SQL the same way it sorts by time, and it is readable
@@ -81,7 +103,24 @@ const MIGRATIONS: &[Migration] = &[Migration {
         -- Eviction order, for a report that wants the oldest first without a full scan.
         CREATE INDEX evicted_turn_stored_at ON evicted_turn (stored_at);
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        sql: "
+        -- One row per non-core owner of tables in this file. See the module documentation
+        -- for why `user_version` cannot serve them: it is one slot, and there is more than
+        -- one owner.
+        CREATE TABLE schema_component (
+            name    TEXT    PRIMARY KEY NOT NULL
+                    CHECK (length(name) > 0),
+            -- 0 means registered but not yet migrated, which never persists: the row is
+            -- written by the same transaction that applies a step.
+            version INTEGER NOT NULL
+                    CHECK (version >= 0)
+        ) STRICT;
+    ",
+    },
+];
 
 /// The highest schema version this build understands.
 #[must_use]
@@ -99,6 +138,143 @@ pub fn current_version(connection: &Connection) -> Result<u32, StoreError> {
     u32::try_from(version).map_err(|_| StoreError::Malformed {
         detail: format!("user_version is {version}, which is not a schema version"),
     })
+}
+
+/// One schema step belonging to a component rather than to the core store.
+///
+/// A component declares its own list in its own crate, so its table definitions live beside
+/// the code that gives them meaning.
+#[derive(Clone, Copy, Debug)]
+pub struct ComponentMigration {
+    /// The version this step produces. Must be dense from 1, as the core list is.
+    pub version: u32,
+    /// What it does. Runs as a batch, inside a transaction.
+    pub sql: &'static str,
+}
+
+/// Read the schema version recorded for one component. Zero when it has never migrated.
+///
+/// # Errors
+///
+/// [`StoreError::Malformed`] when the recorded value is not a version, or any database
+/// failure. Reading before the core schema created [`COMPONENT_TABLE`] is a database
+/// failure, not zero: a missing table means the file is older than this build expects, and
+/// answering "version 0" would invite a component to re-apply its first migration onto
+/// tables that may already exist.
+pub fn component_version(connection: &Connection, component: &str) -> Result<u32, StoreError> {
+    let version: Option<i64> = connection
+        .query_row(&format!("SELECT version FROM {COMPONENT_TABLE} WHERE name = ?1"), [component], |row| {
+            row.get(0)
+        })
+        .optional()?;
+
+    match version {
+        None => Ok(0),
+        Some(found) => u32::try_from(found).map_err(|_| StoreError::Malformed {
+            detail: format!("component {component:?} records version {found}, which is not a version"),
+        }),
+    }
+}
+
+/// Bring one component's tables up to the last version in `migrations`.
+///
+/// Same semantics as [`migrate`]: forward only, a newer file is refused, and each step's DDL
+/// and version bump share one transaction.
+///
+/// # Errors
+///
+/// [`StoreError::ComponentSchemaTooNew`] when the file is ahead of this build,
+/// [`StoreError::ComponentMigrate`] when a step fails - in which case the recorded version
+/// is unchanged.
+///
+/// # Panics
+///
+/// Never. `migrations` is validated for density by [`assert_dense`] in each component's own
+/// test, not here, because a malformed list is a programming error rather than a file state.
+pub fn migrate_component(
+    connection: &Connection,
+    path: &std::path::Path,
+    component: &str,
+    migrations: &[ComponentMigration],
+) -> Result<u32, StoreError> {
+    let mut version = component_version(connection, component)?;
+    let latest = migrations.last().map_or(0, |migration| migration.version);
+
+    if version > latest {
+        return Err(StoreError::ComponentSchemaTooNew {
+            path: path.to_path_buf(),
+            component: component.to_owned(),
+            found: version,
+            supported: latest,
+        });
+    }
+
+    for migration in migrations {
+        if migration.version <= version {
+            continue;
+        }
+        apply_component(connection, component, migration).map_err(|source| StoreError::ComponentMigrate {
+            component: component.to_owned(),
+            from: version,
+            to: migration.version,
+            source,
+        })?;
+        version = migration.version;
+    }
+
+    Ok(version)
+}
+
+/// Run one component migration, DDL and version row together.
+fn apply_component(
+    connection: &Connection,
+    component: &str,
+    migration: &ComponentMigration,
+) -> rusqlite::Result<()> {
+    // `new_unchecked` because the connection is reached through a shared reference: the
+    // `Store` holds it behind a mutex and hands out `&Connection`. IMMEDIATE for the same
+    // reason eviction uses it - this reads the recorded version and then writes, and a
+    // deferred transaction that has already read must upgrade, which SQLite refuses rather
+    // than waiting.
+    let transaction = Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute_batch(migration.sql)?;
+    transaction.execute(
+        &format!(
+            "INSERT INTO {COMPONENT_TABLE} (name, version) VALUES (?1, ?2) \
+             ON CONFLICT (name) DO UPDATE SET version = excluded.version"
+        ),
+        rusqlite::params![component, i64::from(migration.version)],
+    )?;
+    transaction.commit()
+}
+
+/// Assert at compile time that a migration list is ordered and dense from 1.
+///
+/// A gap makes "apply everything above the current version" ambiguous, and an out-of-order
+/// entry silently never runs. Both are programming errors, so they are compile errors:
+/// `const { supra_store::schema::assert_dense(MIGRATIONS) }` in the component that owns the
+/// list. A test would report the same fault one build step later, on a list that has already
+/// compiled into something.
+///
+/// # Panics
+///
+/// At compile time when the list is empty or a version is not its 1-based index. Called from
+/// a runtime path it panics there instead, which is why it is only ever used in a `const`.
+pub const fn assert_dense(migrations: &[ComponentMigration]) {
+    assert!(!migrations.is_empty(), "a component with no migrations should not register one");
+    // Counted up rather than derived from the index, so no `usize` to `u32` cast appears: the
+    // cast would be lossless in practice and the lint would still be right that nothing here
+    // says so.
+    let mut expected: u32 = 1;
+    let mut index = 0;
+    while index < migrations.len() {
+        assert!(
+            migrations[index].version == expected,
+            "component migration versions must be dense from 1, in order"
+        );
+        expected += 1;
+        index += 1;
+    }
 }
 
 /// Bring the schema up to [`latest_version`].
@@ -339,5 +515,226 @@ mod tests {
         connection.pragma_update(None, "user_version", -1_i64).expect("set");
         let error = current_version(&connection).expect_err("not a version");
         assert!(error.to_string().contains("not a schema version"), "{error}");
+    }
+
+    // ---------------------------------------------------------------- the component ledger
+
+    const PROBE: &[ComponentMigration] = &[
+        ComponentMigration { version: 1, sql: "CREATE TABLE probe_one (x INTEGER) STRICT;" },
+        ComponentMigration { version: 2, sql: "CREATE TABLE probe_two (y TEXT) STRICT;" },
+    ];
+
+    fn migrated() -> Connection {
+        let mut connection = memory();
+        migrate(&mut connection, Path::new("<memory>")).expect("migrate");
+        connection
+    }
+
+    fn table_exists(connection: &Connection, name: &str) -> bool {
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .expect("query");
+        count == 1
+    }
+
+    #[test]
+    fn the_core_schema_creates_the_component_table() {
+        // Every component reads its version from here, so its absence is not a state a
+        // component can recover from - which is why `component_version` errors rather than
+        // answering zero when it is missing.
+        assert!(table_exists(&migrated(), COMPONENT_TABLE));
+    }
+
+    #[test]
+    fn a_component_migrates_and_records_its_version() {
+        let connection = migrated();
+        let reached = migrate_component(&connection, Path::new("<memory>"), "probe", PROBE).expect("migrate");
+        assert_eq!(reached, 2);
+        assert_eq!(component_version(&connection, "probe").expect("read"), 2);
+        assert!(table_exists(&connection, "probe_one"));
+        assert!(table_exists(&connection, "probe_two"));
+    }
+
+    #[test]
+    fn a_component_that_has_never_migrated_is_at_zero() {
+        assert_eq!(component_version(&migrated(), "never-seen").expect("read"), 0);
+    }
+
+    #[test]
+    fn migrating_a_component_twice_changes_nothing() {
+        let connection = migrated();
+        migrate_component(&connection, Path::new("<memory>"), "probe", PROBE).expect("first");
+        let again = migrate_component(&connection, Path::new("<memory>"), "probe", PROBE).expect("second");
+        assert_eq!(again, 2);
+    }
+
+    #[test]
+    fn a_component_resumes_from_where_it_stopped() {
+        // The upgrade path: a store created by a build that only had version 1 must get
+        // version 2 and nothing else.
+        let connection = migrated();
+        migrate_component(&connection, Path::new("<memory>"), "probe", &PROBE[..1]).expect("first");
+        assert_eq!(component_version(&connection, "probe").expect("read"), 1);
+        assert!(!table_exists(&connection, "probe_two"));
+
+        let reached = migrate_component(&connection, Path::new("<memory>"), "probe", PROBE).expect("resume");
+        assert_eq!(reached, 2);
+        assert!(table_exists(&connection, "probe_two"));
+    }
+
+    #[test]
+    fn components_do_not_see_each_other() {
+        // Two owners in one file, each with its own history. If they shared a counter, one
+        // stage shipping a migration would make every other stage think it had regressed.
+        let connection = migrated();
+        migrate_component(&connection, Path::new("<memory>"), "probe", PROBE).expect("probe");
+        assert_eq!(component_version(&connection, "probe").expect("read"), 2);
+        assert_eq!(component_version(&connection, "other").expect("read"), 0);
+    }
+
+    #[test]
+    fn a_component_ahead_of_this_build_is_refused() {
+        let connection = migrated();
+        migrate_component(&connection, Path::new("<memory>"), "probe", PROBE).expect("migrate");
+
+        let error = migrate_component(&connection, Path::new("/tmp/supra.db"), "probe", &PROBE[..1])
+            .expect_err("a newer component must be refused");
+        match error {
+            StoreError::ComponentSchemaTooNew { component, found, supported, .. } => {
+                assert_eq!(component, "probe");
+                assert_eq!(found, 2);
+                assert_eq!(supported, 1);
+            }
+            other => panic!("expected ComponentSchemaTooNew, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_failing_component_migration_leaves_the_version_where_it_was() {
+        // The same claim as the core path, asserted separately: this one commits through
+        // `Transaction::new_unchecked` on a shared reference rather than through `&mut`, and
+        // that is a different code path.
+        let connection = migrated();
+        let broken: &[ComponentMigration] = &[ComponentMigration {
+            version: 1,
+            sql: "CREATE TABLE half_applied (x INTEGER); SELECT this_function_does_not_exist();",
+        }];
+
+        let error = migrate_component(&connection, Path::new("<memory>"), "probe", broken)
+            .expect_err("the migration was supposed to fail");
+        assert!(matches!(error, StoreError::ComponentMigrate { from: 0, to: 1, .. }), "{error}");
+        assert_eq!(component_version(&connection, "probe").expect("read"), 0);
+        assert!(!table_exists(&connection, "half_applied"), "the DDL was not rolled back");
+    }
+
+    #[test]
+    fn a_failing_second_step_keeps_the_first() {
+        // Forward-only means partial progress is real progress: the first step stays applied
+        // and recorded, so the next run resumes rather than starting over.
+        let connection = migrated();
+        let broken: &[ComponentMigration] =
+            &[PROBE[0], ComponentMigration { version: 2, sql: "SELECT this_function_does_not_exist();" }];
+
+        let error = migrate_component(&connection, Path::new("<memory>"), "probe", broken)
+            .expect_err("step two was supposed to fail");
+        assert!(matches!(error, StoreError::ComponentMigrate { from: 1, to: 2, .. }), "{error}");
+        assert_eq!(component_version(&connection, "probe").expect("read"), 1);
+        assert!(table_exists(&connection, "probe_one"));
+    }
+
+    #[test]
+    fn creating_an_fts5_table_rolls_back_with_its_transaction() {
+        // T11 puts a `CREATE VIRTUAL TABLE ... USING fts5` in a component migration. A
+        // virtual table's DDL runs the module's own constructor, which writes shadow tables
+        // of its own, so there is no reason to assume it inherits ordinary DDL's rollback.
+        // Measured here rather than assumed, because a half-created FTS5 table would leave
+        // the component at version 0 with shadow tables already present - and the next run
+        // would fail on a name that already exists, for ever.
+        let connection = migrated();
+        let broken: &[ComponentMigration] = &[ComponentMigration {
+            version: 1,
+            sql: "CREATE VIRTUAL TABLE probe_fts USING fts5(body); \
+                  SELECT this_function_does_not_exist();",
+        }];
+
+        let error = migrate_component(&connection, Path::new("<memory>"), "probe", broken)
+            .expect_err("the migration was supposed to fail");
+        assert!(matches!(error, StoreError::ComponentMigrate { .. }), "{error}");
+        assert_eq!(component_version(&connection, "probe").expect("read"), 0);
+
+        // Not only the table: FTS5 creates `probe_fts_data`, `_idx`, `_content`, `_docsize`
+        // and `_config` beside it. Any survivor would block the retry.
+        let leftovers: i64 = connection
+            .query_row("SELECT count(*) FROM sqlite_master WHERE name LIKE 'probe_fts%'", [], |row| {
+                row.get(0)
+            })
+            .expect("query");
+        assert_eq!(leftovers, 0, "an fts5 table or one of its shadow tables survived the rollback");
+    }
+
+    #[test]
+    fn a_component_migration_can_create_an_fts5_table() {
+        // The other half: it has to work when nothing fails.
+        let connection = migrated();
+        let fts: &[ComponentMigration] =
+            &[ComponentMigration { version: 1, sql: "CREATE VIRTUAL TABLE probe_fts USING fts5(body);" }];
+        migrate_component(&connection, Path::new("<memory>"), "probe", fts).expect("migrate");
+        connection.execute("INSERT INTO probe_fts (body) VALUES ('fn recall_turn')", []).expect("insert");
+
+        // bm25 is negative and better matches are *more* negative, so ranking ascending is
+        // correct and taking an absolute value would invert it.
+        let (rowid, score): (i64, f64) = connection
+            .query_row(
+                "SELECT rowid, bm25(probe_fts) FROM probe_fts WHERE probe_fts MATCH 'recall' \
+                 ORDER BY bm25(probe_fts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query");
+        assert_eq!(rowid, 1);
+        assert!(score < 0.0, "bm25 was {score}, expected a negative score");
+    }
+
+    #[test]
+    fn a_component_version_read_before_the_core_schema_is_an_error() {
+        // Answering zero would invite a component to re-apply its first migration onto
+        // tables that may already exist. A missing component table means the file is older
+        // than this build expects, which is a different problem with a different remedy.
+        let connection = memory();
+        let error = component_version(&connection, "probe").expect_err("no component table yet");
+        assert!(matches!(error, StoreError::Sqlite(_)), "{error}");
+    }
+
+    #[test]
+    fn an_empty_component_name_is_refused_by_the_schema() {
+        // The name is the key. An empty one would collide with the next caller that passes
+        // an empty one, silently sharing a version counter between two owners.
+        let connection = migrated();
+        assert!(
+            connection
+                .execute(&format!("INSERT INTO {COMPONENT_TABLE} (name, version) VALUES ('', 1)"), [])
+                .is_err(),
+            "an empty component name must be refused"
+        );
+    }
+
+    #[test]
+    fn a_negative_component_version_is_reported_rather_than_wrapped() {
+        let connection = migrated();
+        // Bypass the CHECK the same way a hand-edited file would: there is no path in this
+        // crate that writes a negative version, so the row is forced in with the constraint
+        // suspended.
+        connection.execute_batch("PRAGMA ignore_check_constraints = ON").expect("relax");
+        connection
+            .execute(&format!("INSERT INTO {COMPONENT_TABLE} (name, version) VALUES ('probe', -1)"), [])
+            .expect("insert");
+        connection.execute_batch("PRAGMA ignore_check_constraints = OFF").expect("restore");
+
+        let error = component_version(&connection, "probe").expect_err("not a version");
+        assert!(error.to_string().contains("not a version"), "{error}");
     }
 }

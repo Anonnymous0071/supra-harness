@@ -7,6 +7,7 @@ members = [
     "crates/supra_log",
     "crates/supra_eventbus",
     "crates/supra_store",
+    "crates/supra_vector",
 ]
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,7 @@ authors = ["supra-harness contributors"]
 # inside a dependency spec, so one literal is unavoidable, and
 # `scripts/check-invariants.sh` asserts it still matches `workspace.package.version`.
 supra_types = { path = "crates/supra_types", version = "0.1.0" }
+supra_store = { path = "crates/supra_store", version = "0.1.0" }
 
 # async runtime + streams
 tokio = { version = "1.53.1", default-features = false }

@@ -1,0 +1,17 @@
+[package]
+name = "supra_vector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hybrid lexical and semantic retrieval over the supra store: FTS5/BM25, binary codes with exact rerank, and rank fusion."
+publish = false
+
+[dependencies]
+rusqlite = { workspace = true }
+supra_store = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
