@@ -59,12 +59,17 @@
 //! ```
 
 #![deny(missing_docs)]
-#![forbid(unsafe_code)]
+// T5 confines `unsafe` to `supra_ffi`, and this crate honours that in shipped code: the
+// `forbid` applies to the library, while tests re-allow `unsafe_code` for their serialised
+// environment control (`set_var`/`remove_var` are `unsafe` in the current toolchain).
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, allow(unsafe_code))]
 // Tests assert with `.expect()` and `panic!`, and report skips on stderr because T8
 // supra_log does not exist yet to receive them. Scoped to `cfg(test)` so no allow
 // reaches a shipped path.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::print_stderr))]
 
+pub mod credential;
 pub mod discover;
 pub mod error;
 pub mod layer;
@@ -73,6 +78,7 @@ pub mod source;
 
 use std::path::{Path, PathBuf};
 
+pub use credential::KEYRING_SERVICE;
 pub use error::ConfigError;
 pub use layer::{
     CohortLayer, ConfigLayer, MAX_COMPACTION_THRESHOLD_PERCENT, MIN_COMPACTION_THRESHOLD_PERCENT,

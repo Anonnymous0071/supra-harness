@@ -311,6 +311,19 @@ render one verbatim"
                 "a misspelled key would be silently ignored"
         fi
     done
+
+    # Credential resolution returns `SecretString`, never a bare `String`. A bare string out
+    # of `provider_secret` would put the credential back into exactly the position the wrapper
+    # exists to prevent: printable, loggable, and unwiped.
+    body=$(sed -n '/pub fn provider_secret/,/^    }/p' "$config/resolve.rs")
+    if ! printf '%s' "$body" | grep -q 'Result<supra_secrets::SecretString, ConfigError>'; then
+        fail "provider_secret no longer returns a Secret" "$body" \
+            "the credential must stay wrapped from resolution to the HTTP layer"
+    fi
+    if printf '%s' "$body" | grep -q -e '-> Result<String, ConfigError>'; then
+        fail "provider_secret returns a bare String" "$body" \
+            "a bare credential is printable, loggable, and unwiped"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -626,6 +639,140 @@ if [ -f "crates/supra_store/src/lib.rs" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T12 - secrets
+#
+# The wrapper is the mechanism and the redactor is the net: a `Secret` that becomes
+# printable, cloneable, or serialisable reopens every leak the wrapper closes, and no
+# test would fail - the value would simply start appearing in logs.
+# ---------------------------------------------------------------------------
+secrets=crates/supra_secrets/src
+
+if [ -d "$secrets" ]; then
+    # Debug and Display must reveal nothing. A derived or echoed impl would dump the
+    # credential into any diagnostic that formats the value.
+    for trait in Debug Display; do
+        body=$(sed -n "/impl<T: Zeroize> fmt::$trait for Secret<T>/,/^}/p" "$secrets/secret.rs")
+        if [ -z "$body" ]; then
+            fail "Secret lost its manual fmt::$trait impl" \
+                "a derived $trait would print the credential into diagnostics"
+        elif ! printf '%s' "$body" | grep -q '\[REDACTED\]'; then
+            fail "Secret's fmt::$trait no longer redacts" "$body" \
+                "the placeholder is what keeps a diagnostic from becoming a leak"
+        fi
+    done
+
+    # Clone, Eq, and Serialize must stay absent. Each is a leak vector: a duplicate doubles
+    # the places a secret can escape from, comparison holds two secrets together, and
+    # serialisation is how secrets reach logs, files, and wires. The absence is structural -
+    # a `#[derive(Clone)]` on a struct holding a Secret fails to compile - and the guard
+    # keeps it from being added here directly.
+    hits=$(scan "$secrets/secret.rs" 'impl.*Clone.*for.*Secret|impl.*PartialEq.*for.*Secret|impl.*Eq.*for.*Secret|impl.*Serialize.*for.*Secret')
+    if [ -n "$hits" ]; then
+        fail "Secret gained Clone, Eq, or Serialize" "$hits" \
+            "each is a leak vector the wrapper exists to refuse"
+    fi
+    # A derive on the struct is the other spelling - and the dangerous one, because a
+    # derived Debug dumps the credential while the manual impl below keeps compiling
+    # untouched beside it. Grep the struct definition's own attribute block: the lines
+    # directly above `pub struct Secret`, which is where a derive would sit.
+    struct_block=$(grep -B6 '^pub struct Secret<T' "$secrets/secret.rs" | head -8)
+    if printf '%s' "$struct_block" | grep -q '#\[derive'; then
+        fail "Secret carries a derive macro" "$struct_block" \
+            "a derived Debug would print the credential while the manual impl compiles beside it"
+    fi
+
+    # The KDF floor must agree with the production constant. A floor below the constant
+    # certifies; a floor above it breaks the build. Both are caught by the same comparison
+    # the code itself asserts at compile time, restated here so the script and the source
+    # cannot drift apart unnoticed.
+    declared=$(sed -n 's/^const PBKDF2_ITERATIONS: u32 = \([0-9_]*\);/\1/p' "$secrets/file_store.rs" |
+        head -1 | tr -d '_')
+    floor=$(sed -n 's/^const MIN_PRODUCTION_ROUNDS: u32 = \([0-9_]*\);/\1/p' "$secrets/file_store.rs" |
+        head -1 | tr -d '_')
+    if [ -z "$declared" ] || [ -z "$floor" ]; then
+        fail "could not read PBKDF2_ITERATIONS or MIN_PRODUCTION_ROUNDS" \
+            "the agreement between them is what this check is about"
+    elif [ "$declared" != "$floor" ]; then
+        fail "PBKDF2_ITERATIONS is $declared but the floor is $floor" \
+            "a floor that disagrees with the constant it guards is worse than no floor"
+    fi
+
+    # The vault file must be 0600 before the first secret byte lands, not after. A chmod
+    # after the write leaves a window where the file is world-readable; the temp file must
+    # also carry the mode, because rename preserves it.
+    #
+    # Two `set_permissions` calls exist (temp file before the write, destination after the
+    # rename), so the check extracts only the segment between `File::create` and the first
+    # `write_all`: exactly the region where ordering matters. A probe that deleted the
+    # first chmod while leaving the second must fail - the second covers the destination,
+    # not the window.
+    segment=$(sed -n '/fn save(/,/^    }/p' "$secrets/file_store.rs" |
+        sed -n '/File::create/,/write_all/p')
+    if ! printf '%s\n' "$segment" | grep -q 'set_permissions'; then
+        fail "the vault file is not restricted before the first write" "$segment" \
+            "chmod must precede write_all, or the secret has a world-readable window"
+    fi
+    if ! printf '%s\n' "$segment" | grep -q 'from_mode(0o600)'; then
+        fail "the pre-write restriction is not 0600" "$segment" \
+            "the mode is the guarantee, not just the presence of a chmod call"
+    fi
+
+    # The passphrase must never come from an interactive prompt inside the library. A
+    # blocking read hangs every non-interactive caller - a test runner, a daemon, a tool
+    # harness - on a question nobody asked. The CLI supplies the prompt through the
+    # provider callback; the library only resolves memory, environment, provider.
+    #
+    # Two spellings are checked because the violation has two: naming a prompt mechanism
+    # (`rpassword`, `/dev/tty`, ...) and *using* an input handle. A probe smuggling in
+    # `std::io::stdin()` tripped only the second; a probe reading `/dev/tty` as a path
+    # tripped only the first.
+    #
+    # `scan` blanks string literals, so `"/dev/tty"` is invisible to it - by design, since a
+    # literal could otherwise be a doc example. The path spelling is therefore checked with
+    # `scan_sql`, which keeps literals. Either is a library that blocks on a question
+    # nobody asked.
+    hits=$(scan "$secrets/file_store.rs" 'rpassword|prompt_password|read_passphrase|hidden_input|stdin\(\)|Stdio::stdin|io::stdin')
+    hits="$hits$(scan_sql "$secrets/file_store.rs" '/dev/tty')"
+    if [ -n "$hits" ]; then
+        fail "the file store reads interactive input" "$hits" \
+            "a library that blocks on input hangs every non-interactive caller behind it"
+    fi
+
+    # The production binary must never take the test-only KDF. `cfg(test)` is set by
+    # the compiler for the crate under test and by nothing else; a feature flag would be one
+    # `cargo add --features` away from any build that copies the line.
+    #
+    # Checked as a property, not a name: the production `PBKDF2_ITERATIONS` must be a
+    # `#[cfg(not(test))]` item, and no second `PBKDF2_ITERATIONS` may exist under any other
+    # gate. A probe widening the test gate to `cfg(any(test, feature = "test-kdf"))` - the
+    # exact weakening this guards against - changes the gate text, which a name search for
+    # `test-kdf` only catches after the feature is also referenced somewhere.
+    prod_gate=$(grep -B1 '^const PBKDF2_ITERATIONS' "$secrets/file_store.rs" | head -2)
+    if ! printf '%s' "$prod_gate" | grep -q '#\[cfg(not(test))\]'; then
+        fail "the production KDF constant is not cfg(not(test))-gated" "$prod_gate" \
+            "any wider gate lets a downstream build select the weak KDF"
+    fi
+    gates=$(grep -c '^const PBKDF2_ITERATIONS' "$secrets/file_store.rs")
+    if [ "$gates" != "2" ]; then
+        fail "expected exactly two PBKDF2_ITERATIONS definitions, found $gates" \
+            "one production (cfg(not(test))), one test-only (cfg(test)); any other shape is unreviewed"
+    fi
+    if grep -A1 'cfg(any(test' "$secrets/file_store.rs" | grep -q 'PBKDF2_ITERATIONS'; then
+        fail "the test KDF gate was widened beyond cfg(test)" \
+            "a feature gate makes the weak KDF selectable by any downstream build"
+    fi
+
+    # `StoreTooNew` must not exist without a version field to compare. The encrypted file
+    # format is four fields with no version slot, so a "too new" variant can never fire -
+    # and dead error variants are misleading API: they promise a case the code cannot detect.
+    hits=$(scan "$secrets/error.rs" 'StoreTooNew')
+    if [ -n "$hits" ]; then
+        fail "a StoreTooNew variant exists without a version to compare" "$hits" \
+            "the vault format has no version field, so the variant could never fire"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which
@@ -661,7 +808,7 @@ fi
 
 if [ "$status" -eq 0 ]; then
     echo "invariants: prompt ledger, ephemeral state, authority, quorum, unsafe confinement,"
-    echo "            the configuration schema, diagnostics, the event bus, the turn store,"
-    echo "            hybrid retrieval, the store's connection, and internal versions"
+    echo "            the configuration schema, credential resolution, diagnostics, the event bus,"
+    echo "            the turn store, hybrid retrieval, the store's connection, and internal versions"
 fi
 exit "$status"

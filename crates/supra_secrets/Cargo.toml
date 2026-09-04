@@ -1,0 +1,27 @@
+[package]
+name = "supra_secrets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Secret storage for supra-harness: OS keyring with encrypted file fallback, and a Secret<T> wrapper that never leaks."
+publish = false
+
+[dependencies]
+aes-gcm = { workspace = true }
+pbkdf2 = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+keyring = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+getrandom = { workspace = true }
+
+[dev-dependencies]
+supra_log = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

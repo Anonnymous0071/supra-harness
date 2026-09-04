@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T11 complete. Stages T12 onward are unimplemented.
+Status: T1-T12 complete. Stages T12.5 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -404,7 +404,7 @@ backtracking.
 | T9 | `supra_eventbus` | filtered pub/sub, explicit backpressure |
 | T10 | `supra_store` | SQLite WAL, versioned migrations |
 | T11 | `supra_vector` | FTS5/BM25, binary codes with exact rerank, two-tier LRU, rank fusion |
-| T12 | `supra_secrets` | OS keyring plus encrypted fallback |
+| T12 | `supra_secrets` | OS keyring plus encrypted fallback, `Secret<T>`, credential resolution |
 | T12.5 | `supra_guard` | seven anti-self-spawn layers |
 
 ### Layer C - efficiency engine
@@ -758,6 +758,46 @@ probes cover both stages.
 dies of `BrokenPipeError`. Every check written that way fails on a file that
 satisfies it - the opposite failure from a blind guard, and equally silent. A
 helper that searches shipped code must collect the output before searching it.
+
+**Method note from T12, on what "probed" means.** Six new guard checks landed with
+this stage; probing them caught three blind spots before they shipped, and two of
+the three are new instances of already-recorded lessons - which is itself the lesson.
+
+*`scan` blanks string literals, so a literal is invisible to it.* The prompt guard
+searched for `/dev/tty` with `scan` and missed a probe reading exactly that path:
+the path lived inside a string, which `scan` blanks by design. The fix is `scan_sql`
+for the literal spelling alongside `scan` for the identifier spelling - and the
+reason it matters is that a doc example mentioning `/dev/tty` must *not* trip the
+guard, so the two spellings cannot share one scanner.
+
+*A property check beats a name check.* The KDF guard first searched for the string
+`test-kdf` and missed the actual weakening, which was widening the `cfg` gate on the
+existing constant - no new name anywhere. The rewritten guard asserts the property:
+the production constant is `cfg(not(test))`-gated, exactly two definitions exist, and
+no `cfg(any(test` gate touches the constant. A probe performing the exact weakening
+now fails.
+
+*The 0600 guard needed the segment, not the function.* `save` contains two
+`set_permissions` calls - temp file before the write, destination after the rename -
+so a whole-function ordering check passed with the first chmod deleted: the second
+satisfied it. The guard extracts only `File::create..write_all`, the region where
+ordering matters. A check that searches a wider region than its invariant is a check
+with room for the violation to hide beside the evidence.
+
+**Decided in T12**: 100 000 PBKDF2 rounds, not OWASP's 600 000. OWASP's floor assumes
+a login server deriving one key per authentication; this store derives one key per
+process. Measured release builds: 100 000 rounds cost ~74 ms, 600 000 cost ~447 ms,
+and neither protects a weak passphrase - the threat model is a vault file that lands
+somewhere it should not, with the passphrase in an environment variable on the same
+class of machine. What would change the number is a memory-hard KDF, which prices
+parallel guessing hardware out in a way iteration count cannot; none is pinned in the
+workspace, and pulling one in for a fallback store is a T30 dependency decision.
+
+**Decided in T12**: the library never prompts. An earlier version read the passphrase
+from `/dev/tty` when no source existed; that hung the test runner, whose stdin was a
+terminal with nobody behind it. A library that blocks on input without an explicit
+opt-in hangs every non-interactive caller behind it. The CLI registers its prompt
+through `set_passphrase_provider`; the library resolves memory, environment, provider.
 
 **Decided in T11**: the stage map named `sqlite-vec`, and the implementation does
 not use it. The decision rests on measurement rather than preference:

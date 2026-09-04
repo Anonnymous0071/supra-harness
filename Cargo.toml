@@ -8,6 +8,7 @@ members = [
     "crates/supra_eventbus",
     "crates/supra_store",
     "crates/supra_vector",
+    "crates/supra_secrets",
 ]
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,8 @@ authors = ["supra-harness contributors"]
 # `scripts/check-invariants.sh` asserts it still matches `workspace.package.version`.
 supra_types = { path = "crates/supra_types", version = "0.1.0" }
 supra_store = { path = "crates/supra_store", version = "0.1.0" }
+supra_secrets = { path = "crates/supra_secrets", version = "0.1.0" }
+supra_log = { path = "crates/supra_log", version = "0.1.0" }
 
 # async runtime + streams
 tokio = { version = "1.53.1", default-features = false }
@@ -85,8 +88,8 @@ keyring = "4.2.0"
 aes-gcm = "0.11.1"
 pbkdf2 = "0.13.0"
 sha2 = "0.11.0"
-hmac = "0.13.0"
 zeroize = { version = "1.9.0", features = ["derive"] }
+getrandom = "0.4.3"
 
 # provider transport (T13)
 reqwest = { version = "0.13.4", default-features = false, features = [

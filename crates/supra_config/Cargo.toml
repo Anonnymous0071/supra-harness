@@ -17,6 +17,7 @@ workspace = true
 # without a filesystem.
 [dependencies]
 supra_types = { workspace = true }
+supra_secrets = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

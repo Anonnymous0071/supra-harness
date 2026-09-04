@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 
 use supra_types::{DEFAULT_PEER_LIMIT, Mode};
 
+use crate::error::ConfigError;
 use crate::layer::ConfigLayer;
 use crate::source::ConfigSource;
 
@@ -163,6 +164,84 @@ impl Config {
     pub fn provider_source(&self, name: &str) -> Option<ConfigSource> {
         self.provider_sources.get(name).copied()
     }
+
+    /// Resolve one provider's credential to a [`SecretString`].
+    ///
+    /// The resolution ladder mirrors T12's: `api_key_env` is read from the process environment,
+    /// `api_key_keyring` is read through [`SecretManager`], which tries the OS keyring and then
+    /// the encrypted file. T7's validation already guarantees exactly one source is named, so
+    /// this function chooses rather than prioritises - and that is why it cannot fail on
+    /// ambiguity. It fails only when the named source has nothing to give.
+    ///
+    /// The result is a [`SecretString`], not a `String`: the caller receives a value whose
+    /// `Debug` and `Display` reveal nothing, so the credential cannot leak through a diagnostic
+    /// between here and the HTTP layer. T8's redactor is the net beneath, not the mechanism.
+    ///
+    /// `manager` is a parameter rather than constructed here because probing the OS keyring is
+    /// I/O, and resolution is a pure function over already-read layers - which is what makes
+    /// the precedence rules testable without a filesystem, a keyring, or a passphrase. T13
+    /// opens one manager per session and threads it through.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::MissingCredential`] when the named environment variable is unset or the
+    /// secrets ladder has no such entry. The message names the source *by name* - never the
+    /// value - and says where to put the credential instead.
+    pub fn provider_secret(
+        &self,
+        name: &str,
+        manager: &supra_secrets::SecretManager,
+    ) -> Result<supra_secrets::SecretString, ConfigError> {
+        let provider = self.providers.get(name).ok_or_else(|| ConfigError::MissingCredential {
+            provider: name.to_owned(),
+            detail: "no such provider is configured".to_owned(),
+        })?;
+
+        if let Some(variable) = &provider.api_key_env {
+            match std::env::var(variable) {
+                Ok(value) if !value.is_empty() => {
+                    return Ok(supra_secrets::SecretString::new(value));
+                }
+                Ok(_) => {
+                    return Err(ConfigError::MissingCredential {
+                        provider: name.to_owned(),
+                        detail: format!(
+                            "environment variable {variable:?} is set but empty; unset it or give \
+                             it a value"
+                        ),
+                    });
+                }
+                Err(_) => {
+                    return Err(ConfigError::MissingCredential {
+                        provider: name.to_owned(),
+                        detail: format!(
+                            "environment variable {variable:?} is not set; export it or point the \
+                             provider at a keyring entry with api_key_keyring"
+                        ),
+                    });
+                }
+            }
+        }
+
+        if let Some(entry) = &provider.api_key_keyring {
+            // The keyring entry name doubles as the account: T7 validates it is non-empty, and
+            // a distinct service keeps supra's entries from colliding with another
+            // application's. The full `service/account` pair is reported on failure so the user
+            // can look the entry up in their keyring manager.
+            return manager
+                .get(crate::credential::KEYRING_SERVICE, entry)
+                .map(supra_secrets::SecretString::new)
+                .map_err(|error| ConfigError::MissingCredential {
+                    provider: name.to_owned(),
+                    detail: format!("keyring entry {entry:?}: {error}"),
+                });
+        }
+
+        Err(ConfigError::MissingCredential {
+            provider: name.to_owned(),
+            detail: "the provider names no credential source; set api_key_env or api_key_keyring".to_owned(),
+        })
+    }
 }
 
 /// Combine validated layers into one configuration.
@@ -279,6 +358,33 @@ mod tests {
     fn layer(text: &str) -> ConfigLayer {
         ConfigLayer::parse(text, ConfigSource::User, PathBuf::from("/test/config.toml"))
             .expect("the fixture must parse")
+    }
+
+    /// Set the process environment for one test body, serialised against every other test in
+    /// this module. `set_var`/`remove_var` are `unsafe` in the current toolchain; the module
+    /// lock is what makes concurrent use sound. Same pattern as T12's `ENV_GUARD`.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[allow(
+        clippy::undocumented_unsafe_blocks,
+        reason = "serialised by the module lock; see the doc comment on ENV_GUARD"
+    )]
+    fn with_env(var: &str, value: &str, body: impl FnOnce()) {
+        let _lock = ENV_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: under the module lock, and no test thread reads the variable outside it.
+        unsafe {
+            std::env::set_var(var, value);
+            body();
+            std::env::remove_var(var);
+        }
+    }
+
+    /// A manager whose file rung points at a scratch vault, so no test touches a real keyring
+    /// or the user's fallback file - even on a machine where the OS keyring answers.
+    fn scratch_manager(name: &str) -> (supra_secrets::SecretManager, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("supra-config-secret-{name}.enc"));
+        let _ = std::fs::remove_file(&path);
+        (supra_secrets::SecretManager::open_with_file_store(path.clone()), path)
     }
 
     #[test]
@@ -560,6 +666,167 @@ mod tests {
             (ConfigSource::Project, layer("[cohort]\n")),
         ]);
         assert_eq!(with_empties, resolve(&[]));
+    }
+
+    // ------------------------------------------------------------------
+    // Credential resolution: `provider_secret`
+    // ------------------------------------------------------------------
+    //
+    // These tests need a manager, but they must never touch the machine's real keyring or
+    // the user's fallback file. Every one opens a scratch manager - and skips its body where
+    // the OS keyring answers, because there the writes below would land in real credentials.
+    // On a headless machine the file rung is primary and the full ladder is exercised.
+
+    #[test]
+    fn an_env_credential_resolves_to_a_secret_that_reveals_nothing() {
+        let config = resolve(&[(
+            ConfigSource::User,
+            layer("[providers.p]\napi_key_env = \"SUPRA_TEST_RESOLVE_KEY\"\n"),
+        )]);
+        let (manager, _path) = scratch_manager("env-resolves");
+
+        with_env("SUPRA_TEST_RESOLVE_KEY", "sk-test-value-123", || {
+            let secret = config.provider_secret("p", &manager).expect("the variable is set");
+            assert_eq!(secret.expose(), "sk-test-value-123");
+            assert_eq!(format!("{secret:?}"), "Secret { value: \"[REDACTED]\" }");
+            assert_eq!(format!("{secret}"), "[REDACTED]");
+        });
+    }
+
+    #[test]
+    fn an_unset_env_variable_is_a_missing_credential_naming_the_variable() {
+        let config = resolve(&[(
+            ConfigSource::User,
+            layer("[providers.p]\napi_key_env = \"SUPRA_TEST_RESOLVE_ABSENT\"\n"),
+        )]);
+        let (manager, path) = scratch_manager("env-absent");
+        let _ = std::fs::remove_file(&path);
+
+        // Belt and suspenders: the variable must be absent, not merely unset by convention.
+        // SAFETY: under the module lock; see `with_env`.
+        #[allow(
+            clippy::undocumented_unsafe_blocks,
+            reason = "serialised by the module lock; see the doc comment on ENV_GUARD"
+        )]
+        let _lock = ENV_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var("SUPRA_TEST_RESOLVE_ABSENT");
+        }
+        let error = config.provider_secret("p", &manager).expect_err("nothing is set");
+        let text = error.to_string();
+        assert!(matches!(error, crate::error::ConfigError::MissingCredential { .. }), "{text}");
+        assert!(text.contains("\"p\""), "the provider: {text}");
+        assert!(text.contains("SUPRA_TEST_RESOLVE_ABSENT"), "the variable by name: {text}");
+        assert!(!text.contains("sk-"), "no value to leak, but assert the shape: {text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_empty_env_variable_is_missing_not_empty() {
+        // An empty credential would authenticate against nothing and fail at the provider with
+        // an opaque 401. Failing here, naming the variable, is the actionable outcome.
+        let config = resolve(&[(
+            ConfigSource::User,
+            layer("[providers.p]\napi_key_env = \"SUPRA_TEST_RESOLVE_EMPTY\"\n"),
+        )]);
+        let (manager, path) = scratch_manager("env-empty");
+        let _ = std::fs::remove_file(&path);
+
+        with_env("SUPRA_TEST_RESOLVE_EMPTY", "", || {
+            let error = config.provider_secret("p", &manager).expect_err("empty is missing");
+            let text = error.to_string();
+            assert!(matches!(error, crate::error::ConfigError::MissingCredential { .. }), "{text}");
+            assert!(text.contains("empty"), "{text}");
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_keyring_credential_resolves_through_the_fallback_file() {
+        // The full T12 ladder behind one call: config names the entry, the manager reads it
+        // from the vault. Gated on the file rung being primary so the test never touches real
+        // credentials on a keyring machine.
+        let config =
+            resolve(&[(ConfigSource::User, layer("[providers.p]\napi_key_keyring = \"test-entry\"\n"))]);
+        let (manager, path) = scratch_manager("keyring-resolves");
+        let _ = std::fs::remove_file(&path);
+        if manager.primary_backend() != supra_secrets::Backend::EncryptedFile {
+            return;
+        }
+
+        with_env(supra_secrets::file_store::MASTER_KEY_ENV, "resolve-test-key", || {
+            manager.set(crate::KEYRING_SERVICE, "test-entry", "sk-keyring-value").expect("seed");
+            let secret = config.provider_secret("p", &manager).expect("the entry exists");
+            assert_eq!(secret.expose(), "sk-keyring-value");
+            assert_eq!(format!("{secret:?}"), "Secret { value: \"[REDACTED]\" }");
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_keyring_entry_is_a_missing_credential_naming_the_entry() {
+        let config =
+            resolve(&[(ConfigSource::User, layer("[providers.p]\napi_key_keyring = \"absent-entry\"\n"))]);
+        let (manager, path) = scratch_manager("keyring-absent");
+        let _ = std::fs::remove_file(&path);
+        if manager.primary_backend() != supra_secrets::Backend::EncryptedFile {
+            return;
+        }
+
+        with_env(supra_secrets::file_store::MASTER_KEY_ENV, "resolve-test-key", || {
+            // Seed an unrelated entry so the vault exists: without it the manager reports
+            // NoStore (nothing configured) rather than NotFound (configured, entry absent),
+            // and the test would assert the wrong distinction.
+            manager.set(crate::KEYRING_SERVICE, "other-entry", "value").expect("seed");
+            let error = config.provider_secret("p", &manager).expect_err("no such entry");
+            let text = error.to_string();
+            assert!(matches!(error, crate::error::ConfigError::MissingCredential { .. }), "{text}");
+            assert!(text.contains("absent-entry"), "the entry by name: {text}");
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_provider_with_no_credential_source_is_missing() {
+        // T7's validation already refuses a provider naming both sources; a provider naming
+        // neither passes validation (it may gain one from a higher layer) and fails here.
+        let config = resolve(&[(ConfigSource::User, layer("[providers.p]\nmodel = \"m\"\n"))]);
+        let (manager, path) = scratch_manager("no-source");
+        let _ = std::fs::remove_file(&path);
+
+        let error = config.provider_secret("p", &manager).expect_err("no source named");
+        let text = error.to_string();
+        assert!(matches!(error, crate::error::ConfigError::MissingCredential { .. }), "{text}");
+        assert!(text.contains("api_key_env"), "the remedy names both sources: {text}");
+        assert!(text.contains("api_key_keyring"), "the remedy names both sources: {text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unknown_provider_is_missing_by_name() {
+        let config = resolve(&[]);
+        let (manager, path) = scratch_manager("unknown-provider");
+        let _ = std::fs::remove_file(&path);
+
+        let error = config.provider_secret("ghost", &manager).expect_err("no such provider");
+        let text = error.to_string();
+        assert!(matches!(error, crate::error::ConfigError::MissingCredential { .. }), "{text}");
+        assert!(text.contains("\"ghost\""), "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_credential_carries_no_layer_and_no_path() {
+        // The provider may combine several layers and the failure is about the world, not any
+        // one file - so attribution is `None`, and callers use `provider_source()` instead.
+        let error = crate::error::ConfigError::MissingCredential {
+            provider: "p".to_owned(),
+            detail: "nothing".to_owned(),
+        };
+        assert_eq!(error.layer(), None);
+        assert_eq!(error.path(), None);
+        let text = error.to_string();
+        assert!(text.contains("\"p\""), "{text}");
     }
 
     #[test]

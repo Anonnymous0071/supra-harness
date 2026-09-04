@@ -9,6 +9,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T12** `crates/supra_secrets`: OS keyring plus encrypted fallback, `Secret<T>`, and
+  credential resolution in `supra_config`.
+  - **The ladder is probed, not assumed.** `keyring` v4 reports `NoDefaultStore` in ~10 ms
+    with no Secret Service provider, so `SecretManager::open` costs nothing and cannot hang
+    startup. `get` searches keyring-then-file; `set` writes the primary only, so a credential
+    lives in exactly one store.
+  - **`Secret<T>` closes the three ordinary leaks**: `Debug` and `Display` print
+    `[REDACTED]`, the value wipes on drop, and there is no `Clone`/`Eq`/`Serialize` to derive
+    around it. `into_zeroizing` hands the value to a consumer inside a wiping guard.
+  - **The vault is AES-256-GCM with a PBKDF2-HMAC-SHA256 key, 100 000 rounds** - measured
+    ~74 ms vs ~447 ms for OWASP's 600 000, neither of which protects a weak passphrase. The
+    threat model is a file that lands somewhere it should not, stated plainly.
+  - **0600 before the first byte lands**, on the temp file and re-asserted after rename.
+  - **The library never prompts.** An earlier `/dev/tty` prompt hung the test runner; the CLI
+    registers its prompt via `set_passphrase_provider`.
+  - **`Config::provider_secret`** resolves `api_key_env`/`api_key_keyring` to a
+    `SecretString`, with `MissingCredential` carrying the source by name - never the value.
 - **T11** `crates/supra_vector`: hybrid lexical and semantic retrieval over T10's file -
   FTS5/BM25, binary codes with an exact rerank, a bounded exact-vector cache, and rank fusion.
   - **The first stage's cost is bytes moved.** At 768 dimensions an exact vector is 3072 bytes
@@ -65,7 +82,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
-- `scripts/check-invariants.sh`: three defects, all found by probing rather than by review.
+- `scripts/check-invariants.sh`: three more defects, all found by probing the six new T12
+  checks before they shipped - two of them new instances of recorded lessons.
+  - `scan` blanks string literals, so a `/dev/tty` path inside a string was invisible to the
+    prompt guard. Fixed with `scan_sql` for the literal spelling alongside `scan`.
+  - The KDF guard searched for the name `test-kdf` and missed the actual weakening (widening
+    the `cfg` gate, no new name anywhere). Rewritten as a property: production constant is
+    `cfg(not(test))`-gated, exactly two definitions exist, no `cfg(any(test` touches it.
+  - The 0600 guard searched the whole `save` function, where the second chmod (destination,
+    after rename) satisfied it with the first (temp file, before write) deleted. Now scoped
+    to `File::create..write_all`.
+  - Also fixed in passing: a `grep -q` pattern starting with `->` parsed as a flag
+    (`grep: invalid option -- '>'`), masked by `|| true` further down the pipeline.
   - A constraint check was satisfied by the module documentation that quotes the constraint, and
     then - once comments were stripped - by the migration's own `--` commentary inside the SQL
     string literal. Both passed on a schema with the constraint deleted.

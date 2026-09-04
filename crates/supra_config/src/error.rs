@@ -130,6 +130,23 @@ pub enum ConfigError {
         /// Why that layer may not set it.
         because: &'static str,
     },
+
+    /// A provider names a credential source that has nothing to give.
+    ///
+    /// This is the one resolution-time failure that is not a validation failure: the schema
+    /// guarantees exactly one source is *named*, but only the lookup can tell whether the
+    /// named source *holds* a credential. The message carries the provider and the source by
+    /// name - never the value - and says where to put the credential instead.
+    #[error("provider {provider:?} has no usable credential: {detail}")]
+    MissingCredential {
+        /// Which provider.
+        provider: String,
+        /// What was looked up and where the credential should go instead. Plain data, not a
+        /// source chain: there is no underlying error here, only an absent value. Named
+        /// `detail` rather than `source` because thiserror treats `source` as the error-chain
+        /// accessor, and a `String` is not an error.
+        detail: String,
+    },
 }
 
 impl ConfigError {
@@ -145,6 +162,10 @@ impl ConfigError {
             | Self::Rejected { layer, .. }
             | Self::NotPermittedFromLayer { layer, .. } => Some(*layer),
             Self::InvalidEnv { .. } => Some(ConfigSource::Env),
+            // No layer: the provider exists in the resolved config, which may combine several
+            // layers, and the failure is about the world (an unset variable, an empty keyring),
+            // not about any one file. Callers that need attribution use provider_source().
+            Self::MissingCredential { .. } => None,
         }
     }
 
@@ -159,7 +180,8 @@ impl ConfigError {
             Self::InvalidEnv { .. }
             | Self::OutOfRange { .. }
             | Self::Rejected { .. }
-            | Self::NotPermittedFromLayer { .. } => None,
+            | Self::NotPermittedFromLayer { .. }
+            | Self::MissingCredential { .. } => None,
         }
     }
 }
