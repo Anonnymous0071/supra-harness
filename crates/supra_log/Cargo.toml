@@ -1,0 +1,28 @@
+[package]
+name = "supra_log"
+description = "Structured diagnostics for supra-harness: redaction at the sink, size-bounded rotation, and stderr that respects the TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# T8 is the one crate that may write to stderr. `print_stderr` is banned
+# workspace-wide precisely so that every diagnostic goes through here, in the same
+# way `unsafe_code` is banned everywhere but T5.
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# `supra_types` is needed only by the test that proves a `ContentHash` survives
+# redaction. The redactor itself is string-in, string-out, so the shipped crate
+# depends on nothing from the contract layer - which keeps it usable from anywhere,
+# including while configuration is still being loaded.
+[dev-dependencies]
+serde_json = { workspace = true }
+supra_types = { workspace = true }

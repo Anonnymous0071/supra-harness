@@ -9,6 +9,44 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T8** `crates/supra_log`: structured diagnostics, and the one crate permitted to
+  write to stderr.
+  - **Redaction happens at the sink**, over the whole formatted line, after every call
+    site has had its say. T7 removed every field that could hold a credential from the
+    configuration schema and a test still found a leak, so the net goes at the last
+    moment before bytes become durable. Two mechanisms, because each misses what the
+    other catches: an **exact** field-name match (`api_key` is a secret, `api_key_env`
+    is a signpost) and a prefixed value shape (`sk-`, `ghp_`, `AKIA`, `Bearer `, PEM).
+  - What must survive is as load-bearing as what is caught. A generic entropy rule would
+    eat supra's own diagnostic material - ULIDs, content hashes, cache keys - so there is
+    none. A `ContentHash` surviving in both its forms, and `api_key_env`'s value
+    surviving, are tests rather than intentions.
+  - **One line, one write** on an `O_APPEND` descriptor, so two processes sharing a log
+    produce whole lines rather than shredded ones - and so redaction sees a complete line
+    exactly once, which is what makes it sound. Threaded and split-write tests cover both
+    halves.
+  - Size-bounded rotation with a fixed file count; an existing file's length counts
+    toward the threshold at open, or a restart would reset the bound. The file is created
+    `0600`, for the same reason T7 holds the user's configuration to `0600`.
+  - stderr mirroring is suppressed by a **guard**, not a pair of setters: a `set(false)`
+    whose `set(true)` is missed would silently discard every diagnostic for the rest of
+    the session. A line written under the guard still reaches the file - suppression is
+    about the terminal, not the record.
+  - A failed write is counted and reported on the next line that succeeds. A gap in a log
+    is only debuggable if the log says there is one.
+  - `build` returns a subscriber without installing it, so the wiring is testable as many
+    times as a test suite likes; exactly one test installs a global subscriber.
+  - The crate deliberately does **not** depend on T7. Configuration loading is exactly
+    when diagnostics are needed, and a logger that cannot start until configuration has
+    loaded cannot report why configuration failed to load.
+  - 56 tests plus a doc test. Twelve mutations: eleven caught, one recorded as
+    platform-equivalent rather than papered over.
+
+- `scripts/check-invariants.sh` gained the T8 checks: no diagnostic outside `sink.rs` may
+  touch stderr, the redaction fast path must read `SHAPES` and `SECRET_FIELDS` rather than
+  restate them, the field rule must stay an exact match, and the log file must stay
+  `0600`. All five probed against deliberate violations.
+
 - **T7** `crates/supra_config`: layered configuration - discovery, per-field
   precedence, provenance, and fail-fast validation.
   - Precedence is per **field**, not per file: `ConfigLayer` is all-`Option` and
@@ -193,6 +231,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The redaction fast path silently let a whole class of credential through.** The
+  pre-check that lets ordinary lines skip the matcher listed its own literals - `"sk-"`,
+  `"gh"`, `"xox"` - and one was wrong: **`github_pat_` does not contain `gh`**, because
+  the letters are g-i-t-h. Every GitHub personal access token passed straight through a
+  matcher that would have caught it. The pre-check now reads the same tables the matcher
+  does, so drift is impossible by construction, and a property test walks every entry.
+- **A filter default could silence everything without failing.** `build` took the default
+  level as a string, and almost any string parses as a *valid* directive because a bare
+  word is read as a target name: `"inf"` becomes `inf=trace`. A typo would not error - it
+  would enable trace for a target nothing logs to and silence the rest. The parameter is
+  now a `LevelFilter`, which cannot be misspelled.
+- **The dropped-line counter had no coverage.** The only test that touched it set it by
+  hand, so a mutation deleting the increment survived. Closed with `/dev/full`, which
+  answers every write with `ENOSPC` - a deterministic version of a full disk.
 - **A pasted credential could leak through the error refusing it.**
   `ConfigError::Invalid` originally carried the `toml` crate's `Display` verbatim,
   which prints the offending **source line** with a caret under it. So the message

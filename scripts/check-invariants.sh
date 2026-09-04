@@ -262,6 +262,51 @@ render one verbatim"
 fi
 
 # ---------------------------------------------------------------------------
+# T8 - diagnostics
+# ---------------------------------------------------------------------------
+log=crates/supra_log/src
+
+if [ -d "$log" ]; then
+    # supra_log is the only crate that may write to stderr, and only through the sink.
+    # A `print!`/`eprint!` anywhere else in the crate bypasses the TUI suppression that
+    # keeps a stray line from tearing the frame.
+    hits=$(for file in "$log"/*.rs; do
+        [ "$(basename "$file")" = "sink.rs" ] && continue
+        scan "$file" '\bprintln!|\beprintln!|\bprint!|\beprint!|io::stderr|io::stdout'
+    done)
+    if [ -n "$hits" ]; then
+        fail "a diagnostic bypasses the sink" "$hits" \
+            "only sink.rs may touch stderr, so TUI suppression cannot be sidestepped"
+    fi
+
+    # The redactor's fast path must be derived from its tables, never restate them. The
+    # first version listed its own literals and got one wrong - `github_pat_` does not
+    # contain `gh` - so every credential with that prefix passed through silently.
+    if ! sed -n '/fn might_contain_secret/,/^}/p' "$log/redact.rs" | grep -q 'SHAPES.iter()'; then
+        fail "the redaction fast path no longer reads SHAPES" \
+            "a second copy of the matcher's literals will drift, and it drifts silently"
+    fi
+    if ! sed -n '/fn might_contain_secret/,/^}/p' "$log/redact.rs" | grep -q 'SECRET_FIELDS.iter()'; then
+        fail "the redaction fast path no longer reads SECRET_FIELDS" \
+            "a second copy of the matcher's field names will drift"
+    fi
+
+    # The field-name rule must match exactly. A prefix match would eat `api_key_env`,
+    # whose value T7 defines as the NAME of an environment variable and which a reader
+    # chasing a credential problem needs to see.
+    if grep -qE 'SECRET_FIELDS[^;]*starts_with\(field\)|field[^;]*is_prefix' "$log/redact.rs"; then
+        fail "the secret-field rule became a prefix match" \
+            "api_key_env is a signpost, not a secret; the difference is four characters"
+    fi
+
+    # The log file is owner-only, for the same reason T7 holds config to 0600.
+    if ! grep -q 'mode(0o600)' "$log/sink.rs"; then
+        fail "the log file is no longer created owner-only" \
+            "a log beside a 0600 config at 0644 makes the config mode pointless"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which
@@ -297,6 +342,6 @@ fi
 
 if [ "$status" -eq 0 ]; then
     echo "invariants: prompt ledger, ephemeral state, authority, quorum, unsafe confinement,"
-    echo "            the configuration schema, and internal versions all hold"
+    echo "            the configuration schema, diagnostics, and internal versions all hold"
 fi
 exit "$status"
