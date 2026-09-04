@@ -1,0 +1,25 @@
+[package]
+name = "supra_config"
+description = "Layered configuration for supra-harness: discovery, per-field precedence, provenance, and fail-fast validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# T7 reads files and inspects their permissions, so unlike T6 it does perform I/O.
+# It performs no *network* I/O and holds no runtime: resolution is a pure function
+# over already-read layers, which is what makes the precedence rules testable
+# without a filesystem.
+[dependencies]
+supra_types = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

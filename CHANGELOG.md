@@ -9,6 +9,60 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T7** `crates/supra_config`: layered configuration - discovery, per-field
+  precedence, provenance, and fail-fast validation.
+  - Precedence is per **field**, not per file: `ConfigLayer` is all-`Option` and
+    says only what its file said, `Config` is fully resolved. Without that split a
+    project file setting `[cohort] limit` would erase the user's
+    `[thinking] budget`. Every resolved setting also records **which layer supplied
+    it**, so `/config` can answer the question a user actually has when a setting
+    appears to be ignored.
+  - Resolution cannot fail. Layers are validated individually, so combining them is
+    a total function - which also means a precedence bug cannot hide behind an error
+    path.
+  - `Config` has no setter and no `&mut` accessor. That is what "the thinking budget
+    is frozen per session" amounts to in practice: not a rule to remember but the
+    absence of a way to break it.
+  - **No configuration field can hold a credential.** Only `api_key_env` and
+    `api_key_keyring` - the *name* of an environment variable or keyring entry -
+    exist. `api_key` and `auth_token` are declared solely to be refused with the
+    remedy, since `deny_unknown_fields` alone would say "unknown field" and leave the
+    reader to guess. A value in `api_key_env` that is not shaped like a variable name
+    is refused too: otherwise supra would look up a variable literally named `sk-...`,
+    report a missing credential, and send the reader looking in the wrong place.
+  - **The project layer is not trusted.** A repository is cloned from anywhere, so
+    `.supra/config.toml` may not name a provider, an endpoint, or a credential
+    source, and its permission mode may only make the session *stricter*. Under plain
+    precedence `project` outranks `user`, so a cloned repository shipping
+    `mode = "yolo"` would get it.
+  - Reading is hardened in two different directions. The permission check runs on the
+    **open handle** rather than the path, so the mode reported and the bytes read
+    belong to the same file. The file-type check runs **before** the open, because
+    opening a FIFO read-only blocks until a writer appears - a handle-based type check
+    would already have hung the process.
+  - Only the user layer is held to `0600`; a project file is normally committed and
+    cannot be. Its safety comes from the schema instead.
+  - Environment variables use a reserved `SUPRA_CONFIG_` prefix, and an unrecognised
+    one is refused. A bare `SUPRA_` prefix could not be: `SUPRA_CXX`,
+    `SUPRA_CPP_BUILD_DIR`, and `SUPRA_CMAKE_BUILD_TYPE` are real build variables, and
+    refusing unknown `SUPRA_*` names would break a developer's own shell.
+  - Every loader input is injectable, so the precedence rules are tested as
+    arithmetic. A loader that reached for the real environment internally could not be
+    exercised without mutating process-global state, and `set_var` is both `unsafe` in
+    this edition and racy across parallel tests.
+  - 82 tests plus a doc test. Twelve mutations against the load-bearing rules, all
+    caught.
+
+- `scripts/check-invariants.sh` gained the T7 checks: no mutation path on the
+  resolved `Config`, no field that can hold a literal credential, `deny_unknown_fields`
+  on every schema shape, and `describe_toml_error` as the single place that sees a
+  parser error. The last is checked structurally rather than by grepping for
+  `error.to_string()`, because a probe showed that pattern misses `e.to_string()`.
+
+- `scripts/mutate.sh` wraps its Rust branch in `timeout`. A mutation can remove a
+  guard against blocking rather than a guard against a wrong answer, and an unbounded
+  hang stalls the harness instead of reporting a verdict.
+
 - **T6** `crates/supra_types`: the contract layer, where the architecture's
   invariants stop being prose.
   - **I1** is the type: `Sealed<T>` has no `DerefMut`, no `as_mut`, and no
@@ -139,6 +193,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **A pasted credential could leak through the error refusing it.**
+  `ConfigError::Invalid` originally carried the `toml` crate's `Display` verbatim,
+  which prints the offending **source line** with a caret under it. So the message
+  explaining that supra never reads a literal credential from a file quoted that
+  credential - into stderr, into the T8 log, and into the next bug report. Errors now
+  report the location and the cause and never the content. One residual is named
+  rather than glossed: a mistyped *scalar* still has its value in the parser's cause
+  text, a surface that needs a value in a field of the wrong type.
+- **The project layer could loosen the permission mode.** The tightening rule was
+  applied as a pass *after* ordinary precedence, but ordinary precedence had already
+  accepted the project's mode - and a pass that can only tighten cannot undo a
+  loosening. The exhaustive test missed it because it used `Cli` as the operator
+  layer, which outranks `Project`; the bug only appeared when the operator layer sat
+  *below* the project. Non-operator-controlled layers are now excluded from the
+  ordinary pass, and the test walks every operator-controlled source.
 - `docs/ARCHITECTURE.md` section 4 was **missing the configurable peer limit
   entirely**, despite it being a locked requirement (1..=80, default 16). Its
   absence is how a reachable gap in the tier table went unnoticed: the limit can

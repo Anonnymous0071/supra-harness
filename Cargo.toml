@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/supra_ffi", "crates/supra_types"]
+members = ["crates/supra_ffi", "crates/supra_types", "crates/supra_config"]
 
 # ---------------------------------------------------------------------------
 # Shared package metadata. Every member crate inherits these with
@@ -30,6 +30,16 @@ authors = ["supra-harness contributors"]
 # nothing: Cargo only resolves a workspace dependency once a member selects it.
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
+# Internal crates.
+#
+# A path dependency needs an explicit `version` as well as its `path`. Without one
+# Cargo records the requirement as `*`, which `cargo deny`'s wildcard ban rejects and
+# which cannot be published to a registry at all. Declaring them here keeps that
+# version literal in exactly one place - Cargo has no `version.workspace = true`
+# inside a dependency spec, so one literal is unavoidable, and
+# `scripts/check-invariants.sh` asserts it still matches `workspace.package.version`.
+supra_types = { path = "crates/supra_types", version = "0.1.0" }
+
 # async runtime + streams
 tokio = { version = "1.53.1", default-features = false }
 tokio-util = "0.7.19"

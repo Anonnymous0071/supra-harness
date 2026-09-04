@@ -204,7 +204,99 @@ if ! grep -q 'forbid(unsafe_code)' "$crate/lib.rs"; then
         "the compile-time half of the unsafe confinement is gone"
 fi
 
+# ---------------------------------------------------------------------------
+# T7 - configuration
+# ---------------------------------------------------------------------------
+config=crates/supra_config/src
+
+if [ -d "$config" ]; then
+    # The thinking budget is frozen per session (section 6), which is enforced by
+    # `Config` having no way to be mutated. A setter or a `&mut` accessor would turn
+    # the freeze back into a convention.
+    hits=$(scan "$config/resolve.rs" \
+        'fn[[:space:]]+set_[a-z_]+|&mut[[:space:]]+self|impl[^;{]*DerefMut')
+    if [ -n "$hits" ]; then
+        fail "the resolved Config gained a mutation path" "$hits" \
+            "the thinking budget is frozen per session; see ARCHITECTURE.md section 6"
+    fi
+
+    # A configuration file must not be able to hold a credential. Only the *names* of
+    # an environment variable or a keyring entry are accepted, so a declared field
+    # that takes a key would reopen the leak the schema closes.
+    hits=$(scan "$config/layer.rs" \
+        'pub[[:space:]]+api_key:[[:space:]]*Option<String>|pub[[:space:]]+auth_token:[[:space:]]*Option<String>|pub[[:space:]]+secret')
+    if [ -n "$hits" ]; then
+        fail "a config field can hold a literal credential" "$hits" \
+            "only api_key_env and api_key_keyring are accepted; see the crate docs"
+    fi
+
+    # The `toml` crate's Display prints the offending source line, which put a pasted
+    # credential straight into the message refusing it. Errors report the location and
+    # the cause, never the content.
+    #
+    # Checked structurally rather than by grepping for `error.to_string()`: that
+    # pattern depends on a variable name, and a probe showed it misses
+    # `e.to_string()`. Instead, `describe_toml_error` must be the single place that
+    # sees a `toml::de::Error` at all, and `parse` must route through it.
+    if ! scan "$config/layer.rs" 'describe_toml_error' | grep -q 'toml::from_str' &&
+        ! grep -A6 'pub fn parse(' "$config/layer.rs" | grep -q 'describe_toml_error'; then
+        fail "ConfigLayer::parse no longer routes through describe_toml_error" \
+            "a raw parser message echoes the file line, and may echo a pasted credential"
+    fi
+
+    mentions=$(scan "$config/layer.rs" 'toml::de::Error' | wc -l | tr -d ' ')
+    if [ "$mentions" != "1" ]; then
+        fail "toml::de::Error is handled in $mentions places, expected 1" \
+            "$(scan "$config/layer.rs" 'toml::de::Error')" \
+            "only describe_toml_error may see a parser error, so no other path can \
+render one verbatim"
+    fi
+
+    # Unknown keys must be refused, or a typo is silently ignored.
+    for shape in ConfigLayer ThinkingLayer CohortLayer PermissionLayer PromptLayer ProviderLayer; do
+        if ! grep -B4 "pub struct $shape" "$config/layer.rs" | grep -q 'deny_unknown_fields'; then
+            fail "$shape does not deny unknown fields" \
+                "a misspelled key would be silently ignored"
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Internal dependency versions track the workspace version
+#
+# A path dependency needs an explicit `version` too, or Cargo records `*` - which
+# cargo-deny's wildcard ban rejects and which cannot be published. Cargo has no
+# `version.workspace = true` inside a dependency spec, so the literal is unavoidable;
+# what is avoidable is it drifting silently when the workspace version is bumped.
+# ---------------------------------------------------------------------------
+workspace_version=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml |
+    sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+
+if [ -z "$workspace_version" ]; then
+    fail "could not read workspace.package.version from Cargo.toml" \
+        "the internal dependency version check cannot run"
+else
+    internal=$(grep -E '^[a-z_]+ = \{ path = "crates/' Cargo.toml || true)
+    if [ -n "$internal" ]; then
+        while IFS= read -r line; do
+            crate=${line%% =*}
+            declared=$(printf '%s' "$line" | sed -n 's/.*version = "\([^"]*\)".*/\1/p')
+            if [ -z "$declared" ]; then
+                fail "internal dependency $crate has a path but no version" "$line" \
+                    "Cargo records that as \`*\`, which cannot be published"
+            elif [ "$declared" != "$workspace_version" ]; then
+                fail "internal dependency $crate is pinned to $declared, workspace is $workspace_version" \
+                    "$line" \
+                    "bump the [workspace.dependencies] entry alongside workspace.package.version"
+            fi
+        done <<EOF
+$internal
+EOF
+    fi
+fi
+
 if [ "$status" -eq 0 ]; then
-    echo "invariants: I1, I2, authority, quorum, and unsafe confinement all hold"
+    echo "invariants: prompt ledger, ephemeral state, authority, quorum, unsafe confinement,"
+    echo "            the configuration schema, and internal versions all hold"
 fi
 exit "$status"

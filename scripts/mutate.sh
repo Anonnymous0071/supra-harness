@@ -76,7 +76,12 @@ if [[ "$file" == *.rs ]]; then
 
     # One invocation compiles and runs, so the exit code alone cannot say
     # whether a failure was a compile failure or a caught mutation.
-    if cargo test "${target[@]}" --locked >/tmp/mutate-build.log 2>&1; then
+    #
+    # Wrapped in `timeout` because a mutation can remove a guard against blocking -
+    # T7's pre-flight check on a FIFO is exactly that - and an unbounded hang would
+    # stall the harness instead of reporting a verdict. A timeout counts as CAUGHT:
+    # the suite noticed.
+    if timeout 300 cargo test "${target[@]}" --locked >/tmp/mutate-build.log 2>&1; then
         printf 'SURVIVED   %s  <-- TEST GAP\n' "$desc"
     elif grep -qE 'could not compile|failed to run custom build command' /tmp/mutate-build.log; then
         printf 'BUILD_FAIL %s\n' "$desc"
