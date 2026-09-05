@@ -1,0 +1,23 @@
+[package]
+name = "supra_llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Provider clients for supra-harness: three providers, CachePolicy, canonical serialisation, frozen thinking budget."
+publish = false
+
+[dependencies]
+supra_types = { workspace = true }
+supra_config = { workspace = true }
+supra_secrets = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+
+[lints]
+workspace = true

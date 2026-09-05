@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T12.5 complete. Stages T13 onward are unimplemented.
+Status: T1-T13 complete. Stages T13.5 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -809,6 +809,18 @@ the only thing standing. A third survival (M5) is the dual: a suite holding only
 fully-honest and fully-dishonest fixtures cannot see an early-accept on a *valid*
 layer. The fix is a fixture honest everywhere except the last layer, demanding
 exactly `[7]`.
+
+**Method note from T13, on a redundant line that must stay.** The canonicaliser's
+`keys.sort()` changes nothing: `serde_json::Map` without `preserve_order` is a
+`BTreeMap`, so iteration is already sorted. Deleting it passes the suite - correctly.
+The line stays because the guarantee must not depend on a transitive feature flag no
+member selects: enabling `preserve_order` anywhere would switch the map to insertion
+order, and the canonicaliser would emit whatever the parser saw. A redundant sort is
+cheap; a feature-dependent guarantee is not one. Two tests pin it: output bytes, and
+the map's own ordering. The general rule: **a passing suite is not evidence until
+something has tried to break it - and a mutation that changes nothing is evidence
+about the code, not a gap in the suite.** M1's survival taught what the line is for;
+removing the line would un-teach it.
 
 **Decided in T11**: the stage map named `sqlite-vec`, and the implementation does
 not use it. The decision rests on measurement rather than preference:

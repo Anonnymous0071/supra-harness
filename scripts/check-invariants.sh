@@ -327,6 +327,88 @@ render one verbatim"
 fi
 
 # ---------------------------------------------------------------------------
+# T13 - providers
+#
+# Three properties the compiler cannot see: the canonicaliser actually sorts (its
+# output must not depend on a transitive serde_json feature), the thinking floor is
+# checked at construction (not at the first request), and the credential never sits
+# in a field (it arrives per request, used once).
+# ---------------------------------------------------------------------------
+llm=crates/supra_llm/src
+
+if [ -d "$llm" ]; then
+    # The sort must be an explicit call in `emit`, not an inherited property of the
+    # container. `serde_json::Map` without `preserve_order` is a BTreeMap (sorted),
+    # so deleting `keys.sort()` changes nothing today - and the day a transitive
+    # feature enables `preserve_order`, the canonicaliser silently emits insertion
+    # order. A probe deleting the sort must fail.
+    if ! scan "$llm/canonical.rs" 'keys\.sort\(\)' | grep -q 'keys.sort()'; then
+        fail "the canonicaliser no longer sorts keys explicitly" \
+            "ordering would depend on serde_json's preserve_order feature flag"
+    fi
+
+    # `CanonicalJson::from_canonical` must be called from exactly one place: the
+    # canonicaliser. A second producer is a second implementation of canonicity, and
+    # two implementations can disagree - which is an invisible cache break.
+    producers=$(scan "$llm/canonical.rs" 'from_canonical' | wc -l | tr -d ' ')
+    if [ "$producers" != "2" ]; then
+        fail "expected from_canonical at 2 sites in canonical.rs, found $producers" \
+            "$(scan "$llm/canonical.rs" 'from_canonical')" \
+            "T13's serialiser is the only sanctioned producer of CanonicalJson"
+    fi
+    # And no producer outside the canonicaliser. `scan` takes a file, so walk the
+    # crate; the count above covers canonical.rs, this covers everywhere else.
+    hits=$(for file in "$llm"/*.rs; do
+        [ "$(basename "$file")" = "canonical.rs" ] && continue
+        scan "$file" 'from_canonical'
+    done)
+    if [ -n "$hits" ]; then
+        fail "a second CanonicalJson producer exists outside the canonicaliser" "$hits" \
+            "two implementations of canonicity can disagree; that is a cache break"
+    fi
+
+    # The thinking floor is checked in `Client::new`, not at the first request.
+    # `budget_tokens` is rendered into the prompt, so a below-floor budget invalidates
+    # every cache breakpoint from the first turn - surfacing it late means the first
+    # turn paid full price before anyone learned the configuration was wrong.
+    body=$(sed -n '/pub fn new(/,/^    }/p' "$llm/client.rs")
+    if ! printf '%s' "$body" | grep -q 'ThinkingBudget'; then
+        fail "Client::new no longer checks the thinking floor" "$body" \
+            "T7 requires the check at startup, not at the first request"
+    fi
+
+    # The credential arrives per request, never as a field. A `Client` holding a
+    # `SecretString` keeps the credential alive for the session's lifetime and widens
+    # every clone, log, and unwind path into a leak vector.
+    #
+    # A field declaration is `name: Type,` at struct depth; the sanctioned parameter
+    # `credential: &supra_secrets::SecretString,` carries a `&` the field never would.
+    # Match the field spelling (no `&`) anchored to end-of-line, so the parameter
+    # cannot satisfy it.
+    hits=$(scan "$llm/client.rs" 'credential:[[:space:]]*Option<|credential:[[:space:]]*supra_secrets|secret:[[:space:]]*$')
+    if [ -n "$hits" ]; then
+        fail "the client holds a credential" "$hits" \
+            "it arrives per send(), used once, never stored"
+    fi
+    # The positive form: `send` must take the credential as a parameter.
+    if ! grep -q 'credential: &supra_secrets::SecretString' "$llm/client.rs"; then
+        fail "Client::send no longer takes the credential per request" \
+            "the credential must arrive per call, used once, never stored"
+    fi
+
+    # Retries are the caller's, not the client's. Only RateLimited carries a delay,
+    # and Unauthorized must never be retried (a bad credential retried is how a typo
+    # becomes a lockout). `retry_after_ms` (the delay *value*) and `RateLimited` (the
+    # variant that carries it) are the sanctioned vocabulary; a loop, a sleep, or a
+    # backoff around `send` is the violation.
+    hits=$(scan "$llm/client.rs" 'tokio::time::sleep|for .* in .*retry|while .*retry|backoff')
+    if [ -n "$hits" ]; then
+        fail "the client retries" "$hits" \
+            "backoff belongs to the turn loop, which knows how many peers wait"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # T8 - diagnostics
 # ---------------------------------------------------------------------------
 log=crates/supra_log/src

@@ -9,6 +9,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T13** `crates/supra_llm`: three providers behind one call shape, each with its own
+  `CachePolicy`, one canonical serialiser, and a thinking budget frozen at startup.
+  - **`Anthropic` is T6's table verbatim** (4 breakpoints, 1h/5m, 1024 minimum, 1024
+    thinking floor). `OpenAI` carries one `prompt_cache_key`. `Google` assumes the 4096
+    floor: padding wastes once, a miss bills every turn. Section 11 records Google as
+    unverified; the policy encodes that honestly.
+  - **The serialiser is the only sanctioned producer of `CanonicalJson`.** Sorted keys,
+    no floats, duplicates refused (with `\u0041`-style escapes decoded for identity).
+    The bytes on the wire are the bytes that were hashed.
+  - **The thinking floor is checked in `Client::new`**, not at the first request -
+    T7's fail-fast, placed where it lives. Zero disables thinking on every provider.
+  - **The credential arrives per `send()`**, never as a field. Retries belong to the
+    turn loop: only `RateLimited` carries a delay (provider's header, else 60 s, never
+    zero); `Unauthorized` is never retried; malformed SSE is refused, not skipped.
+  - Eight mutations, all caught; one survived first (M1: the sort is redundant today
+    because the map is already a `BTreeMap` - evidence about the code, closed with two
+    pinning tests). Six guard checks, all probed; two were blind before shipping
+    (parameter vs field, value vs violation vocabulary).
 - **T12.5** `crates/supra_guard`: seven anti-self-spawn layers, no off switch.
   - **Four questions, seven layers.** L1/L2 readiness (identity, key); L3/L4 this binary
     (name, inode); L5 the copy L4 cannot see (HMAC marker); L6 this agent (lineage);

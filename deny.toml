@@ -36,12 +36,29 @@ allow = [
     "CC0-1.0",
     "Unlicense",
     "BSL-1.0",
+    # CDLA-Permissive-2.0, scoped by the clarify entry below to webpki-root-certs'
+    # CA bundle (data, not code). `allow` is the blanket grant, so the scope lives
+    # in the comment and the clarify: a future non-data use of this licence would
+    # need its own justification, not a free ride on this line.
+    "CDLA-Permissive-2.0",
 ]
 
 [[licenses.clarify]]
 name = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [{ path = "LICENSE", hash = 0xbd0e_ed23 }]
+
+# webpki-root-certs bundles Mozilla's CA certificate list, which is data licensed
+# under CDLA-Permissive-2.0 - a permissive data licence in the same family as CC0: use,
+# modify, and share with the licence text, no restrictions on results. It reaches the
+# graph only on wasm32-wasi, through reqwest's rustls-platform-verifier on that target;
+# every other target verifies against the OS store instead. The `allow` entry above is
+# the grant; this clarify pins the expected licence text hash, so a changed bundle
+# fails the gate rather than passing silently.
+[[licenses.clarify]]
+name = "webpki-root-certs"
+expression = "CDLA-Permissive-2.0"
+license-files = [{ path = "LICENSE", hash = 0x99b6_8c9c }]
 
 [bans]
 multiple-versions = "warn"
