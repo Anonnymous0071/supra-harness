@@ -1375,6 +1375,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_guard"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "sha2 0.11.0",
+ "supra_ffi",
+ "supra_types",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "supra_log"
 version = "0.1.0"
 dependencies = [

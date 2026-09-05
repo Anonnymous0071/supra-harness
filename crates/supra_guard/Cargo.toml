@@ -1,0 +1,21 @@
+[package]
+name = "supra_guard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Seven anti-self-spawn guard layers: one model must not spawn itself."
+publish = false
+
+[dependencies]
+supra_types = { workspace = true }
+supra_ffi = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+getrandom = { workspace = true }
+
+[lints]
+workspace = true

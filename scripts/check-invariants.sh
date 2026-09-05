@@ -773,6 +773,139 @@ if [ -d "$secrets" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T12.5 - anti-self-spawn guard
+#
+# Seven layers, no off switch. Each check below names the layer it protects; a probe
+# per check deletes the enforcement while leaving the name, because a guard that
+# tests vocabulary ("does L4 appear somewhere") certifies broken code.
+# ---------------------------------------------------------------------------
+guard=crates/supra_guard/src
+
+if [ -d "$guard" ]; then
+    # L1/L2 share the NoIdentity variant with a detail that names the missing half, and
+    # `layer_of` maps the detail back to 1 or 2. A probe replacing the detail parse with
+    # a constant 1 makes L2's refusal report as L1 - the operator investigates the wrong
+    # half. The check asserts the mapping reads the detail, not the variant alone.
+    body=$(sed -n '/pub fn layer_of/,/^}/p' "$guard/layers.rs")
+    if ! printf '%s' "$body" | grep -q 'marker key'; then
+        fail "layer_of no longer distinguishes L1 from L2" "$body" \
+            "both share NoIdentity; the detail text is what maps back to 1 or 2"
+    fi
+    if printf '%s' "$body" | grep -q 'Refusal::NoIdentity[^a-z]*=>[^0-9]*1,'; then
+        fail "layer_of maps every NoIdentity to L1" "$body" \
+            "L2's refusal would report as L1 and misdirect the investigation"
+    fi
+
+    # Every layer must run even after one refuses. Short-circuiting on the first refusal
+    # hides what the other layers saw: "refused by L3" says what happened, "refused by
+    # L3, L4, and L5" says what was attempted. A probe inserting an early return after
+    # the first push must fail.
+    body=$(sed -n '/pub fn judge/,/^}/p' "$guard/layers.rs")
+    if printf '%s' "$body" | grep -qE 'if !refusals.is_empty\(\)|if refusals.len\(\)|return Verdict \{ refusals \}|return Verdict\{'; then
+        fail "judge short-circuits on the first refusal" "$body" \
+            "every layer runs unconditionally; the verdict carries all refusals"
+    fi
+    # The positive form: all seven layer sections must be present in `judge`. A probe
+    # deleting one layer's block while leaving its helper intact must fail.
+    for marker in 'L1: identity' 'L2: marker key' 'L3: the command' 'L4: the command' 'L5: the marker' 'L6: the lineage' 'L7: no self-voting'; do
+        if ! printf '%s' "$body" | grep -qF -- "$marker"; then
+            fail "judge lost its $marker section" "$body" \
+                "deleting a layer while leaving its helper compiles and certifies"
+        fi
+    done
+
+    # L4 must compare (device, inode) through supra_ffi, not a path string. A path
+    # comparison passes a symlink with an innocent name and fails a hardlink with a
+    # guilty one - both wrong.
+    #
+    # Two halves, because the call site and the definition live in different crates:
+    # `judge` must call `is_own_file` (the (device, inode) comparison in identity.rs,
+    # which itself calls `supra_ffi::sandbox::file_identity`), and a probe replacing the
+    # call with a path comparison must fail. Checking only that the *name* appears
+    # somewhere is vocabulary; checking the call site is enforcement.
+    hits=$(scan "$guard/layers.rs" 'is_own_file')
+    if [ -z "$hits" ]; then
+        fail "L4 no longer calls is_own_file at the judgement site" \
+            "a path-string comparison passes a symlink with an innocent name"
+    fi
+    if ! scan "$guard/identity.rs" 'file_identity' | grep -q .; then
+        fail "L4's identity comparison no longer resolves through supra_ffi" \
+            "names lie, inodes do not"
+    fi
+
+    # L5 must verify through HMAC, constant-time. The check targets the call site in
+    # `verify`, not the doc comment that names the primitive: a probe replacing the call
+    # while leaving the comment must fail, and a probe *adding* a `==` fast path next to
+    # the real check must fail too, because the fast path leaks timing.
+    #
+    # `scan` (not grep) so a doc example mentioning `verify_slice` does not satisfy it -
+    # the call must be in shipped code. Same lesson as T11's constraint checks.
+    if ! scan "$guard/marker.rs" 'verify_slice' | grep -q 'mac.verify_slice'; then
+        fail "L5 no longer calls verify_slice at the verification site" \
+            "hmac::Mac::verify_slice is the primitive that does this correctly"
+    fi
+    hits=$(scan "$guard/marker.rs" 'expected ==|== *expected|presented ==|== *presented|\.result\(\)')
+    if [ -n "$hits" ]; then
+        fail "L5 compares tags outside verify_slice" "$hits" \
+            "a byte-wise early exit lets a local process time the match byte by byte"
+    fi
+    # The tag helper is called exactly once outside its definition: when issuing.
+    # Verification recomputes nothing - it checks the presented tag against the key via
+    # `verify_slice`. A second call site is a shadow verification path, and a shadow path
+    # is where a `==` fast path hides.
+    calls=$(scan "$guard/marker.rs" '(^|[^_:a-zA-Z])tag\(' | wc -l | tr -d ' ')
+    if [ "$calls" != "2" ]; then
+        fail "expected tag() at 2 sites (def, issue), found $calls" \
+            "$(scan "$guard/marker.rs" '(^|[^_:a-zA-Z])tag\(')" \
+            "a new call site is a shadow verification path until proven otherwise"
+    fi
+
+    # The marker key must be zeroized, not merely dropped. A plain `[u8; 32]` leaves both
+    # key generations in freed heap; `Zeroizing` wipes on drop and on rotation. Checked at
+    # the declaration site (`static KEY`), not by counting mentions: rotation helpers also
+    # name the type, so a whole-file grep for `Zeroizing` passes with the static replaced.
+    if ! scan "$guard/marker.rs" 'static KEY' | grep -q 'Zeroizing'; then
+        fail "the marker key static is not zeroized" \
+            "a plain array leaves key generations in freed heap"
+    fi
+
+    # Entropy failure must be a returned Refusal, never a panic. `expect` on a getrandom
+    # or HMAC constructor turns a kernel state into an abort, and takes the degraded-run
+    # decision away from startup. T12's file store maps the same failure to Crypto; here
+    # it is NoEntropy, because the remedy differs.
+    hits=$(scan "$guard/marker.rs" 'expect\(')
+    if [ -n "$hits" ]; then
+        fail "marker keying can panic" "$hits" \
+            "map entropy and constructor failures to Refusal::NoEntropy instead"
+    fi
+
+    # No off switch: no flag, mode, or configuration may skip a layer. `yolo` relaxes
+    # consent (T16.7); it does not touch authority. A probe adding a `skip_l2: bool` or a
+    # `Mode` parameter to `judge`/`SpawnRequest` must fail.
+    hits=$(scan "$guard/layers.rs" 'skip_|bypass|disable|Mode|yolo')
+    if [ -n "$hits" ]; then
+        fail "the guard grew an off switch" "$hits" \
+            "layers L1-L7 have no off switch; yolo relaxes consent, not authority"
+    fi
+    hits=$(scan "$guard/lib.rs" 'skip_|bypass|disable')
+    if [ -n "$hits" ]; then
+        fail "the guard's public surface grew an off switch" "$hits" \
+            "see above"
+    fi
+
+    # The event taxonomy already promises layer numbers 1-7 (`GuardLayerTriggered.layer`
+    # documents T12.5's seven layers). `layer_of` must stay within that range: an 8 would
+    # be a layer the taxonomy cannot name, and a 0 would be a refusal no layer owns.
+    body=$(sed -n '/pub fn layer_of/,/^}/p' "$guard/layers.rs")
+    for n in 0 8 9; do
+        if printf '%s' "$body" | grep -q "=> $n,"; then
+            fail "layer_of returns $n, outside the taxonomy's 1-7" "$body" \
+                "GuardLayerTriggered.layer documents seven layers; the mapping must match"
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which
@@ -809,6 +942,7 @@ fi
 if [ "$status" -eq 0 ]; then
     echo "invariants: prompt ledger, ephemeral state, authority, quorum, unsafe confinement,"
     echo "            the configuration schema, credential resolution, diagnostics, the event bus,"
-    echo "            the turn store, hybrid retrieval, the store's connection, and internal versions"
+    echo "            the turn store, hybrid retrieval, the store's connection, anti-self-spawn,"
+    echo "            and internal versions"
 fi
 exit "$status"

@@ -9,6 +9,7 @@ members = [
     "crates/supra_store",
     "crates/supra_vector",
     "crates/supra_secrets",
+    "crates/supra_guard",
 ]
 
 # ---------------------------------------------------------------------------
@@ -51,6 +52,8 @@ supra_types = { path = "crates/supra_types", version = "0.1.0" }
 supra_store = { path = "crates/supra_store", version = "0.1.0" }
 supra_secrets = { path = "crates/supra_secrets", version = "0.1.0" }
 supra_log = { path = "crates/supra_log", version = "0.1.0" }
+supra_guard = { path = "crates/supra_guard", version = "0.1.0" }
+supra_ffi = { path = "crates/supra_ffi", version = "0.1.0" }
 
 # async runtime + streams
 tokio = { version = "1.53.1", default-features = false }
@@ -90,6 +93,9 @@ pbkdf2 = "0.13.0"
 sha2 = "0.11.0"
 zeroize = { version = "1.9.0", features = ["derive"] }
 getrandom = "0.4.3"
+
+# guard (T12.5): HMAC-SHA256 for the environment marker
+hmac = "0.13.0"
 
 # provider transport (T13)
 reqwest = { version = "0.13.4", default-features = false, features = [

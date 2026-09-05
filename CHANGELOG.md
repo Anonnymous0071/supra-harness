@@ -9,6 +9,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T12.5** `crates/supra_guard`: seven anti-self-spawn layers, no off switch.
+  - **Four questions, seven layers.** L1/L2 readiness (identity, key); L3/L4 this binary
+    (name, inode); L5 the copy L4 cannot see (HMAC marker); L6 this agent (lineage);
+    L7 this claim (no self-vote). Every layer runs on every judgement; the verdict
+    carries all refusals.
+  - **L4 compares inodes, never paths**, via `supra_ffi::sandbox::file_identity` - the
+    `self_identity` T4 built for exactly this. A symlink test proves it: an innocent
+    name passes L3 and fails L4.
+  - **The marker is HMAC-SHA256 over `version:nonce`**, verified constant-time, key
+    zeroized, entropy failure returned as `NoEntropy` rather than panicked. A rotation
+    test stands in for "another process".
+  - Eight mutations, all caught; three survived first (M3/M4: fixtures failing before
+    the gate; M5: no honest-except-last fixture). Nine guard checks, all probed; three
+    were blind before shipping (call-site vs name, doc comment vs call, region scope).
 - **T12** `crates/supra_secrets`: OS keyring plus encrypted fallback, `Secret<T>`, and
   credential resolution in `supra_config`.
   - **The ladder is probed, not assumed.** `keyring` v4 reports `NoDefaultStore` in ~10 ms

@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T12 complete. Stages T12.5 onward are unimplemented.
+Status: T1-T12.5 complete. Stages T13 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -798,6 +798,17 @@ from `/dev/tty` when no source existed; that hung the test runner, whose stdin w
 terminal with nobody behind it. A library that blocks on input without an explicit
 opt-in hangs every non-interactive caller behind it. The CLI registers its prompt
 through `set_passphrase_provider`; the library resolves memory, environment, provider.
+
+**Method note from T12.5, on fixtures that fail before the gate.** Two mutations
+survived (M3/M4) because the truncation test's hostile cases failed on shape before
+reaching the gate under test: the version-2 case carried a two-char tag, the nonce
+cases a short tag. A fixture that fails before the gate cannot test the gate - the
+same class of mistake as T11's degenerate corpus, one level down. The fix is the same
+too: mint a well-formed marker and break exactly one field, so the gate under test is
+the only thing standing. A third survival (M5) is the dual: a suite holding only
+fully-honest and fully-dishonest fixtures cannot see an early-accept on a *valid*
+layer. The fix is a fixture honest everywhere except the last layer, demanding
+exactly `[7]`.
 
 **Decided in T11**: the stage map named `sqlite-vec`, and the implementation does
 not use it. The decision rests on measurement rather than preference:
