@@ -9,6 +9,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T15.5** `crates/supra_cohort`: deterministic tier estimation, admission,
+  escalation - turn step 2 with zero LLM calls.
+  - **A ladder, not a weighted sum.** Ordered rules over signal bands, composing
+    by maximum so overlapping evidence resolves independent of rule order. E5 on
+    user request or 2+ failures; E4 on sensitive areas or any active finding;
+    E3 on wide blast or hot churn; E2 on contained blast, many anchors, active
+    churn, or R3; E1 on any side effect or few anchors; E0 otherwise.
+  - **Bands, not raw counts.** Blast/churn/anchor thresholds calibrated to the
+    document's triggers, normalised at construction so the ladder stays stable
+    while repositories grow. Failures saturate at 2, success resets; E5
+    saturates, unreachable-quorum and blind-mismatch skip E1.
+  - **`Admission` carries k, quorum, shards together** - built once from T6's
+    arithmetic, read everywhere, so the numbers cannot drift apart.
+  - Fourteen mutations, all caught; two survived first (M4/M5: deleted signals
+    sharing a rule with covered neighbours - closed with minimal-evidence
+    tests). Five guard checks, all probed; three were blind before shipping
+    (directory-to-scan, presence-vs-count, single-arm sed range).
 - **T15** `crates/supra_digest`: symbol index, dependency graph, churn, hybrid
   retrieval anchors - orientation with zero LLM calls.
   - **A real parser, not line patterns.** Seven compiled-in grammars (Rust,

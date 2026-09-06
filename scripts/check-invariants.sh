@@ -1145,6 +1145,86 @@ if [ -d "$digest" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T15.5 - cohort estimation
+#
+# Five properties the compiler cannot see: zero LLM calls (no provider
+# dependency, enforced twice), integer-only scoring (no float), max-composition
+# (order-independent rules), saturation (failures stop at 2), and the turn
+# loop's escalation contract (unreachable now, blind mismatch skips E1).
+# ---------------------------------------------------------------------------
+cohort=crates/supra_cohort/src
+
+if [ -d "$cohort" ]; then
+    # Zero LLM calls is structural, twice over: the manifest must not name the
+    # provider crate (the build fails first), and no module may import it (the
+    # negative test fails second). A probe adding the dependency must fail.
+    if grep -q 'supra_llm' crates/supra_cohort/Cargo.toml; then
+        fail "supra_cohort depends on supra_llm" \
+            "estimation is zero LLM calls; signals are integers, not completions"
+    fi
+    hits=$(scan "$cohort/score.rs" 'supra_llm::|use supra_llm|Client::new|reqwest::')
+    if [ -n "$hits" ]; then
+        fail "supra_cohort reaches for a provider client" "$hits" \
+            "estimation reads integers and returns a tier"
+    fi
+
+    # Scoring is integer-only. A float confidence would invite averaging and
+    # thresholding that reads as rigour while resting on a model's self-report -
+    # and it would be the only float in the estimation path (T6's rule).
+    # One file at a time: `scan` reads a single file, and a directory argument
+    # makes production_lines fail - which `|| true` downstream would mask as a
+    # pass. A guard that cannot see the violation certifies it.
+    hits=$(scan "$cohort/signals.rs" '\bf32\b|\bf64\b|[0-9]\.[0-9]')
+    hits="$hits$(scan "$cohort/score.rs" '\bf32\b|\bf64\b|[0-9]\.[0-9]')"
+    hits="$hits$(scan "$cohort/admit.rs" '\bf32\b|\bf64\b|[0-9]\.[0-9]')"
+    hits="$hits$(scan "$cohort/profile.rs" '\bf32\b|\bf64\b|[0-9]\.[0-9]')"
+    if [ -n "$hits" ]; then
+        fail "a float reached cohort estimation" "$hits" \
+            "bands are ordinals, not magnitudes; see ARCHITECTURE.md section 4"
+    fi
+
+    # The ladder composes by maximum, not first match. A probe replacing
+    # `tier.max` with early returns makes the outcome depend on rule order -
+    # and rule order is the thing most likely to be edited casually.
+    # Counted, not merely present: one surviving `tier.max` beside a new early
+    # return still leaves the early return deciding overlapping evidence.
+    maxes=$(scan "$cohort/score.rs" 'tier\.max\(Tier::E' | wc -l | tr -d ' ')
+    if [ "$maxes" != "5" ]; then
+        fail "expected tier.max at 5 ladder rules, found $maxes" \
+            "$(scan "$cohort/score.rs" 'tier\.max\(Tier::E|return Tier::E')" \
+            "first-match-wins makes overlapping evidence order-dependent"
+    fi
+
+    # Failures saturate at 2: the third failure teaches nothing the second did
+    # not, and an unbounded counter pins every future task at E5. A probe
+    # removing the saturation must fail.
+    if ! scan "$cohort/profile.rs" 'repeat_failures >= 2|repeat_failures > 1|\.min\(2\)|saturat' | grep -q .; then
+        fail "failure counting no longer saturates" \
+            "one flaky shape would pin every future task at E5"
+    fi
+
+    # Unreachable quorum and blind mismatch skip E1: k=2 with quorum 2 is
+    # unanimity-shaped scrutiny, and a model that disagrees with itself needs
+    # peers that can disagree with each other. The sed range below spans the
+    # whole `next_tier` function (both match arms); anchoring on the function
+    # name alone matched only the first arm in an earlier draft, and a probe
+    # routing FindingConfirmed to E1 would have passed uncaught.
+    body=$(sed -n '/pub const fn next_tier/,/^    }$/p' "$cohort/admit.rs")
+    if ! printf '%s' "$body" | grep -q 'Tier::E0 | Tier::E1 => Tier::E2'; then
+        fail "escalation no longer skips E1" "$body" \
+            "unanimity-shaped scrutiny cannot review self-disagreement"
+    fi
+    # And the skip-E1 arm must map E0 to E2, not E1: matching only the presence
+    # of E2 anywhere would pass a body where some other arm mentions E2 while
+    # the skip arm quietly routes to E1.
+    skip_arm=$(printf '%s' "$body" | grep -A3 'UnreachableQuorum | Self::BlindMismatch')
+    if ! printf '%s' "$skip_arm" | grep -q 'Tier::E0 | Tier::E1 => Tier::E2'; then
+        fail "the skip-E1 arm no longer routes E0 to E2" "$skip_arm" \
+            "unanimity-shaped scrutiny cannot review self-disagreement"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T15 complete. Stages T15.5 onward are unimplemented.
+Status: T1-T15.5 complete. Stages T15.7 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.

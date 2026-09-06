@@ -1,0 +1,16 @@
+[package]
+name = "supra_cohort"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic cohort tier estimation for supra-harness: signals to tier, admission, quorum, sharding. Zero LLM calls."
+publish = false
+
+[dependencies]
+supra_types = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true
