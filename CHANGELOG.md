@@ -9,6 +9,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T13.5** (research, no new crate): thinking-block preservation rules resolved from
+  official Anthropic documentation, unblocking T14's eviction policy.
+  - **Required:** within a tool-use turn, thinking blocks pass back complete and
+    unmodified with their `tool_use` (400 otherwise); `signature` verifies provenance,
+    `redacted_thinking` passes back unchanged; consecutive blocks keep generation order.
+  - **Allowed:** outside tool use, prior turns' thinking may be omitted (silently
+    accepted or auto-stripped; modifying is a 400, omitting is free).
+  - **Decided for T14:** evict verbatim what the API requires (`tool_use` turns keep
+    thinking + signature, `redacted_thinking` everywhere, order kept); drop only what
+    the API declares omissible; never call `clear_thinking_20251015` (server-side
+    clearing invalidates cache at the clearing point - eviction already reclaimed the
+    space losslessly, so clearing would pay the break without buying anything back).
 - **T13** `crates/supra_llm`: three providers behind one call shape, each with its own
   `CachePolicy`, one canonical serialiser, and a thinking budget frozen at startup.
   - **`Anthropic` is T6's table verbatim** (4 breakpoints, 1h/5m, 1024 minimum, 1024

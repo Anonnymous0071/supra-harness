@@ -23,13 +23,25 @@
 //! block carries the budget the request was rendered against, so a mismatch between the
 //! configured budget and the request's budget is detectable rather than silent.
 //!
-//! # T13.5 blocks what this client preserves
+//! # T13.5 resolved: what this client preserves
 //!
-//! Whether prior-turn thinking blocks must be resent, and the signature rule for thinking
-//! blocks adjacent to `tool_use`, are open research questions. Until resolved, this client
-//! carries thinking blocks verbatim and never drops them: T14 is conservative, preserving
-//! thinking blocks on turns containing `tool_use`. Dropping them early would be an
-//! optimisation against an unknown rule.
+//! Anthropic's rules, verified from official documentation (thinking, tool-use, API
+//! reference, context-editing pages):
+//!
+//! - **Required:** within a tool-use turn, thinking blocks must be passed back complete
+//!   and unmodified, alongside the `tool_use` block they accompanied (400 otherwise).
+//!   The `signature` verifies Claude generated the block; `redacted_thinking` blocks
+//!   pass back unchanged the same way.
+//! - **Within the latest assistant message**, consecutive thinking blocks must match
+//!   generation order exactly - including `redacted_thinking`.
+//! - **Recommended:** across turns, pass everything back; the API filters and bills
+//!   only shown blocks.
+//! - **Allowed:** outside tool use, omit prior turns' thinking (silently accepted).
+//! - Keep-all models bill retained thinking as input; last-turn-only models strip
+//!   automatically. Clearing via `clear_thinking_20251015` invalidates cache at the
+//!   clearing point - so T14 evicts losslessly instead of asking the provider to clear.
+//!
+//! Until T14 lands, this client carries thinking blocks verbatim and never drops them.
 
 use serde::{Deserialize, Serialize};
 
