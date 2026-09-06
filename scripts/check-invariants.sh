@@ -988,6 +988,90 @@ if [ -d "$guard" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T14 - prompt ledger
+#
+# Four properties the compiler cannot see: append-only (no mutation path on the
+# ledger), store-before-drop (eviction commits before the prefix forgets), thinking
+# disposition per T13.5 (tool turns keep, prose turns drop), and generation
+# verification (a rewrite proves it moved content rather than rewording it).
+# ---------------------------------------------------------------------------
+prompt=crates/supra_prompt/src
+
+if [ -d "$prompt" ]; then
+    # I1: the ledger exposes append and read-only views, never mutation. A `&mut`
+    # accessor, a `remove`, a `clear` beyond the rewrite path, or an `into_inner`
+    # would be a rewrite wearing an append's clothes. `clear_for_rewrite` is the
+    # one sanctioned clearing, and it is checked separately below.
+    hits=$(scan "$prompt/ledger.rs" '&mut Sealed|&mut self\.entries|-> &mut |fn remove|fn clear\b|into_inner|DerefMut|as_mut|get_mut')
+    if [ -n "$hits" ]; then
+        fail "the ledger grew a mutation path" "$hits" \
+            "I1 is append-only; the only clearing is clear_for_rewrite"
+    fi
+    # The positive form: append takes an unsealed Segment, never a sealed one. If
+    # callers sealed their own entries they could reserve, skip, or reuse positions -
+    # gap-free sequencing is the ledger's act, not the caller's.
+    if ! grep -q 'pub fn append(&mut self, segment: Segment)' "$prompt/ledger.rs"; then
+        fail "ledger append no longer takes an unsealed Segment" \
+            "sealing is the ledger's act; callers must not reserve positions"
+    fi
+
+    # T10-before-prefix: eviction commits to the store first, and only on success
+    # returns the index entry. A probe swapping the order - dropping the turn, then
+    # writing - must fail. Checked as data flow: a store commit must appear in
+    # evict.rs. The call spans two lines (`store` newline `.evict_turn`), so match
+    # the method name rather than the receiver spelling.
+    if ! scan "$prompt/evict.rs" '\.evict_turn\(' | grep -q .; then
+        fail "eviction no longer commits to the store" \
+            "T10 must commit before the prefix drops the turn; no setting makes the other order safe"
+    fi
+
+    # T13.5 disposition: tool turns keep thinking verbatim, prose turns drop it. A
+    # probe deleting either arm must fail - keeping everything wastes context the API
+    # declares omissible; dropping everything earns a 400 on tool turns.
+    body=$(sed -n '/pub fn render_body/,/^}/p' "$prompt/evict.rs")
+    if ! printf '%s' "$body" | grep -q 'ThinkingDisposition::Keep'; then
+        fail "eviction lost its Keep arm" "$body" \
+            "tool turns must keep thinking verbatim (signature included) or the API 400s"
+    fi
+    if ! printf '%s' "$body" | grep -q 'ThinkingDisposition::Drop'; then
+        fail "eviction lost its Drop arm" "$body" \
+            "prose turns may drop thinking; keeping everything wastes context"
+    fi
+    # The decision must key on ToolUse presence across the whole turn, not on role,
+    # position, or a flag. `blocks.first()` matching ToolUse passes a tool turn whose
+    # call sits after prose - and `Segment::new` only forbids prose *between* tool
+    # blocks, so leading prose is legal. Anything narrower than `.any()` lets a
+    # caller smuggle thinking out of a tool turn.
+    if ! scan "$prompt/evict.rs" 'blocks\.iter\(\)\.any' | grep -q .; then
+        fail "the thinking disposition no longer scans the whole turn for ToolUse" \
+            "T13.5 rule 1 is about presence anywhere, not first position"
+    fi
+
+    # Generation rewrite preserves order: verify_rewrite compares segment sequences,
+    # and a rewrite that reorders must fail verification. A probe deleting the
+    # comparison must fail.
+    if ! scan "$prompt/generation.rs" 'before\.segments != after\.segments' | grep -q .; then
+        fail "rewrite verification no longer compares segment sequences" \
+            "a rewrite that reorders would certify as faithful"
+    fi
+    # The 92% threshold is a number in the document, not a mood. A probe lowering it
+    # to 80 must fail.
+    if ! grep -q 'usage_percent >= 92' "$prompt/generation.rs"; then
+        fail "the rewrite threshold is no longer 92%" \
+            "every avoided rewrite is one full 1-hour-TTL write not paid for"
+    fi
+
+    # The prefix hash covers (SeqNo, ContentHash) pairs, not content alone. A
+    # position-blind hash equates two generations with different cache lifetimes -
+    # and a rewrite re-seals every segment at new positions, so that equation would
+    # verify a rewrite against the wrong generation.
+    if ! scan "$prompt/ledger.rs" 'entry\.seq\(\)' | grep -q .; then
+        fail "the prefix hash no longer covers sequence positions" \
+            "content alone cannot tell resealed-same from same-positions"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which
@@ -1025,6 +1109,6 @@ if [ "$status" -eq 0 ]; then
     echo "invariants: prompt ledger, ephemeral state, authority, quorum, unsafe confinement,"
     echo "            the configuration schema, credential resolution, diagnostics, the event bus,"
     echo "            the turn store, hybrid retrieval, the store's connection, anti-self-spawn,"
-    echo "            and internal versions"
+    echo "            the prompt ledger, and internal versions"
 fi
 exit "$status"

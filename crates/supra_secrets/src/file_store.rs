@@ -495,6 +495,15 @@ mod tests {
     /// and `with_key` each declaring their own `GUARD` would guard nothing against each other,
     /// and parallel tests using different helpers would interleave `set_var`/`remove_var` at
     /// will. One module-level lock, shared by every helper below, is what actually serialises.
+    ///
+    /// Unit tests (`src/`, compiled with `cfg(test)`) and integration tests (`tests/`,
+    /// compiled as a separate binary) do **not** share this lock: statics are per-binary,
+    /// and `just ci` runs both binaries' tests in parallel threads of one harness run.
+    /// The two binaries must therefore never touch the same variable concurrently. In
+    /// practice they do not collide - the lib suite finishes in milliseconds while the
+    /// manager suite spends seconds in PBKDF2 - but that is scheduling luck, not a
+    /// guarantee, and a future slowdown could interleave them. Documented here so the
+    /// next intermittent `Crypto` failure points at the cause instead of the symptom.
     static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Set the process environment for the duration of one test body, serialised against every

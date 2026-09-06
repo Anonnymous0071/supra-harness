@@ -9,6 +9,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T14** `crates/supra_prompt`: append-only ledger, four breakpoints, lossless
+  eviction, generation rewrites, hash guard.
+  - **Sealing is the ledger's act.** `append` takes an unsealed `Segment` and returns
+    the assigned `SeqNo`; callers cannot reserve positions. The prefix hash covers
+    `(SeqNo, ContentHash)` pairs - a rewrite re-seals every segment at new positions,
+    so content alone would verify against the wrong generation.
+  - **Eviction commits before the prefix forgets** (T10's rule, honoured here), with
+    T13.5's disposition: tool turns keep thinking verbatim, prose turns drop it,
+    keyed on `ToolUse` presence anywhere (`.any()`, not first position). Recall is
+    byte-identical; missing is not corrupt.
+  - **Rewrite at 92% while idle**, moving content never rewording; both seals kept
+    so a reorder fails verification loudly. Eight mutations, all caught; two
+    survived first (M4: no interleaved-region fixture; M6: order-sensitivity is not
+    position-sensitivity). Seven guard checks, all probed; two were blind before
+    shipping (two-line call spelling, name-vs-meaning narrowing).
 - **T13.5** (research, no new crate): thinking-block preservation rules resolved from
   official Anthropic documentation, unblocking T14's eviction policy.
   - **Required:** within a tool-use turn, thinking blocks pass back complete and

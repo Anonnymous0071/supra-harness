@@ -2123,6 +2123,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_prompt"
+version = "0.1.0"
+dependencies = [
+ "supra_store",
+ "supra_types",
+ "thiserror",
+]
+
+[[package]]
 name = "supra_secrets"
 version = "0.1.0"
 dependencies = [

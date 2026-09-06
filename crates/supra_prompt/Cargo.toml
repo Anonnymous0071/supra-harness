@@ -1,0 +1,17 @@
+[package]
+name = "supra_prompt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Append-only prompt ledger for supra-harness: four breakpoints, lossless eviction, generations, hash guard."
+publish = false
+
+[dependencies]
+supra_types = { workspace = true }
+supra_store = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
