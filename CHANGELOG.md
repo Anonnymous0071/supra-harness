@@ -9,6 +9,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T15.7** `crates/supra_ast`: byte-range splice, reparse gate, outline, query,
+  rename - the call-graph precision T15 promised, syntactic only.
+  - **`replace_node` with three gates**: exact range (no rounding, empty matches
+    nothing), clean result (errors anywhere refuse), same kind (cross-kind is
+    delete plus insert, refused as a splice). Source never mutated in place;
+    formatting preserved by the absence of a formatter.
+  - **Query narrows by reachability, confirms by tree**: import edge first,
+    whole-identifier comparison second (`recall_turntable` never matches).
+    Outlines render T15's harvest with depth; renames splice back to front,
+    refuse shadows, return files without touching the filesystem.
+  - **`semantic: false` is a field**, not a footnote - T24 flips what it
+    computes without reshaping the result.
+  - Twelve mutations: M2/M7/M11 survived first (error gate masked by kind gate;
+    order unobservable at equal length; guard-vs-finder refusal conflated -
+    closed with isolated fixtures and an independent finder unit test), M10
+    survives by design (redundant-today sort, T13 M1 class). Eight guard
+    checks, all probed; four were blind before shipping.
 - **T15.5** `crates/supra_cohort`: deterministic tier estimation, admission,
   escalation - turn step 2 with zero LLM calls.
   - **A ladder, not a weighted sum.** Ordered rules over signal bands, composing

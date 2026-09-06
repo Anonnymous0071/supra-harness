@@ -65,7 +65,6 @@ pub mod graph;
 pub mod index;
 pub mod parse;
 pub mod symbol;
-
 pub use anchors::{
     Anchor, BYTES_PER_TOKEN, MAX_ANCHORS, SUFFIX_TOKENS, check_budget, gist_for_entry, gist_for_symbol,
     render_suffix,
@@ -74,6 +73,7 @@ pub use digest::{DEFAULT_RESCAN_SECS, Digest};
 pub use error::DigestError;
 pub use graph::{DependencyGraph, Edge, churn, import_targets};
 pub use index::{ScanStats, SymbolIndex, scan_tree};
+pub use parse::{ParseOutcome, parse_file};
 pub use symbol::{Fingerprint, Language, Symbol, SymbolKind};
 
 /// The digest is opened once and queried from the turn loop while the watcher

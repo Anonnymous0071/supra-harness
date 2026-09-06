@@ -1145,6 +1145,94 @@ if [ -d "$digest" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T15.7 - structural edits
+#
+# Six properties the compiler cannot see: no duplicate harvest (T15 owns the
+# grammar table), the reparse gate's three checks in order (exact range, clean
+# result, same kind), back-to-front splice order, reachability before text in
+# queries, shadow refusal before any splice in renames, and semantic:false on
+# every syntactic result.
+# ---------------------------------------------------------------------------
+ast=crates/supra_ast/src
+
+if [ -d "$ast" ]; then
+    # One harvest, in T15: a second grammar table here would give two harvests
+    # that can disagree about what a file declares. T15 owns grammars,
+    # Language detection, and Symbol; this crate reuses all three.
+    # One file at a time: `scan` reads a single file, and a directory argument
+    # fails - which `|| true` downstream would mask as a pass (the T15.5
+    # lesson: a guard that cannot see the violation certifies it).
+    hits=$(for file in "$ast"/*.rs; do scan "$file" 'supra_digest::parse_file|supra_digest::ParseOutcome'; done)
+    if [ -z "$hits" ]; then
+        fail "supra_ast no longer reuses T15's harvest" \
+            "a second harvest would disagree about what a file declares"
+    fi
+    # ...but reuse must be load-bearing, not decorative: an import that names
+    # the function without calling it satisfies the check above while a local
+    # copy does the work. The call site below is the load-bearing half - and
+    # `scan` (not grep) so a doc comment naming the call does not satisfy it.
+    if ! scan "$ast/query.rs" 'supra_digest::parse_file' | grep -q .; then
+        fail "supra_ast names T15's harvest without calling it" \
+            "a decorative import beside a local copy disagrees silently"
+    fi
+    dups=$(for file in "$ast"/*.rs; do scan "$file" 'fn declaration_kind|fn node_name|fn impl_target|fn harvest'; done)
+    if [ -n "$dups" ]; then
+        fail "supra_ast duplicates T15's harvest" "$dups" \
+            "one harvest, in T15; this crate calls it"
+    fi
+
+    # The gate's three checks in order: exact range, clean result, same kind.
+    # A probe deleting any one must fail - each refuses a different wrong edit.
+    # Matched with just enough context to be unique, via `scan` (literals
+    # blanked): `find_exact` is called in two places and `has_error` in two,
+    # so the bare names would pass with one deleted. The context names the
+    # decisive use of each, including the `else` that makes the range check a
+    # refusal rather than a fallback.
+    for check in 'find_exact\([^)]*root, start, end. else' 'has_error..after' 'node.kind.. != before_kind'; do
+        if ! scan "$ast/splice.rs" "$check" | grep -q .; then
+            fail "the reparse gate lost its $check check" \
+                "each check refuses a different wrong edit"
+        fi
+    done
+
+    # Back-to-front splice order: earlier offsets stay valid while later bytes
+    # move. A probe deleting the descending sort must fail.
+    if ! scan "$ast/rename.rs" 'sort_unstable_by' | grep -q .; then
+        fail "rename no longer splices back to front" \
+            "forward order shifts later offsets and the gate refuses them"
+    fi
+
+    # Reachability before text: a textual match outside the import graph is
+    # coincidence, and coincidence renamed is corruption.
+    if ! scan "$ast/query.rs" 'if !reachable' | grep -q .; then
+        fail "query no longer gates on reachability" \
+            "text without an import edge is coincidence"
+    fi
+
+    # Shadow refusal before any splice: silently creating a shadow rebinds every
+    # existing reference. A probe deleting the WouldShadow check must fail.
+    # Matched with context (`if let Some...find...*new`), not the bare variant
+    # name: the variant also appears in docs and error definitions, which would
+    # satisfy a name-only check with the enforcement deleted.
+    if ! scan "$ast/rename.rs" 'outline\.iter\(\)\.find.*== \*new' | grep -q .; then
+        fail "rename no longer refuses shadowing" \
+            "a silent shadow rebinds every existing reference"
+    fi
+
+    # semantic:false on every syntactic result. The architecture document states
+    # syntactic rename can be wrong under shadowing or overloading, so the flag
+    # is a field the caller must read, not a footnote to remember.
+    if ! scan "$ast/query.rs" 'semantic: false' | grep -q .; then
+        fail "query results no longer carry semantic:false" \
+            "the limitation must be read, not remembered"
+    fi
+    if ! scan "$ast/rename.rs" 'semantic: false' | grep -q .; then
+        fail "rename results no longer carry semantic:false" \
+            "the limitation must be read, not remembered"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # T15.5 - cohort estimation
 #
 # Five properties the compiler cannot see: zero LLM calls (no provider
