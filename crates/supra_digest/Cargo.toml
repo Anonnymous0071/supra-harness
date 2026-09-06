@@ -1,0 +1,29 @@
+[package]
+name = "supra_digest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Repo digest for supra-harness: symbol index, dependency graph, churn, hybrid retrieval anchors."
+publish = false
+
+[dependencies]
+supra_types = { workspace = true }
+supra_store = { workspace = true }
+supra_vector = { workspace = true }
+supra_prompt = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+notify = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

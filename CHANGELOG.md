@@ -9,6 +9,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T15** `crates/supra_digest`: symbol index, dependency graph, churn, hybrid
+  retrieval anchors - orientation with zero LLM calls.
+  - **A real parser, not line patterns.** Seven compiled-in grammars (Rust,
+    TypeScript, Python, JavaScript, Go, C, C++); anything else is
+    `UnsupportedLanguage` by design. Error nodes yield nothing (guesses indexed
+    as facts misdirect anchors); stale entries die with the breakage.
+  - **Import edges, not call edges** - over-approximation is the safe direction
+    for scrutiny. `crate::` rewritten at record time against the importer's
+    directory; unindexed paths (external targets, deleted files) have empty
+    radii, not singleton ones.
+  - **Gists are deterministic strings** (`name (kind[ of parent], language):
+    first line`), shortened at word boundaries, refused past 80 bytes. Ten
+    pointers, ~300 tokens at 3 bytes/token, rendering in fused-rank order.
+  - **Pool entries die with the retrieval** (explicit drain at every exit,
+    including `?` exits); embedding trouble degrades to lexical, never fails.
+  - Eight mutations, all caught; two survived first (M4: count-not-consequence,
+    closed with sequenced retrievals around a deletion; M6: defence in depth,
+    same class as T13's M1). Six guard checks, all probed; one blind before
+    shipping (constant presence vs comparison).
 - **T14** `crates/supra_prompt`: append-only ledger, four breakpoints, lossless
   eviction, generation rewrites, hash guard.
   - **Sealing is the ledger's act.** `append` takes an unsealed `Segment` and returns

@@ -12,6 +12,7 @@ members = [
     "crates/supra_guard",
     "crates/supra_llm",
     "crates/supra_prompt",
+    "crates/supra_digest",
 ]
 
 # ---------------------------------------------------------------------------
@@ -59,6 +60,8 @@ supra_guard = { path = "crates/supra_guard", version = "0.1.0" }
 supra_ffi = { path = "crates/supra_ffi", version = "0.1.0" }
 supra_llm = { path = "crates/supra_llm", version = "0.1.0" }
 supra_prompt = { path = "crates/supra_prompt", version = "0.1.0" }
+supra_digest = { path = "crates/supra_digest", version = "0.1.0" }
+supra_vector = { path = "crates/supra_vector", version = "0.1.0" }
 
 # async runtime + streams
 tokio = { version = "1.53.1", default-features = false }
@@ -114,6 +117,13 @@ wasmtime = "48.0.1"
 
 # code intelligence (T15, T15.7)
 tree-sitter = "0.27.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
 
 # shell sessions (T16.5)
 portable-pty = "0.9.0"

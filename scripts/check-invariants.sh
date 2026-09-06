@@ -1072,6 +1072,79 @@ if [ -d "$prompt" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T15 - repo digest
+#
+# Five properties the compiler cannot see: zero LLM calls (no provider
+# dependency), lossless error handling (broken files contribute nothing, stale
+# entries die with them), refused budgets (ten pointers, ~300 tokens, never
+# truncated), pool hygiene (scratch entries die with the retrieval), and blast
+# radius that follows internal edges only.
+# ---------------------------------------------------------------------------
+digest=crates/supra_digest/src
+
+if [ -d "$digest" ]; then
+    # Zero LLM calls is structural: the manifest must not name the provider
+    # crate, and no module may import it. A probe adding the dependency must
+    # fail - retrieval stays on the per-turn overhead budget, not the bill.
+    if grep -q 'supra_llm' crates/supra_digest/Cargo.toml; then
+        fail "supra_digest depends on supra_llm" \
+            "orientation is zero LLM calls; gists are deterministic strings"
+    fi
+    hits=$(scan "$digest" 'supra_llm::|use supra_llm|supra_llm::Client|Client::new')
+    if [ -n "$hits" ]; then
+        fail "supra_digest reaches for a provider client" "$hits" \
+            "ranks are integer arithmetic over T11's lanes, not completions"
+    fi
+
+    # Broken files contribute nothing: the error-node gate must precede the
+    # harvest. A probe deleting the gate indexes guesses as facts - ranges
+    # around the error are unknown, and an anchor pointing at them misdirects.
+    body=$(sed -n '/pub fn parse_file/,/^}/p' "$digest/parse.rs")
+    harvest_at=$(printf '%s\n' "$body" | grep -n 'harvest(' | head -1 | cut -d: -f1)
+    gate_at=$(printf '%s\n' "$body" | grep -n 'has_error' | head -1 | cut -d: -f1)
+    if [ -z "$harvest_at" ] || [ -z "$gate_at" ]; then
+        fail "parse_file no longer gates the harvest on error nodes" \
+            "one of the two halves is gone"
+    elif [ "$gate_at" -gt "$harvest_at" ]; then
+        fail "the error-node gate runs after the harvest" \
+            "guesses indexed as facts misdirect anchors"
+    fi
+
+    # Budgets are refused, never truncated. A probe deleting either bound must
+    # fail - an eleven-pointer suffix is a listing, not orientation, and tokens
+    # past 300 silently exceed the window the suffix was sized for. The token
+    # bound is checked as a comparison against SUFFIX_TOKENS (the `tokens >`
+    # spelling), not by the constant's mere presence: the constant also names
+    # the budget in the error, so presence alone proves nothing.
+    body=$(sed -n '/pub fn check_budget/,/^}/p' "$digest/anchors.rs")
+    if ! printf '%s' "$body" | grep -q 'MAX_ANCHORS'; then
+        fail "the anchor-count bound is gone from check_budget" "$body" \
+            "ten is a readability bound as well as a token bound"
+    fi
+    if ! printf '%s' "$body" | grep -q 'tokens > SUFFIX_TOKENS'; then
+        fail "the suffix-token comparison is gone from check_budget" "$body" \
+            "the constant naming the budget in the error does not enforce it"
+    fi
+
+    # Pool hygiene: every retrieve exit drains the scratch namespace. A pool
+    # entry that survives its retrieval ranks deleted symbols in the next one.
+    # A probe deleting a drain_pool call must fail.
+    drains=$(scan "$digest/digest.rs" 'drain_pool' | wc -l | tr -d ' ')
+    if [ "$drains" -lt "3" ]; then
+        fail "expected drain_pool at 3 sites (def + 2 exits), found $drains" \
+            "$(scan "$digest/digest.rs" 'drain_pool')" \
+            "a leaked pool entry ranks deleted symbols"
+    fi
+
+    # Blast radius follows internal edges only. External targets resolve to no
+    # file; walking them would join every importer of std into one radius.
+    if ! scan "$digest/graph.rs" 'if !edge\.internal' | grep -q .; then
+        fail "the blast-radius walk no longer skips external edges" \
+            "every importer of std would join one radius"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which
@@ -1109,6 +1182,6 @@ if [ "$status" -eq 0 ]; then
     echo "invariants: prompt ledger, ephemeral state, authority, quorum, unsafe confinement,"
     echo "            the configuration schema, credential resolution, diagnostics, the event bus,"
     echo "            the turn store, hybrid retrieval, the store's connection, anti-self-spawn,"
-    echo "            the prompt ledger, and internal versions"
+    echo "            the prompt ledger, the repo digest, and internal versions"
 fi
 exit "$status"
