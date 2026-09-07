@@ -1,0 +1,32 @@
+[package]
+name = "supra_sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Process-isolation policy layer for supra-harness: the host-side choreography of the C++ sandbox, descriptor hygiene, and process-tree accounting."
+publish = false
+
+[dependencies]
+# supra_ffi owns the only unsafe in the workspace and exposes both the
+# libsupra_sandbox C ABI and the FD_CLOEXEC primitive the host-side audit needs.
+# A crate above the FFI must not reach for unsafe on its own; confinement is
+# what keeps the soundness story in one place.
+supra_ffi = { workspace = true }
+# supra_types carries the permission model (T6/T6.7): the two axes - tool
+# authority and consent mode - and the reversibility classification. The
+# spawn ticket composes them in the same order `decide` does, so the rule
+# precedence and "deny always wins" semantics are read from one place.
+supra_types = { workspace = true }
+# The seven-layer guard (T12.5) refuses self-spawn before the sandbox runs.
+# T16 owns the host-side enforcement, not the layer definitions.
+supra_guard = { workspace = true }
+# ulid is a per-process ticket id; process-tree entries need a stable
+# identifier that survives across reloads.
+ulid = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

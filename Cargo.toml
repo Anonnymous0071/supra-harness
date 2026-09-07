@@ -15,6 +15,7 @@ members = [
     "crates/supra_digest",
     "crates/supra_cohort",
     "crates/supra_ast",
+    "crates/supra_sandbox",
 ]
 
 # ---------------------------------------------------------------------------
@@ -65,6 +66,7 @@ supra_prompt = { path = "crates/supra_prompt", version = "0.1.0" }
 supra_cohort = { path = "crates/supra_cohort", version = "0.1.0" }
 supra_ast = { path = "crates/supra_ast", version = "0.1.0" }
 supra_digest = { path = "crates/supra_digest", version = "0.1.0" }
+supra_sandbox = { path = "crates/supra_sandbox", version = "0.1.0" }
 supra_vector = { path = "crates/supra_vector", version = "0.1.0" }
 
 # async runtime + streams

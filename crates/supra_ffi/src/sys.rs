@@ -255,6 +255,19 @@ unsafe extern "C" {
 }
 
 // ---------------------------------------------------------------------------
+// descriptor hygiene (fcntl)
+//
+// POSIX-fixed commands and flags for the T16 fd primitive, declared by hand
+// like every other foreign call in this crate. These are not part of the
+// libsupra_* ABI; they are the one libc call with no C++ source beneath it,
+// and fd.rs records why. Values are stable across POSIX platforms.
+// ---------------------------------------------------------------------------
+
+pub(crate) const F_GETFD: c_int = 1;
+pub(crate) const F_SETFD: c_int = 2;
+pub(crate) const FD_CLOEXEC: c_int = 1;
+
+// ---------------------------------------------------------------------------
 // libsupra_sandbox
 // ---------------------------------------------------------------------------
 
@@ -367,6 +380,15 @@ unsafe extern "C" {
 // unit; its static_asserts are the C++ half of the layout ratchet.
 unsafe extern "C" {
     pub(crate) fn supra_ffi_abi_check() -> c_int;
+}
+
+// `fcntl` is variadic in C; a single variadic declaration covers both the
+// `F_GETFD` (two arguments) and `F_SETFD` (three) shapes, and Rust still
+// checks the fixed argument types at every call site. glibc and musl both
+// export the plain `fcntl` symbol.
+#[cfg(unix)]
+unsafe extern "C" {
+    pub(crate) fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 }
 
 /// Keep `supra_ffi_abi_check` reachable.

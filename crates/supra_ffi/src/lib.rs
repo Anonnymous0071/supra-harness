@@ -81,6 +81,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::print_stderr))]
 
 pub mod ansi;
+pub mod fd;
 pub mod sandbox;
 pub mod width;
 

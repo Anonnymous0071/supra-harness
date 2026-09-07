@@ -9,6 +9,37 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T16** `crates/supra_sandbox`: host-side choreography of the C++ sandbox -
+  fd audit, process-tree budget, and the three-step spawn (audit → guard → FFI).
+  - **Pre-spawn fd audit** walks `/proc/self/fd`, reads each `FD_CLOEXEC` flag
+    through `supra_ffi::fd`, and refuses on the first descriptor that is
+    without the flag and not on the policy's allow list. The T4 note is the
+    binding: "descriptors inherited across `exec` remain usable. T16 and T16.5
+    must close descriptors they do not intend to pass." Standard streams
+    (fd 0/1/2) are excluded because a TTY-attached child must talk to the
+    user; the boundary is the descriptors *above* stdio, and that is the only
+    shape the audit recognises.
+  - **Three-step spawn**: audit first, then the seven-layer guard, then the
+    FFI. A refusal at any step returns without touching the next. The order
+    is the product, and `scripts/mutate.sh` proved each step is test-enforced
+    rather than convention-enforced.
+  - **`TreeBudget`** is the host-side catch for what the guard cannot see:
+    when an env-marker layer is stripped, the counter still counts the
+    consequence. Cumulative and burst counters; the TUI reads the burst.
+  - **`supra_ffi::fd`** gained the primitive the audit calls: a hand-rolled
+    `fcntl` for `F_GETFD`/`F_SETFD`/`FD_CLOEXEC`. Confined to the only `unsafe`
+    crate in the workspace; no other crate holds `unsafe`.
+  - **Five refusal shapes** with the operator in mind: `Authority` (guard
+    said no, here is the layer list), `Consent` (gate said no, here is the
+    mode/reversibility), `LeakyDescriptor` (audit said no, here is the fd),
+    `Unsupported` (the platform cannot enforce), `Ffi` (C side refused,
+    message verbatim). Deny-wins is preserved: `yolo` skips consent; nothing
+    here skips authority.
+  - Seven mutations: M1/M2/M3/M4/M5/M6/M7 CAUGHT. The two that survived
+    first (M1: a unit test for `record_child` could not be a passing suite
+    without an end-to-end spawn; M2: the audit's *helper* was tested but
+    not the call site) closed with end-to-end fixtures that exercise the
+    full `spawn` path. Eight guard checks, all probed.
 - **T15.7** `crates/supra_ast`: byte-range splice, reparse gate, outline, query,
   rename - the call-graph precision T15 promised, syntactic only.
   - **`replace_node` with three gates**: exact range (no rounding, empty matches

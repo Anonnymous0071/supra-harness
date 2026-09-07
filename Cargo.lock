@@ -2262,6 +2262,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_sandbox"
+version = "0.1.0"
+dependencies = [
+ "supra_ffi",
+ "supra_guard",
+ "supra_types",
+ "thiserror",
+ "ulid",
+]
+
+[[package]]
 name = "supra_secrets"
 version = "0.1.0"
 dependencies = [

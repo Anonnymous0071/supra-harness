@@ -356,6 +356,17 @@ impl Policy {
         self
     }
 
+    /// Number of filesystem rules currently in the policy.
+    ///
+    /// Exposed for callers - the T16 policy layer asserts on the *count*
+    /// before sending the policy to the C side, and counting the raw
+    /// `paths` slice would force the field public. The method is the
+    /// shape the FFI already had to manage.
+    #[must_use]
+    pub fn path_count(&self) -> usize {
+        self.paths.len()
+    }
+
     /// Build the raw structure.
     ///
     /// The pointers it holds borrow from `self`, so the result must not outlive
