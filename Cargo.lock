@@ -2327,6 +2327,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_tool"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "supra_llm",
+ "supra_permission",
+ "supra_types",
+ "thiserror",
+]
+
+[[package]]
 name = "supra_types"
 version = "0.1.0"
 dependencies = [

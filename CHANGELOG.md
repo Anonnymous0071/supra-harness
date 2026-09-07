@@ -9,6 +9,45 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T17** `crates/supra_tool`: the tool registry - frozen manifests, robust
+  invocation for weak tool-callers, and instruction-carrying preconditions.
+  - **The registry is frozen structurally** (I3): no `remove` exists, and
+    `disable` is a session set the dispatcher consults, not a mutation - the
+    manifest stays byte-stable, so the BP1 prefix never breaks. Dynamic
+    discovery (T18/T19) appends, which the freeze permits by design.
+  - **Robust invocation for weak tool-callers**: every refusal in `ToolError`
+    is structured and field-naming - the unknown tool lists the registered
+    names, the bad argument names the shape that arrived, the schema refusal
+    names the field and both types, the unknown field is refused (a `pathh`
+    beside a valid `path` would run against the default - silent corruption
+    wearing a success). The message is the model's only channel; the retry
+    has to be able to be correct.
+  - **Instruction-carrying preconditions** (§5): `edit_file` fails with a
+    structured instruction ("read_file {path} before editing it") when the
+    file was not read this session - the architecture's own table row,
+    ~10 unreliable prompt tokens replaced with zero prompt tokens and a
+    reliable refusal. The workflow is not described; it is the only path
+    the tool surface permits.
+  - **One serialiser, no second parse**: arguments go through T13's
+    `canonicalize` exactly once - the only sanctioned producer of
+    `CanonicalJson` - and the invocation carries the canonical bytes to the
+    ledger unchanged. This crate never re-serialises a parsed value.
+  - **A closed schema language, not JSON Schema**: typed, required-or-
+    optional fields, strict about unknowns. The provider-facing manifest
+    renders from the same `Field` list that validates, so the two cannot
+    disagree (pinned by test). JSON Schema would be a second grammar
+    disagreeing on exactly the weak-model inputs.
+  - **The effect resolver rides the manifest** (T16.7's rule): the registry
+    resolves an invocation's arguments into the permission catalogue's
+    `Effect`, because it is the layer that knows the arguments. The
+    architecture's own pair - `shell_run("cargo test")` R0 vs
+    `shell_run("rm -rf node_modules")` R3, same tool - is pinned by test.
+  - Ten mutations: nine CAUGHT, control survived by design. Four guards in
+    `check-invariants.sh`; the manifest guard is the first *inverted* one
+    (asserts the absence of a filter, because a positive anchor cannot see
+    one), and the instruction guard is the first `scan_sql` subject outside
+    SQL - the instruction lives inside a format-string literal, which
+    `scan` blanks by design. All probed 4/4 caught on mutated code.
 - **T16.7** `crates/supra_permission`: the host-side permission gate -
   reversibility classification of resolved effects, the four-mode consent
   matrix composed through rules and authority, and batched prompts.

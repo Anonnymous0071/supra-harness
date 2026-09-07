@@ -1569,6 +1569,67 @@ if [ -d "$permission" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T17 - tool registry guards
+#
+# The registry's load-bearing properties are structural: I3's frozen
+# manifest, the single-serialiser rule for arguments, and the
+# precondition's instruction-carrying refusal. All through `scan`, so a
+# comment cannot stand in for code. Probed against the same M1-M9 the
+# suite catches.
+# ---------------------------------------------------------------------------
+toolsrc="crates/supra_tool/src"
+
+if [ -d "$toolsrc" ]; then
+    # Arguments canonicalise through T13's serialiser - the only sanctioned
+    # producer of CanonicalJson. A registry that parsed and re-serialised
+    # would give I7 two implementations that can disagree.
+    canonical=$(scan "$toolsrc/registry.rs" 'canonicalize\(arguments\)\?')
+    if [ -z "$canonical" ]; then
+        fail "invocations no longer canonicalise through T13's serialiser" \
+            "crates/supra_tool/src/registry.rs" \
+            "the bytes that were hashed must be the bytes that reach the wire"
+    fi
+
+    # The precondition check runs on every invocation: the §5 property.
+    # Anchored on the call inside invoke's sequence, after validation.
+    preconditions=$(scan "$toolsrc/registry.rs" 'tool\.check_precondition\(map, facts\)\?;')
+    if [ -z "$preconditions" ]; then
+        fail "invocations no longer check the precondition" \
+            "crates/supra_tool/src/registry.rs" \
+            "the workflow is the only path the tool surface permits; a skipped precondition is a prose instruction waiting to happen"
+    fi
+
+    # The manifest lists every registered tool, disabled or not: I3's
+    # byte-stability. The guard anchors on the manifest() body's iterator
+    # over all tools - a filter on disabled would be the mutation.
+    # Inverted anchor: the manifest's iterator must not filter on the
+    # disabled set. M9 added `.filter(|tool| !self.disabled...)` before the
+    # map; a positive anchor on values() cannot see a filter, so the guard
+    # asserts its absence inside the manifest function's own body.
+    manifest_body=$(sed -n '/pub fn manifest(/,/^    }/p' "$toolsrc/registry.rs")
+    if printf '%s' "$manifest_body" | grep -q 'filter'; then
+        fail "the manifest filters tools out instead of listing them all" \
+            "crates/supra_tool/src/registry.rs" \
+            "disabling is a session set, not a manifest mutation; a manifest that changed would break the BP1 prefix"
+    fi
+
+    # The read-before-edit precondition names the tool and the file in its
+    # instruction: the refusal the model can follow. A bare Ok(()) rule
+    # would be a barrier, not an instruction.
+    # `scan_sql`, not `scan`: the instruction lives inside a format-string
+    # literal, and `scan` blanks string contents by design - the subject
+    # here IS the literal, exactly the SQL case the second helper exists
+    # for. The pattern avoids brace characters because ERE reads them as
+    # interval openers; the instruction's own words carry the anchor.
+    instruction=$(scan_sql "$toolsrc/registry.rs" 'read_file .* before editing it')
+    if [ -z "$instruction" ]; then
+        fail "the read-before-edit refusal no longer carries an instruction" \
+            "crates/supra_tool/src/registry.rs" \
+            "the message is the model's only channel; the retry has to be able to be correct"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

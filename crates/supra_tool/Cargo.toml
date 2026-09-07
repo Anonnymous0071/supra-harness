@@ -1,0 +1,33 @@
+[package]
+name = "supra_tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The tool registry: frozen manifests, robust invocation for weak tool-callers, and instruction-carrying preconditions."
+publish = false
+
+[dependencies]
+# Tool input is CanonicalJson (T6), whose only sanctioned producer is T13's
+# canonicaliser. Parsing model-produced argument text here would be a second
+# implementation of the serialiser whose output CanonicalJson represents -
+# the mistake I7 exists to prevent - so this crate routes every argument
+# through supra_llm::canonicalize and never parses JSON itself.
+supra_llm = { workspace = true }
+# ToolClass rides on every manifest (the authority axis, T12.5/T20), and
+# CanonicalJson is the argument type. supra_types is where both live.
+supra_types = { workspace = true }
+# The permission catalogue (T16.7): the registry resolves an invocation into
+# an Effect shape so the gate classifies a resolved effect, never a tool
+# name. The registry does not evaluate the gate - T23 does - it only names
+# the effect.
+supra_permission = { workspace = true }
+# Argument schemas are described as JSON values (the provider-facing manifest
+# shape); serde_json is the substrate, as it is for T13.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
