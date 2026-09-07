@@ -76,7 +76,7 @@ pub use cohort::{
 pub use ephemeral::{EphemeralBlock, EphemeralKey};
 pub use event::{CacheBreakCause, Event, Topic};
 pub use hash::{CanonicalWriter, ContentHash, ParseHashError};
-pub use id::{AgentId, ClaimId, FindingId, ParseIdError, SegmentId, SessionId, TurnId};
+pub use id::{AgentId, ClaimId, FindingId, ParseIdError, SegmentId, SessionId, SnapshotId, TurnId};
 pub use lineage::{Lineage, LineageError};
 pub use money::MicroUsd;
 pub use permission::{

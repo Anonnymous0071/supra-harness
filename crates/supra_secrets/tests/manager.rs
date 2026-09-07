@@ -137,20 +137,26 @@ fn a_provider_supplies_the_passphrase_when_nothing_else_does() {
 
     let path = scratch_path();
     let _ = std::fs::remove_file(&path);
+    // The whole body runs under the module's environment lock, not just the
+    // seed: this test's `get` reads a file unlocked by a *provider*, so it
+    // must not race another test's `remove_var` between the seeding and the
+    // read - the in-binary flake this closes. (The cross-binary window is
+    // documented in the module docs above and stays open by nature.)
     with_key("seed-key", || {
         let seeder = SecretManager::open_with_file_store(path.clone());
         if seeder.primary_backend() != Backend::EncryptedFile {
             return;
         }
         seeder.set("svc", "acct", "value").expect("seed");
+
+        let manager = SecretManager::open_with_file_store(path.clone());
+        if manager.primary_backend() != Backend::EncryptedFile {
+            return;
+        }
+        let provider: PassphraseProvider = Arc::new(|| Ok(Zeroizing::new("seed-key".to_owned())));
+        manager.set_passphrase_provider(provider);
+        assert_eq!(manager.get("svc", "acct").expect("get"), "value");
     });
-    let manager = SecretManager::open_with_file_store(path.clone());
-    if manager.primary_backend() != Backend::EncryptedFile {
-        return;
-    }
-    let provider: PassphraseProvider = Arc::new(|| Ok(Zeroizing::new("seed-key".to_owned())));
-    manager.set_passphrase_provider(provider);
-    assert_eq!(manager.get("svc", "acct").expect("get"), "value");
     let _ = std::fs::remove_file(&path);
 }
 

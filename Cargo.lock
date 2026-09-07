@@ -2227,6 +2227,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_journal"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "supra_store",
+ "supra_types",
+ "thiserror",
+]
+
+[[package]]
 name = "supra_llm"
 version = "0.1.0"
 dependencies = [
@@ -2269,7 +2279,6 @@ dependencies = [
  "supra_guard",
  "supra_types",
  "thiserror",
- "ulid",
 ]
 
 [[package]]

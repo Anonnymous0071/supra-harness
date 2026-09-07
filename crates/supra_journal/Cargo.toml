@@ -1,0 +1,28 @@
+[package]
+name = "supra_journal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Write-ahead file snapshots and atomic undo: the R1 reversibility class that makes `auto` the default mode."
+publish = false
+
+[dependencies]
+# The journal owns tables in the shared store file; `user_version` is one slot
+# per file and already belongs to T10, so the component ledger is the only
+# forward-only home for this crate's schema history.
+supra_store = { workspace = true }
+# SnapshotId is a ULID-backed distinct type (id.rs); ContentHash/Sealable give
+# the domain-separated digest a snapshot's bytes carry, the same way T10's
+# evicted turns carry theirs.
+supra_types = { workspace = true }
+# The journal's queries speak SQL against the shared file, as T11's index
+# does; `with_transaction` hands this type over, so it is a direct
+# dependency of every second owner of tables in the store.
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

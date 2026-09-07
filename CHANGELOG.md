@@ -9,6 +9,41 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T16.6** `crates/supra_journal`: write-ahead file snapshots and atomic
+  undo - the R1 reversibility class that makes `auto` the default mode.
+  - **`snapshot`** reads a file, digests it, and commits the row in one
+    `Immediate` transaction, before the caller's edit may touch the file:
+    T14's "store before drop", restated for files. A missing file is an
+    error, not an empty snapshot - an undo that "restores" nothing would
+    report success while reverting nothing.
+  - **`undo`** spans one `Immediate` transaction across read, verify,
+    write, fsync, and mark. The store's lock is the only arbiter two
+    concurrent undoes must both pass, so the file write happens inside it -
+    a dedicated two-thread test pins that exactly one undo wins. A damaged
+    row restores nothing (`Corrupt`, no bytes offered - I4's reasoning
+    verbatim); the corruption probe had to be a same-length mutation
+    because the schema's own CHECKs refuse the lazier corruptions first.
+    A crash between write and mark is idempotent: undoing again rewrites
+    the same bytes.
+  - **`SnapshotId`** joins `supra_types` as the sixth ULID-backed distinct
+    id; `snapshot_digest` is domain-separated at canonical kind `0x11`
+    (T10's turn body holds `0x10`), pinned by a domain-separation test.
+  - **`created_at` comes from the id, not a second clock read.** Two clock
+    reads disagree whenever the millisecond turns between them, and
+    `ORDER BY created_at DESC` could then name the *older* snapshot as
+    newest - a real flake, caught once in ~15 runs and closed structurally;
+    a test and a guard both pin the derivation.
+  - Schema as the second `schema_component` owner (`"journal"`, forward
+    only, dense from 1), with T10's CHECK discipline: 26-char id, 32-byte
+    digest, `byte_len = length(before)`, `undone IN (0, 1)`.
+  - Nine mutations: seven CAUGHT; M3 (fsync dropped) survived the suite
+    because no userspace test can observe a power loss, and is caught by a
+    structural guard instead; M8 control survived by design. Six guards in
+    `check-invariants.sh`, all written through `scan()` from birth (the
+    T15.7 lesson) and probed 6/6 caught on mutated code.
+  - Cleanup: `ulid` removed from `supra_sandbox`'s dependencies - a dead
+    dependency whose comment promised a "per-process ticket id" that the
+    distinct-id types in `supra_types` already own.
 - **T16.5** `crates/supra_shell`: persistent pty shell sessions with
   deterministic output shaping, spawned through the T16 sandbox.
   - **`supra_ffi::pty`**: pty primitives behind the confined `unsafe` -

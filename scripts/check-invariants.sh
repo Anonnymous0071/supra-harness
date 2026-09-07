@@ -1429,6 +1429,85 @@ if [ -d "$shell" ] && [ -d "$ffi" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T16.6 - journal guards
+#
+# The journal is the R1 class the permission engine prices edits against:
+# "auto is the default only because T16.6 exists." Two of its promises are
+# structural and unprobeable from a userspace test (fsync durability, the
+# single-transaction undo), so they live here as pinned lines rather than
+# as test assertions. All guards run through `scan`, so a commented-out
+# line cannot satisfy them - the T15.7 lesson, applied from birth this
+# time.
+# ---------------------------------------------------------------------------
+journal="crates/supra_journal/src"
+
+if [ -d "$journal" ]; then
+    # Fsync is the undo's durability: without it, a restore is a cache entry
+    # the kernel may drop. No userspace test can observe a power loss, so
+    # the call is pinned structurally - mutation M3 survived the suite and
+    # is caught here instead.
+    flushed=$(scan "$journal/journal.rs" 'file\.sync_all\(\)\?;')
+    if [ -z "$flushed" ]; then
+        fail "undo no longer flushes the restored bytes" \
+            "crates/supra_journal/src/journal.rs" \
+            "an unflushed restore is a cache entry the kernel may drop; M3 survived the suite and is caught here"
+    fi
+
+    # The write-ahead order: snapshot must commit the row before the caller
+    # edits. The insert call sits inside snapshot()'s transaction; a guard
+    # matching only the function name would pass a snapshot that reads but
+    # never stores.
+    stored=$(scan "$journal/journal.rs" 'schema::insert\(transaction, id, &path_text, &bytes, &digest\)\?;')
+    if [ -z "$stored" ]; then
+        fail "snapshot no longer commits the row before the edit" \
+            "crates/supra_journal/src/journal.rs" \
+            "T14's store-before-drop, restated for files: an edit without a committed snapshot is not R1"
+    fi
+
+    # Undo verifies the digest before writing: a damaged row must restore
+    # nothing. The comparison (not the digest call alone) is the guard's
+    # subject, because the digest is also computed in snapshot().
+    verified=$(scan "$journal/journal.rs" 'if computed != stored_digest')
+    if [ -z "$verified" ]; then
+        fail "undo no longer verifies the stored digest before writing" \
+            "crates/supra_journal/src/journal.rs" \
+            "an undo that restores approximately the original is worse than no undo"
+    fi
+
+    # created_at is the id's own timestamp, not a second clock read: two
+    # reads disagree when the millisecond turns, and ORDER BY created_at
+    # could then name the older snapshot as newest. The flake that proved
+    # it produced exactly that once in ~15 runs; M9 closed it and this
+    # guard keeps it closed.
+    stamped=$(scan "$journal/schema.rs" 'snapshot\.timestamp_ms\(\)')
+    if [ -z "$stamped" ]; then
+        fail "created_at no longer comes from the snapshot id" \
+            "crates/supra_journal/src/schema.rs" \
+            "two clock reads disagree on the millisecond boundary; the newest report would name the older snapshot"
+    fi
+
+    # The mark and the write share one transaction: mark_undone inside
+    # undo's with_transaction. A mark that ran outside it would let two
+    # concurrent undoes both pass the read.
+    marked=$(scan "$journal/journal.rs" 'schema::mark_undone\(transaction, snapshot\)\?;')
+    if [ -z "$marked" ]; then
+        fail "the undo mark no longer shares the undo's transaction" \
+            "crates/supra_journal/src/journal.rs" \
+            "outside the transaction, two concurrent undoes both pass the read and both write"
+    fi
+
+    # The snapshot digest is domain-separated from T10's turn body: kind
+    # 0x11, not 0x10. A collision between a turn body and a file snapshot
+    # hashing the same bytes would look like verification.
+    kinds=$(scan "$journal/journal.rs" 'CANONICAL_KIND: u8 = 0x11;')
+    if [ -z "$kinds" ]; then
+        fail "the snapshot digest no longer uses its own canonical kind" \
+            "crates/supra_journal/src/journal.rs" \
+            "0x10 is the turn body's kind; a shared kind makes a cross-type collision look like verification"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

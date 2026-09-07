@@ -162,6 +162,17 @@ declare_id! {
 }
 
 declare_id! {
+    /// One write-ahead file snapshot, the unit T16.6's journal undoes.
+    ///
+    /// Distinct from [`TurnId`] and [`ClaimId`] on purpose: a snapshot is
+    /// neither a conversation position nor a thing a cohort votes on, and a
+    /// caller that passed one where another belongs would be pointing the
+    /// undo at the wrong row - the kind of bug the distinct-type rule
+    /// exists to make a compile error.
+    SnapshotId
+}
+
+declare_id! {
     /// One finding raised by a deterministic gate or by a peer review.
     ///
     /// Distinct from [`ClaimId`] on purpose: a claim is something a peer proposes

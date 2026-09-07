@@ -23,9 +23,6 @@ supra_types = { workspace = true }
 # The seven-layer guard (T12.5) refuses self-spawn before the sandbox runs.
 # T16 owns the host-side enforcement, not the layer definitions.
 supra_guard = { workspace = true }
-# ulid is a per-process ticket id; process-tree entries need a stable
-# identifier that survives across reloads.
-ulid = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]
