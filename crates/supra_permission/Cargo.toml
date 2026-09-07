@@ -1,0 +1,23 @@
+[package]
+name = "supra_permission"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The host-side permission gate: reversibility classification of resolved effects, the four-mode consent matrix, and batched prompts."
+publish = false
+
+[dependencies]
+# The classes, the mode matrix, the authority ladder, and deny-wins resolution
+# already live in supra_types (T6). This crate owns what the architecture
+# assigns T16.7: the catalogue that turns a resolved effect into a class, the
+# gate that composes catalogue + rules + matrix, and the batching that makes
+# many questions one prompt. Re-deriving any of T6's shapes here would give
+# two implementations of one matrix - the mistake this project keeps refusing.
+supra_types = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1508,6 +1508,67 @@ if [ -d "$journal" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T16.7 - permission gate guards
+#
+# The gate is a composition point: catalogue -> rules -> authority ->
+# matrix, plus the escape-hatch exception and the batch's unanswered-is-no.
+# Each guard pins a load-bearing line through `scan`, so a comment cannot
+# stand in for code. Probed against the same M1-M9 the suite catches.
+# ---------------------------------------------------------------------------
+permission="crates/supra_permission/src"
+
+if [ -d "$permission" ]; then
+    # Authority is consulted before the mode: the two-axis property. The
+    # guard anchors on the check itself, inside the gate function's order -
+    # a decorative `permits` elsewhere must not satisfy it.
+    authority=$(scan "$permission/gate.rs" 'if !request\.class\.permits\(request\.invoker\) \{')
+    if [ -z "$authority" ]; then
+        fail "the gate no longer consults authority before consent" \
+            "crates/supra_permission/src/gate.rs" \
+            "no mode - yolo included - can widen the authority axis"
+    fi
+
+    # Damping routes through the structural shape only: the is_structural
+    # condition guarding damped() is the measurable version of
+    # verifiability-damps-risk.
+    damped=$(scan "$permission/gate.rs" 'if request\.effect\.is_structural\(\) \{')
+    if [ -z "$damped" ]; then
+        fail "damping no longer routes through the structural shape" \
+            "crates/supra_permission/src/gate.rs" \
+            "verified structure earns one class lower; damping everything would soften the catalogue's R3s"
+    fi
+
+    # The escape hatch asks in every mode. Anchored on the match plus the
+    # EscapeHatch arm, so the shape's name alone (present in docs and the
+    # catalogue) cannot satisfy the guard.
+    hatch=$(scan "$permission/gate.rs" 'matches!\(request\.effect, Effect::EscapeHatch \{ \.\. \}\)')
+    if [ -z "$hatch" ]; then
+        fail "an escape hatch no longer asks in every mode" \
+            "crates/supra_permission/src/gate.rs" \
+            "consent is what yolo pre-grants; stepping aside from a guard is not consent's to grant"
+    fi
+
+    # Unanswered is not consent: the batch's missing-answer default is
+    # false. The repeat(&false) expression is the one-sentence contract.
+    unanswered=$(scan "$permission/gate.rs" 'repeat\(&false\)')
+    if [ -z "$unanswered" ]; then
+        fail "unanswered batch items no longer refuse" \
+            "crates/supra_permission/src/gate.rs" \
+            "a question the user did not answer is not consent"
+    fi
+
+    # Rules are consulted before everything: resolve(rules) is the gate's
+    # first move. A gate that evaluated the matrix first would let a deny
+    # be outrun by an ask.
+    rules_first=$(scan "$permission/gate.rs" 'if let Some\(effect\) = resolve\(rules\) \{')
+    if [ -z "$rules_first" ]; then
+        fail "the gate no longer consults rules first" \
+            "crates/supra_permission/src/gate.rs" \
+            "deny wins literally; the rule set outranks the mode matrix"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

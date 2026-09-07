@@ -242,6 +242,21 @@ pub enum RuleSource {
     Session,
 }
 
+impl core::fmt::Display for RuleSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Lowercase words, the shape a refusal message or a status line
+        // shows: "a rule from builtin denies this request" reads as English
+        // without a lookup table in every renderer.
+        f.write_str(match self {
+            Self::Builtin => "builtin",
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Cli => "cli",
+            Self::Session => "session",
+        })
+    }
+}
+
 /// What a rule says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuleEffect {

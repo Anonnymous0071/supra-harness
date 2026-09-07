@@ -2263,6 +2263,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_permission"
+version = "0.1.0"
+dependencies = [
+ "supra_types",
+ "thiserror",
+]
+
+[[package]]
 name = "supra_prompt"
 version = "0.1.0"
 dependencies = [

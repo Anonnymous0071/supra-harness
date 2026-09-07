@@ -9,6 +9,35 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T16.7** `crates/supra_permission`: the host-side permission gate -
+  reversibility classification of resolved effects, the four-mode consent
+  matrix composed through rules and authority, and batched prompts.
+  - **The catalogue**: `Effect`, a closed enumeration of effect shapes,
+    classified exhaustively. Classification runs on the resolved effect,
+    never the tool name - `shell_run("cargo test")` is R0 and
+    `shell_run("rm -rf node_modules")` is R3, and the difference is data
+    the caller supplies (`Remove { target }`, `RecoverableEdit { basis }`),
+    not a substring this crate guesses at. A string classifier would be a
+    second grammar that disagrees with the shell about `env rm` and `\rm` -
+    the T15.7 two-parsers lesson, restated for classification.
+  - **The gate**: rules first (deny wins literally; an allow
+    short-circuits; no rule falls through to the matrix), authority second
+    (before the mode is examined, so no mode can widen it), the matrix
+    third - with the escape-hatch exception: a guard-stepping-aside effect
+    asks in every mode, `yolo` included, because consent is not the axis a
+    sandbox rides on. Damping routes through the structural shape only:
+    under `ask`, a blind edit prompts and a verified splice runs, which is
+    verifiability-damps-risk made measurable.
+  - **Batched prompts**: many questions become one prompt, answers come
+    back per item, and an unanswered item refuses - a question the user
+    did not answer is not consent. An empty batch is `EmptyBatch`, not an
+    empty approval.
+  - `RuleSource` gained `Display` in `supra_types` (the lowercase word a
+    refusal message shows), the only T6 surface this stage needed.
+  - Ten mutations: nine CAUGHT, control survived by design. Five guards in
+    `check-invariants.sh`, all through `scan()`, probed 5/5 caught. A
+    sixteen-cell walk pins the gate's composition against T6's matrix so
+    the two cannot drift.
 - **T16.6** `crates/supra_journal`: write-ahead file snapshots and atomic
   undo - the R1 reversibility class that makes `auto` the default mode.
   - **`snapshot`** reads a file, digests it, and commits the row in one

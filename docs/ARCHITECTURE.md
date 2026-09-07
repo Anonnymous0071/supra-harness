@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T16.6 complete. Stages T16.7 onward are unimplemented.
+Status: T1-T16.7 complete. Stages T17 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -423,7 +423,7 @@ backtracking.
 | T16 | `supra_sandbox` | host-side policy layer over the C++ sandbox: fd audit, three-step spawn, process-tree budget |
 | T16.5 | `supra_shell` | persistent PTY sessions, deterministic output shaping; pty CLOEXEC-from-birth, session composes T16 sandbox, shaper routes through libsupra_ansi |
 | T16.6 | `supra_journal` | write-ahead snapshots, atomic undo; component schema in `schema_component`, `SnapshotId`/kind 0x11, created_at from the id |
-| T16.7 | `supra_permission` | reversibility classification, four modes, batched prompts |
+| T16.7 | `supra_permission` | reversibility classification, four modes, batched prompts; closed `Effect` catalogue, gate composes rules->authority->matrix, escape-hatch asks in every mode |
 | T17 | `supra_tool` | registry, robust invocation, instruction-carrying preconditions |
 | T18 | `supra_mcp` | stdio + HTTP clients behind a static gateway |
 | T19 | `supra_skill` | skill loading, dependency resolution, hot reload |
