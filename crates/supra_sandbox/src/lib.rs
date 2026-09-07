@@ -43,7 +43,7 @@
 //! # Usage
 //!
 //! ```no_run
-//! use supra_sandbox::{default_policy, spawn, SpawnRequest, TreeBudget};
+//! use supra_sandbox::{default_policy, spawn, SpawnRequest, Stdio, TreeBudget};
 //! use supra_types::{Mode, Reversibility};
 //!
 //! let workspace = std::env::temp_dir();
@@ -62,6 +62,7 @@
 //!     lineage: None,
 //!     child: None,
 //!     claim_vote: None,
+//!     stdio: Stdio::null(),
 //! };
 //! let _process = spawn(&policy, &request, &tree).expect("the spawn refused");
 //! # Ok::<(), supra_sandbox::SandboxError>(())
@@ -87,7 +88,7 @@ pub mod tree;
 pub use error::SandboxError;
 pub use fd_audit::{DescriptorRecord, find_leaks, snapshot as snapshot_descriptors};
 pub use policy::{SandboxPolicy, bootstrap_paths, default_policy};
-pub use spawn::{SpawnRequest, SpawnTicket, platform_tier, spawn, status_summary};
+pub use spawn::{SpawnRequest, SpawnTicket, Stdio, platform_tier, spawn, status_summary};
 pub use tree::TreeBudget;
 
 /// Sandbox policy layer is on the turn loop and on tool calls, so this is a
@@ -97,3 +98,12 @@ const _: () = {
     assert_send_sync::<SandboxPolicy>();
     assert_send_sync::<TreeBudget>();
 };
+
+/// Serialises two families of tests that cannot coexist in one binary:
+/// tests that deliberately clear `FD_CLOEXEC` to manufacture a leak, and
+/// tests that run a real spawn whose audit must see a clean host. In
+/// production nothing shares a process this way - the turn loop is the only
+/// spawner and it never clears flags - so the lock exists only under
+/// `cfg(test)`.
+#[cfg(test)]
+pub(crate) static AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

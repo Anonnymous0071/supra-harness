@@ -2289,6 +2289,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_shell"
+version = "0.1.0"
+dependencies = [
+ "supra_ffi",
+ "supra_guard",
+ "supra_sandbox",
+ "supra_types",
+ "thiserror",
+]
+
+[[package]]
 name = "supra_store"
 version = "0.1.0"
 dependencies = [

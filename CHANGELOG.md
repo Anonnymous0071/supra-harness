@@ -9,6 +9,46 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T16.5** `crates/supra_shell`: persistent pty shell sessions with
+  deterministic output shaping, spawned through the T16 sandbox.
+  - **`supra_ffi::pty`**: pty primitives behind the confined `unsafe` -
+    `posix_openpt`/`grantpt`/`unlockpt` plus the slave `open`, both with
+    `O_CLOEXEC` from the syscall that creates the descriptor. `openpty(3)`
+    was rejected with a measured reason: it returns both descriptors
+    unflagged, leaving a window in which a concurrent fd audit sees the
+    pair as a leak. Resize/size round-trip through `TIOCSWINSZ`/
+    `TIOCGWINSZ`; the parent's slave copy closes on `take_slave` so the
+    master sees EOF when the child exits.
+  - **`ShellSession`**: one pty pair, one child, one `Shaper`. The child
+    is spawned through `supra_sandbox::spawn` with the slave fd as all
+    three standard streams, an explicit environment, and the full audit
+    before exec. There is no unsandboxed path in this crate - `yolo`
+    cannot reach one, by construction. `read` blocks until a byte arrives
+    (the TUI owns the reader thread); EOF and post-exit `EIO` both return
+    `Ok(None)` so a draining reader finishes cleanly.
+  - **`Shaper`**: deterministic transcript from raw pty bytes. Every byte
+    routes through the C++ scanner (T3's C1-positional rule binds the
+    shaping - no reimplementation), with explicit C0 semantics (`\n`
+    commits a line, `\r` returns the cursor to column zero, backspace
+    steps left, other controls drop) and per-line cell-accurate truncation
+    through the C++ planner. The same byte stream shapes to the same
+    transcript whatever the chunk boundaries - pinned by a test that cuts
+    mid-sequence on purpose. The prompt heuristic is a flag the caller
+    reads, never a trigger this crate pulls (T4: false positives ask the
+    user).
+  - **Two parallel-test races, closed structurally.** The vanish race: a
+    session dropping its pty while another test's audit walks
+    `/proc/self/fd` produced `LeakyDescriptor { path: "" }` - a closed
+    descriptor reported as a leak. The audit now treats a mid-walk
+    EBADF/ENOENT as absence, not danger. The probe race: tests that
+    manufacture leaks by clearing CLOEXEC shared a binary with tests whose
+    spawns must see a clean host; a test-only `AUDIT_LOCK` serialises
+    them. Verified with ten consecutive parallel runs per crate.
+  - Nine mutations: eight CAUGHT, one control survived by design. M1
+    (drop `take_slave`) is closed by an EOF-deadline test that turns the
+    would-be hang into a failure; M9 (vanished fd as live leak) by a
+    synthetic-directory unit test, deterministic where the race it models
+    is not.
 - **T16** `crates/supra_sandbox`: host-side choreography of the C++ sandbox -
   fd audit, process-tree budget, and the three-step spawn (audit → guard → FFI).
   - **Pre-spawn fd audit** walks `/proc/self/fd`, reads each `FD_CLOEXEC` flag

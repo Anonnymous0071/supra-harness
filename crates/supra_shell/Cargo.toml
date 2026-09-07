@@ -1,0 +1,28 @@
+[package]
+name = "supra_shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Persistent pty shell sessions with deterministic output shaping, spawned through the T16 sandbox."
+publish = false
+
+[dependencies]
+# The pty pair and the escape-sequence scanner both live behind supra_ffi -
+# the only crate in the workspace allowed to hold unsafe. This crate routes
+# every byte it reads through that scanner (T3's C1-positional rule binds
+# T16.5's output shaping: neither may reimplement the check).
+supra_ffi = { workspace = true }
+# The session spawns its child through the T16 sandbox: the slave fd becomes
+# the child's stdio, the environment stays explicit, and the fd audit runs
+# before every exec.
+supra_sandbox = { workspace = true }
+# Mode and Reversibility travel in the SpawnRequest the session forwards.
+supra_types = { workspace = true }
+supra_guard = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

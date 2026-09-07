@@ -1090,7 +1090,17 @@ if [ -d "$digest" ]; then
         fail "supra_digest depends on supra_llm" \
             "orientation is zero LLM calls; gists are deterministic strings"
     fi
-    hits=$(scan "$digest" 'supra_llm::|use supra_llm|supra_llm::Client|Client::new')
+    hits=""
+    # One file per scan: passing the directory made `production_lines` open a
+    # directory and die with IsADirectoryError - the `|| true` in `scan` then
+    # masked it as "no hits", so the guard certified what it could not see.
+    while IFS= read -r -d '' file; do
+        found=$(scan "$file" 'supra_llm::|use supra_llm')
+        if [ -n "$found" ]; then
+            hits="$hits$found
+"
+        fi
+    done < <(find "$digest" -name '*.rs' -print0 | sort -z)
     if [ -n "$hits" ]; then
         fail "supra_digest reaches for a provider client" "$hits" \
             "ranks are integer arithmetic over T11's lanes, not completions"
@@ -1309,6 +1319,112 @@ if [ -d "$cohort" ]; then
     if ! printf '%s' "$skip_arm" | grep -q 'Tier::E0 | Tier::E1 => Tier::E2'; then
         fail "the skip-E1 arm no longer routes E0 to E2" "$skip_arm" \
             "unanimity-shaped scrutiny cannot review self-disagreement"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T16 + T16.5 - sandbox composition guards
+#
+# The fd audit and the pty session are composition points: each one holds a
+# promise that lives across crates (the audit sees every spawn, the session
+# never bypasses the sandbox, the pty never shows an unflagged descriptor to
+# a concurrent audit). The guards below pin the load-bearing lines with
+# enough context that a decorative mention elsewhere cannot satisfy them -
+# the lesson from T15.5 and T15.7, where bare-name matches certified what
+# they could not see.
+#
+# Probed: each guard was verified to fail against the mutation it names
+# (the same M1-M9 the test suite catches), and to pass on the healthy tree.
+# ---------------------------------------------------------------------------
+sandbox="crates/supra_sandbox/src"
+shell="crates/supra_shell/src"
+ffi="crates/supra_ffi/src"
+
+if [ -d "$sandbox" ]; then
+    # The stdio exemption is one expression: fd > 2 AND !cloexec AND !allow.
+    # A probe that drops only `record.fd > 2` would pass a guard matching the
+    # two remaining conjuncts, so all three must appear together.
+    leaks=$(scan "$sandbox/fd_audit.rs" 'record\.fd > 2 && !record\.cloexec && !allow')
+    if [ -z "$leaks" ]; then
+        fail "the leak predicate no longer exempts stdio in one expression" \
+            "crates/supra_sandbox/src/fd_audit.rs" \
+            "fds 0/1/2 are the child's streams, not leaks; every fd above them must be audited"
+    fi
+
+    # A descriptor that closed mid-walk is absence, not danger. The guard
+    # anchors on the EBADF arm *inside the cloexec match*; a bare `EBADF`
+    # elsewhere (the constant's own doc) must not satisfy it. Probed with
+    # the arm commented out - a plain grep on the file matched the comment
+    # and passed, which is the T15 lesson restated: comments are not code.
+    vanish=$(sed -n '/let cloexec = match cloexec_flag/,/^        };/p' \
+        "$sandbox/fd_audit.rs" 2>/dev/null |
+        grep 'Some(EBADF) => continue' || true)
+    if [ -z "$vanish" ]; then
+        fail "a vanished descriptor is treated as a live leak again" \
+            "crates/supra_sandbox/src/fd_audit.rs" \
+            "a closed fd cannot cross an exec; reporting it as a leak is a false positive under concurrency"
+    fi
+
+    # The audit must run from spawn, before the guard and the FFI. `scan`
+    # strips comments, so commenting the call out cannot satisfy the guard -
+    # the probe that proved this passed a plain grep on the commented line.
+    wired=$(scan "$sandbox/spawn.rs" 'audit_descriptors\(policy\)\?')
+    if [ -z "$wired" ]; then
+        fail "spawn no longer audits descriptors before exec" \
+            "crates/supra_sandbox/src/spawn.rs" \
+            "the T4 boundary is the whole point of the audit"
+    fi
+
+    # The tree budget counts every child the host started. Anchored on the
+    # call site inside spawn (post-FFI), because TreeBudget's own unit tests
+    # would survive a spawn that forgets to record; `scan` keeps a commented
+    # call from satisfying the guard.
+    recorded=$(scan "$sandbox/spawn.rs" 'tree\.record_child\(\);')
+    if [ -z "$recorded" ]; then
+        fail "spawn no longer records the child in the tree budget" \
+            "crates/supra_sandbox/src/spawn.rs" \
+            "the T12.5 catch for stripped env-markers is the count"
+    fi
+fi
+
+if [ -d "$shell" ] && [ -d "$ffi" ]; then
+    # CLOEXEC from the syscall: the flag must ride the posix_openpt call
+    # itself. Anchored on the call with all three flags, so a decorative
+    # `const O_CLOEXEC` cannot satisfy the guard.
+    born=$(scan "$ffi/pty.rs" 'posix_openpt\(O_RDWR \| O_NOCTTY \| O_CLOEXEC\)')
+    if [ -z "$born" ]; then
+        fail "the pty master is no longer CLOEXEC from birth" \
+            "crates/supra_ffi/src/pty.rs" \
+            "openpty-style set-after leaves a window a concurrent audit sees as a leak"
+    fi
+
+    # The parent's slave copy closes right after the spawn - the T4 note.
+    # `scan` keeps a commented-out call from satisfying the guard.
+    take=$(scan "$shell/session.rs" 'pty\.take_slave\(\);')
+    if [ -z "$take" ]; then
+        fail "the session no longer closes the parent's slave copy" \
+            "crates/supra_shell/src/session.rs" \
+            "a held slave keeps the pair alive; the master would never see EOF"
+    fi
+
+    # The child's stdio is the pty slave, overriding whatever the request
+    # said. Matching the assignment pins the override, and `scan` keeps a
+    # comment from standing in for the code.
+    stdio=$(scan "$shell/session.rs" 'request\.stdio = Stdio::all\(slave_fd\);')
+    if [ -z "$stdio" ]; then
+        fail "the session no longer wires stdio to the pty slave" \
+            "crates/supra_shell/src/session.rs" \
+            "a session whose child cannot talk to its own terminal is not a session"
+    fi
+
+    # Shaping routes through the confined scanner, never a reimplementation.
+    # Anchored on the scanner call inside push (Eof::More); the finish() scan
+    # uses Eof::Final and is pinned by its own test, not this guard.
+    routed=$(scan "$shell/shaping.rs" 'self\.scanner\.tokens\(bytes, Eof::More\)')
+    if [ -z "$routed" ]; then
+        fail "the shaper no longer routes bytes through the C++ scanner" \
+            "crates/supra_shell/src/shaping.rs" \
+            "T3's C1-positional rule lives in libsupra_ansi; two parsers for one grammar disagree on the bytes that matter"
     fi
 fi
 

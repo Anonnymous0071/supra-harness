@@ -82,6 +82,7 @@
 
 pub mod ansi;
 pub mod fd;
+pub mod pty;
 pub mod sandbox;
 pub mod width;
 

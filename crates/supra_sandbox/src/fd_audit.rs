@@ -31,6 +31,13 @@ use std::path::Path;
 
 use supra_ffi::fd::cloexec_flag;
 
+/// `EBADF`: the only `errno` `fcntl(F_GETFD)` returns for a descriptor that
+/// no longer exists. POSIX-fixed at 9 on every platform this crate builds
+/// on (Linux, macOS); declared by hand for the same reason every other
+/// foreign constant in the workspace is - no `libc` dependency to carry for
+/// one number.
+const EBADF: i32 = 9;
+
 /// One descriptor the audit observed.
 ///
 /// `path` is best-effort: a descriptor that has been unlinked can resolve to
@@ -85,13 +92,27 @@ fn snapshot_in(directory: &Path) -> io::Result<Vec<DescriptorRecord>> {
         // `i32::from_str` rejects everything else for free.
         let Ok(fd) = raw.parse::<i32>() else { continue };
 
-        // Read the symlink target before the flag: a descriptor that has
-        // vanished between the directory read and the readlink call shows
-        // up as an empty path, which the audit reports as a present
-        // descriptor with no name. That is still a leak in the making.
-        let path = std::fs::read_link(entry.path())
-            .map_or_else(|_| String::new(), |target| target.to_string_lossy().into_owned());
-        let cloexec = cloexec_flag(fd).unwrap_or(false);
+        // Read the symlink target before the flag. A descriptor that
+        // vanished between the directory read and this readlink is gone:
+        // a closed descriptor cannot cross an exec, so it is not a leak -
+        // it is not present at all. Under a concurrent thread (the TUI's
+        // reader closing a session while the turn loop audits) this race
+        // is normal operation, not an error.
+        let path = match std::fs::read_link(entry.path()) {
+            Ok(target) => target.to_string_lossy().into_owned(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => String::new(),
+        };
+        // `fcntl(F_GETFD)` on a live descriptor cannot fail except EBADF,
+        // which here means the descriptor closed mid-walk - the same
+        // verdict as the vanished symlink above. Any other failure (none
+        // is known for `F_GETFD` on a live fd) keeps the fail-closed
+        // default below.
+        let cloexec = match cloexec_flag(fd) {
+            Ok(flag) => flag,
+            Err(error) if error.raw_os_error() == Some(EBADF) => continue,
+            Err(_) => false,
+        };
         records.push(DescriptorRecord { fd, path, cloexec });
     }
     records.sort_by_key(|record| record.fd);
@@ -186,6 +207,9 @@ mod tests {
 
     #[test]
     fn a_descriptor_without_cloexec_is_reported_as_a_leak() {
+        // Holds AUDIT_LOCK: this test manufactures a host-wide leak on
+        // purpose, and a parallel spawn test's audit would see it.
+        let _audit = crate::AUDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // std sets CLOEXEC by default, so the only way to *create* a leak
         // is to clear the flag. The audit must then find it. The leak
         // descriptor is closed at end of scope to keep the test self-clean.
@@ -209,6 +233,29 @@ mod tests {
         supra_ffi::fd::set_cloexec(fd, true).expect("restore");
         drop(file);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_vanished_descriptor_is_absent_not_a_leak() {
+        // A directory entry whose fd no longer exists must be skipped, not
+        // reported as a leak: a closed descriptor cannot cross an exec, so
+        // "vanished mid-walk" is absence, not danger. The probe walks a
+        // synthetic fd directory whose one entry names an impossibly high
+        // descriptor number - `cloexec_flag` answers EBADF, exactly as it
+        // would for a descriptor another thread closed while this walk ran.
+        // Under the old `unwrap_or(false)` shape this returned a record
+        // with `cloexec: false` and an empty path, which `find_leaks`
+        // reported as a leak - the parallel-test flake this behaviour
+        // exists to prevent.
+        let dir = std::env::temp_dir().join("supra-sandbox-fd-vanished-probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("999999"), b"x").expect("entry");
+
+        let records = snapshot_in(&dir).expect("walk");
+        assert!(records.is_empty(), "a vanished fd is absent: {records:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

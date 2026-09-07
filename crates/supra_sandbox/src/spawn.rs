@@ -36,7 +36,11 @@ use crate::tree::TreeBudget;
 /// means the caller has to track what the builder does on its behalf; a
 /// flat struct means the type system says "these are the four things you
 /// have to provide", and the rest is filled in by the host.
-#[derive(Debug)]
+///
+/// `Clone`/`Copy` are derived because the shell session (T16.5) forwards the
+/// caller's request and overrides `stdio`; a request is a bundle of
+/// references, so copying it is copying a handful of pointers.
+#[derive(Clone, Copy, Debug)]
 pub struct SpawnRequest<'a> {
     /// The command's argv. `argv[0]` is conventionally the program path.
     pub argv: &'a [&'a str],
@@ -61,6 +65,48 @@ pub struct SpawnRequest<'a> {
     /// Whether the child is voting. `Some((proposer, voter))` triggers
     /// L7's self-vote refusal when the two are equal.
     pub claim_vote: Option<(AgentId, AgentId)>,
+    /// Where the child's standard streams come from.
+    ///
+    /// The default (`Stdio::default()`) points all three at `/dev/null`,
+    /// which is right for a batch command. A caller that needs to *see* the
+    /// output passes descriptors - a pipe pair, or the slave end of a pty
+    /// (T16.5). The descriptors are borrowed for the spawn only; they stay
+    /// open in the parent and the parent closes them, because a library
+    /// that closes descriptors out from under its caller corrupts it.
+    pub stdio: Stdio,
+}
+
+/// Borrowed descriptors for the child's standard streams.
+///
+/// `None` means the C side opens `/dev/null` for that stream, so a child
+/// that reads stdin reads nothing and a child that writes stdout writes
+/// into the void - both are correct fail-closed shapes for a command whose
+/// output nobody asked for. `Some(fd)` dup2s the descriptor onto the
+/// stream before exec; `dup2` clears CLOEXEC on the duplicate, so the
+/// stream survives the exec even though the source descriptor may not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stdio {
+    /// The child's stdin. `None` = `/dev/null`.
+    pub stdin: Option<core::ffi::c_int>,
+    /// The child's stdout. `None` = `/dev/null`.
+    pub stdout: Option<core::ffi::c_int>,
+    /// The child's stderr. `None` = `/dev/null`.
+    pub stderr: Option<core::ffi::c_int>,
+}
+
+impl Stdio {
+    /// All three streams from one descriptor - the pty-slave shape, where
+    /// stdin, stdout, and stderr must be the same terminal.
+    #[must_use]
+    pub const fn all(fd: core::ffi::c_int) -> Self {
+        Self { stdin: Some(fd), stdout: Some(fd), stderr: Some(fd) }
+    }
+
+    /// All three streams at `/dev/null`.
+    #[must_use]
+    pub const fn null() -> Self {
+        Self { stdin: None, stdout: None, stderr: None }
+    }
 }
 
 /// A pre-flight check that did not run, with a slot for the cause.
@@ -164,6 +210,12 @@ pub fn spawn(
         command.working_dir(dir).map_err(|error| map_ffi(&error))?;
     }
 
+    // Borrowed stdio: the caller's descriptors become the child's streams.
+    // `None` maps to the C side's `-1`, which opens `/dev/null`.
+    command.stdin(request.stdio.stdin.unwrap_or(-1));
+    command.stdout(request.stdio.stdout.unwrap_or(-1));
+    command.stderr(request.stdio.stderr.unwrap_or(-1));
+
     let process = sandbox::spawn(policy.inner(), &command).map_err(|error| map_ffi(&error))?;
     tree.record_child();
     Ok(process)
@@ -239,6 +291,7 @@ mod tests {
             lineage: None,
             child: None,
             claim_vote: None,
+            stdio: Stdio::null(),
         };
         let ticket = SpawnTicket::from_request(&request);
         assert_eq!(ticket.argv, vec!["/bin/sh", "-c", "true"]);
@@ -259,6 +312,7 @@ mod tests {
             lineage: None,
             child: None,
             claim_vote: None,
+            stdio: Stdio::null(),
         };
         let ticket = SpawnTicket::from_request(&request);
         let text = ticket.to_string();
@@ -288,14 +342,17 @@ mod tests {
 
     #[test]
     fn the_spawn_records_a_child_in_the_tree_budget() {
+        use std::time::Duration;
+
+        // Holds AUDIT_LOCK: this test runs a real spawn whose audit must see a
+        // clean host, and a parallel test manufacturing a leak would break it.
+        let _audit = crate::AUDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // The counter is the only thing that proves the host-side hook ran.
         // A mutation that drops `record_child()` would leave the count at
         // zero, and the tree budget would be a counter that never counts.
         // The test runs a real command through the C side and asserts the
         // post-condition; a stage that is unable to actually spawn is its
         // own failure mode and the test reports it.
-        use std::time::Duration;
-
         let caps = supra_ffi::sandbox::probe();
         if !caps.tier.enforces_filesystem() {
             // Skip rather than fail: the audit and ticket tests above already
@@ -320,6 +377,7 @@ mod tests {
             lineage: None,
             child: None,
             claim_vote: None,
+            stdio: Stdio::null(),
         };
 
         // Identity must be established for the guard to pass; the test sets
@@ -341,6 +399,9 @@ mod tests {
 
     #[test]
     fn the_spawn_refuses_when_an_unlisted_descriptor_is_open() {
+        // Holds AUDIT_LOCK: this test manufactures a host-wide leak on purpose,
+        // which a parallel spawn test's audit would see.
+        let _audit = crate::AUDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // The whole point of the pre-spawn audit is to refuse a child
         // that would inherit a descriptor the host has not deliberately
         // allowed. The test creates the leak, calls `spawn` end to end,
@@ -373,6 +434,7 @@ mod tests {
             lineage: None,
             child: None,
             claim_vote: None,
+            stdio: Stdio::null(),
         };
 
         let result = spawn(&policy, &request, &tree);
@@ -390,6 +452,9 @@ mod tests {
 
     #[test]
     fn the_spawn_refuses_when_the_guard_refuses() {
+        // Holds AUDIT_LOCK: this test runs a real spawn whose audit must see a
+        // clean host, and a parallel test manufacturing a leak would break it.
+        let _audit = crate::AUDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // The guard (T12.5) is the host-side anti-self-spawn. A spawn that
         // would create a self-cycle - the agent voting on its own claim -
         // must be refused by the guard, and `spawn` must propagate the
@@ -425,6 +490,7 @@ mod tests {
             lineage: None,
             child: None,
             claim_vote: Some((id, id)),
+            stdio: Stdio::null(),
         };
 
         let started = tree.total_count();
@@ -440,6 +506,9 @@ mod tests {
 
     #[test]
     fn the_pre_spawn_audit_refuses_a_leak() {
+        // Holds AUDIT_LOCK: this test manufactures a host-wide leak on purpose,
+        // which a parallel spawn test's audit would see.
+        let _audit = crate::AUDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = std::env::temp_dir().join("supra-sandbox-spawn-leak-probe");
         let file = std::fs::File::create(&path).expect("create");
         let fd = file.as_raw_fd();
@@ -458,6 +527,9 @@ mod tests {
 
     #[test]
     fn the_allow_list_relaxes_the_audit() {
+        // Holds AUDIT_LOCK: this test manufactures a host-wide leak on purpose,
+        // which a parallel spawn test's audit would see.
+        let _audit = crate::AUDIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // The caller is allowed to inherit a path, and the audit must
         // respect that. The harness uses this for a pipe to the log; the
         // default `SandboxPolicy::new()` has the allow list empty.

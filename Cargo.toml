@@ -16,6 +16,7 @@ members = [
     "crates/supra_cohort",
     "crates/supra_ast",
     "crates/supra_sandbox",
+    "crates/supra_shell",
 ]
 
 # ---------------------------------------------------------------------------
@@ -67,6 +68,7 @@ supra_cohort = { path = "crates/supra_cohort", version = "0.1.0" }
 supra_ast = { path = "crates/supra_ast", version = "0.1.0" }
 supra_digest = { path = "crates/supra_digest", version = "0.1.0" }
 supra_sandbox = { path = "crates/supra_sandbox", version = "0.1.0" }
+supra_shell = { path = "crates/supra_shell", version = "0.1.0" }
 supra_vector = { path = "crates/supra_vector", version = "0.1.0" }
 
 # async runtime + streams
@@ -130,9 +132,6 @@ tree-sitter-javascript = "0.25.0"
 tree-sitter-go = "0.25.0"
 tree-sitter-c = "0.24.2"
 tree-sitter-cpp = "0.23.4"
-
-# shell sessions (T16.5)
-portable-pty = "0.9.0"
 
 # filesystem watching (T15 incremental digest, T19 skill hot-reload)
 notify = "8.2.0"

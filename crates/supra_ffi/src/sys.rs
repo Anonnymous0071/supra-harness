@@ -391,6 +391,50 @@ unsafe extern "C" {
     pub(crate) fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 }
 
+// ---------------------------------------------------------------------------
+// pty (T16.5)
+//
+// The window-size `ioctl` is variadic in C, like `fcntl`; the wrapper passes
+// a `winsize` pointer for the two window-size requests it uses. The request
+// codes are per-OS constants and live in `pty.rs` next to their use, since
+// they describe those two calls rather than a library ABI.
+//
+// Allocation uses the posix_openpt/grantpt/unlockpt route rather than
+// openpty(3): openpty returns both descriptors with FD_CLOEXEC clear, which
+// leaves a window where a concurrent fd audit sees the pair as unflagged.
+// posix_openpt and open both take O_CLOEXEC, so the flag is set by the
+// syscall that creates the descriptor. Declarations for the allocation
+// calls follow below.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+unsafe extern "C" {
+    pub(crate) fn ioctl(fd: c_int, request: core::ffi::c_ulong, ...) -> c_int;
+}
+
+// pty allocation, the CLOEXEC-from-birth route (T16.5). `posix_openpt`,
+// `grantpt`, and `unlockpt` are POSIX. `ptsname_r` is the GNU thread-safe
+// form of `ptsname`; every other Unix ships only the static-buffer
+// `ptsname`, which the pty module serialises under a lock. `open` allocates
+// the slave descriptor with the O_CLOEXEC the flag-from-birth contract
+// needs; the O_ values are per-kernel and live in `pty.rs` next to their
+// use.
+#[cfg(unix)]
+unsafe extern "C" {
+    pub(crate) fn posix_openpt(flags: c_int) -> c_int;
+    pub(crate) fn grantpt(fd: c_int) -> c_int;
+    pub(crate) fn unlockpt(fd: c_int) -> c_int;
+    pub(crate) fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+}
+#[cfg(all(unix, target_os = "linux"))]
+unsafe extern "C" {
+    pub(crate) fn ptsname_r(fd: c_int, buf: *mut c_char, buflen: usize) -> c_int;
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+unsafe extern "C" {
+    pub(crate) fn ptsname(fd: c_int) -> *mut c_char;
+}
+
 /// Keep `supra_ffi_abi_check` reachable.
 ///
 /// Without a live reference the linker may drop the object, taking the C++
