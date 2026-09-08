@@ -9,6 +9,39 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T22** `crates/supra_introspector`: static, dynamic, and cross-agent
+  bug detection - findings carry evidence, the blackboard decides.
+  - **A finding never escalates on its own**: the bridge publishes it as
+    a claim and peers vote; quorum (T21), not a linter, decides - the
+    cross-agent mutual-validation mandate, wired. Every bridge vote
+    carries the finding's own `source#path:line` evidence reference
+    (sized for T6's Verdict budget), and a dedicated test reads
+    `bb_vote.evidence` back from the store to pin it.
+  - **The gates**: clippy (static, `-D warnings` - measured: plain clippy
+    exits 0 on warnings, which made the first fixture pass a broken
+    project) and cargo test (dynamic), through one `run_gate` shape whose
+    diagnostics parser is line-oriented and lenient - ` --> path:line:col`
+    yields a located finding, an unlocated `error:` still yields a
+    finding, noise lines yield nothing. A gate that cannot start is a
+    refusal (`Spawn`), never a pass.
+  - **Cross-agent comparison counts, it does not judge**: answers group
+    by exact text; a minority side produces one finding naming the split
+    ("2 of 3 agree, 1 differ"); unanimity and single answers produce
+    nothing. Who is right is the blackboard's question.
+  - Ten mutations: all ten CAUGHT after one fixture lesson - M9 (votes
+    without evidence) survived because the verdict's evidence was
+    written but never read back; closed by reopening the store and
+    asserting the column. Three guards in `check-invariants.sh`, probed
+    3/3.
+  - **A helper bug found and fixed, with the probe discipline that found
+    it**: the invariants script's keep-strings mode stripped SQL comments
+    (`--...`) from *inside kept Rust string literals*, so a guard on a
+    clippy flag list (`--quiet`, `-D warnings`) could never match - and
+    worse, silently. Diagnosed by printing the kept line and seeing it
+    truncated at `--quiet`; fixed segment-wise (SQL comments apply only
+    between literals), with a regression probe on the T18 INSERT OR
+    IGNORE guard to prove nothing else moved. All earlier `scan_sql`
+    guards re-verified green.
 - **T21** `crates/supra_blackboard`: the shared peer blackboard - claims,
   per-claim votes with proposer exclusion, incremental quorum, rotating
   roles, persisted to SQLite.

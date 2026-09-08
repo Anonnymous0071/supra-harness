@@ -66,7 +66,21 @@ SQL_COMMENT = re.compile(r"--.*$")
 def strip(line: str) -> str:
     """Remove comments, and literals unless the caller asked to keep them."""
     if keep_strings:
-        line = SQL_COMMENT.sub("", line)
+        # SQL comments apply only outside string literals: a `--` inside a
+        # kept Rust literal (a clippy flag like `--quiet`, a `-->` the
+        # cargo parser matches) is content, not commentary. Strip the line
+        # segment by segment, between the strings this mode keeps.
+        out = []
+        rest = line
+        while True:
+            match = STRING.search(rest)
+            if match is None:
+                out.append(SQL_COMMENT.sub("", rest))
+                break
+            out.append(SQL_COMMENT.sub("", rest[:match.start()]))
+            out.append(match.group(0))
+            rest = rest[match.end():]
+        line = "".join(out)
     else:
         line = STRING.sub('""', line)
         line = CHAR.sub("''", line)
@@ -1800,6 +1814,37 @@ if [ -d "$bbsrc" ]; then
         fail "a claim's status no longer updates per vote" \
             "crates/supra_blackboard/src/board.rs" \
             "the turn loop evaluates after every vote; a stale status hangs the loop"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# T22 - introspector guards
+#
+# A gate that cannot run must refuse, and a bridge vote must carry the
+# finding's evidence. Through `scan`; probed against the same M-series.
+# ---------------------------------------------------------------------------
+introsrc="crates/supra_introspector/src"
+
+if [ -d "$introsrc" ]; then
+    spawned=$(scan "$introsrc/gates.rs" 'IntrospectError::Spawn\(')
+    if [ -z "$spawned" ]; then
+        fail "a gate that cannot run no longer refuses" \
+            "crates/supra_introspector/src/gates.rs" \
+            "a gate that cannot run is a refusal, not a pass"
+    fi
+
+    evidenced=$(scan "$introsrc/bridge.rs" 'Some\(finding\.evidence_ref\(\)\)')
+    if [ -z "$evidenced" ]; then
+        fail "a bridge vote no longer carries the finding's evidence" \
+            "crates/supra_introspector/src/bridge.rs" \
+            "a confirming peer's verdict must point at the finding it confirmed"
+    fi
+
+    denied=$(scan_sql "$introsrc/gates.rs" '.D., .warnings')
+    if [ -z "$denied" ]; then
+        fail "the clippy gate no longer denies warnings" \
+            "crates/supra_introspector/src/gates.rs" \
+            "plain clippy exits 0 on warnings; the workspace's zero-warning bar is the gate's own bar"
     fi
 fi
 

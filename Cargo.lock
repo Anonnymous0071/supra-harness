@@ -2751,6 +2751,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_introspector"
+version = "0.1.0"
+dependencies = [
+ "supra_blackboard",
+ "supra_store",
+ "supra_types",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "supra_journal"
 version = "0.1.0"
 dependencies = [
