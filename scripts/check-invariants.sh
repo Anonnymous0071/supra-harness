@@ -1680,6 +1680,45 @@ if [ -d "$mcpsrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T19 - skill loader guards
+#
+# The loader's load-bearing properties: reload-through-a-copy (a failed
+# reload never adopted), the verbatim body, and cycle detection with the
+# cycle named. Through `scan`/`scan_sql`; probed against the same
+# M-series the suite catches.
+# ---------------------------------------------------------------------------
+skillsrc="crates/supra_skill/src"
+
+if [ -d "$skillsrc" ]; then
+    # Reload adopts a copy only after it resolved: the candidate-clone
+    # pattern. A direct apply on self is M5's mutation.
+    reloaded=$(scan "$skillsrc/loader.rs" 'let mut candidate = self\.clone\(\);')
+    if [ -z "$reloaded" ]; then
+        fail "reload no longer applies events to a copy" \
+            "crates/supra_skill/src/loader.rs" \
+            "a failed reload must leave the session with the skills it had"
+    fi
+
+    # The body is verbatim: to_owned, not trim - M9's mutation.
+    verbatim=$(scan_sql "$skillsrc/skill.rs" 'body: body\.to_owned\(\)')
+    if [ -z "$verbatim" ]; then
+        fail "the skill body is no longer verbatim" \
+            "crates/supra_skill/src/skill.rs" \
+            "the model sees the author's formatting; a reflowed body is a different skill"
+    fi
+
+    # Cycle detection exists and builds the arrow-joined path: the
+    # visiting-stack position search is the detection, the join is the
+    # message an author can act on.
+    cycles=$(scan "$skillsrc/loader.rs" 'position\(\|entry\| entry == name\)')
+    if [ -z "$cycles" ]; then
+        fail "cycle detection no longer names the cycle" \
+            "crates/supra_skill/src/loader.rs" \
+            "'cycle' alone sends the author hunting through every skill they wrote"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

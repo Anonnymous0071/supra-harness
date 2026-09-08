@@ -21,6 +21,7 @@ members = [
     "crates/supra_permission",
     "crates/supra_tool",
     "crates/supra_mcp",
+    "crates/supra_skill",
 ]
 
 # ---------------------------------------------------------------------------
@@ -77,6 +78,7 @@ supra_journal = { path = "crates/supra_journal", version = "0.1.0" }
 supra_permission = { path = "crates/supra_permission", version = "0.1.0" }
 supra_tool = { path = "crates/supra_tool", version = "0.1.0" }
 supra_mcp = { path = "crates/supra_mcp", version = "0.1.0" }
+supra_skill = { path = "crates/supra_skill", version = "0.1.0" }
 supra_vector = { path = "crates/supra_vector", version = "0.1.0" }
 
 # async runtime + streams

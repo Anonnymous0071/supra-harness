@@ -1,0 +1,25 @@
+[package]
+name = "supra_skill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Skill loading, dependency resolution, and hot reload: SKILL.md files parsed, cycle-checked, ordered, and reloaded on watch events."
+publish = false
+
+[dependencies]
+# The digest's watcher patch (T15) set the pattern this crate's hot reload
+# follows: `apply_event(&notify::Event)` rather than a background thread
+# with its own timing. The dependency is for the `notify::Event` type the
+# turn loop forwards, not for a watcher of its own.
+notify = { workspace = true }
+# A skill's body routes to the model as content (I2: never a `system`
+# mutation), and CanonicalJson is the argument shape any tool a skill
+# contributes carries.
+supra_types = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

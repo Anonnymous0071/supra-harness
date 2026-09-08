@@ -9,6 +9,40 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T19** `crates/supra_skill`: skill loading, dependency resolution, and
+  hot reload.
+  - **One directory per skill** (`skills/name/SKILL.md`) - the layout
+    every skill system studied converged on; a skill carries its own
+    files beside the manifest without colliding with siblings. The
+    first loader draft read flat files and every fixture caught it.
+  - **The body is content, never a `system` mutation (I2)**: the prompt
+    listing carries name + description only; the body rides as content
+    on demand - the token-efficiency contract Kimchi's skills and the
+    0xPony SKILL.md files both taught.
+  - **Parsing by hand, deliberately**: the front matter is a `key:
+    value` line grammar small enough to own; a YAML dependency would
+    carry its version pins and grammar ambiguities into a file the user
+    edits by hand (the T15.7 two-parsers lesson, applied before the
+    second parser could exist). Unknown keys are preserved verbatim,
+    not refused.
+  - **Name is the front matter's, not the file's** - identity survives
+    renames and moves; a front-matter rename through a watcher event is
+    a drop plus a load, both identities reported.
+  - **Reload refuses and stands**: `reload_from` applies events to a
+    copy and adopts only when everything resolved - the T15 watcher
+    shape (`apply_event(&notify::Event)`, the turn loop forwards), not a
+    background thread. A broken rewrite, a cycle introduced by reload:
+    the author's error leaves the session with the skills it had.
+  - **Determinism**: paths sort, the topological walk keeps name order
+    among unrelated skills - same skills, same bytes, every session.
+  - Ten mutations: nine CAUGHT, control survived by design. M4
+    (topological order reversed) survived with the honest shape of the
+    gap: the fixture's dependent sorted after its dependency, so BTreeMap
+    iteration alone produced the correct answer and the recursion was
+    never exercised - closed by renaming the dependent to sort first and
+    adding a diamond (one edge only proves one edge). Three guards in
+    `check-invariants.sh`, probed 3/3 (one regex escaping bug found by
+    the probe itself and fixed).
 - **T18** `crates/supra_mcp`: MCP client gateway - stdio and HTTP
   transports behind one static gateway schema, manifests cached to
   SQLite, discovery by append.
