@@ -9,6 +9,50 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T20** `crates/supra_plugin`: the wasmtime host - WIT-world plugins
+  with ToolClass-derived import sets, fuel-contained execution.
+  - **Isolation by absence** (§3/§6): one linker per class, each holding
+    exactly the class's imports from `world::imports_for` - an
+    Agent-class guest has no Host or User entry to call through, not a
+    check that refuses after the fact. `verify` type-checks a
+    component's declared imports against its class set **before
+    instantiation**, and `instantiate` runs the same check itself, so a
+    caller that skips verify still cannot link an over-classed component
+    (the paranoid path is test-pinned).
+  - **The world is three ladders in one file** (`supra.wit`,
+    `include_str!`): `agent`/`host`/`user` worlds ascending the
+    `ToolClass` ladder, each exporting `run(string) -> string`; a test
+    pins that the docs and the file agree.
+  - **Import names, three spellings, verified against the parser**: the
+    text format accepts flat kebab names; the WIT `interface#func` path
+    is a source-level spelling a toolchain lowers away. `import_in_set`
+    accepts interface, `interface#function`, and bare-function - the
+    three a toolchain produces, no fourth. Measured: first fixtures
+    named WIT paths and the parser refused `#spawn: trailing characters`.
+  - **Fuel is the hang containment**: `consume_fuel(true)` + per-store
+    `DEFAULT_FUEL` (10M), non-refillable. An infinite-loop guest dies in
+    milliseconds as `FuelExhausted` (component and budget named), not in
+    minutes as a hang; the classifier greps the formatted error chain -
+    the same chain the trap test pins.
+  - **The string ABI, learned from the parser**: a lifted `(string) ->
+    (string)` needs `(memory ...)` and `(realloc ...)` in the `canon
+    lift` - refused at parse time otherwise. The round-trip guest
+    answers from its **own** data segment (a `(ptr,len)` pair at a known
+    offset), not the argument's pointer: the argument's memory belongs
+    to the caller, and returning it traps out-of-bounds - three fixture
+    shapes measured before the fourth landed.
+  - **`HostState` is the T23 socket**: one state per instance, host
+    functions closing over it; the call log is the audit trail today,
+    the real dispatch plugs into the same shape.
+  - Ten mutations: all ten CAUGHT, control survived by design. M1
+    (verify skipped by instantiate) survived first - every test verified
+    explicitly, so the skip was unobservable; closed by instantiating an
+    over-classed component without prior verify. Four guards in
+    `check-invariants.sh`, one needing `scan_sql` (the classifier's
+    subject is the literal "fuel", which `scan` blanks), probed 4/4.
+  - Environment note: /tmp hit 100% again mid-stage (a 788MB wasmtime
+    probe build + stale test artifacts); cleaned per the standing /tmp
+    practice, and the probe directories removed.
 - **T19** `crates/supra_skill`: skill loading, dependency resolution, and
   hot reload.
   - **One directory per skill** (`skills/name/SKILL.md`) - the layout

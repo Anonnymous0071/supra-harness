@@ -1719,6 +1719,59 @@ if [ -d "$skillsrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T20 - plugin host guards
+#
+# Isolation by absence is structural: the linker for a class holds exactly
+# the class's imports, fuel is enabled, and the fuel trap is classified.
+# Through `scan`/`scan_sql`; probed against the same M-series the suite
+# catches.
+# ---------------------------------------------------------------------------
+pluginsrc="crates/supra_plugin/src"
+
+if [ -d "$pluginsrc" ]; then
+    # Fuel is on at the engine: without it, an infinite-loop guest is a
+    # hang, not a refusal - M4's mutation.
+    fuelled=$(scan "$pluginsrc/host.rs" 'config\.consume_fuel\(true\);')
+    if [ -z "$fuelled" ]; then
+        fail "the plugin engine no longer enables fuel" \
+            "crates/supra_plugin/src/host.rs" \
+            "an infinite-loop guest must die in milliseconds, not hang the turn"
+    fi
+
+    # The store carries the budget: enabled fuel without a set budget is
+    # unlimited fuel - M5's mutation.
+    budgeted=$(scan "$pluginsrc/host.rs" 'store\.set_fuel\(DEFAULT_FUEL\)\?;')
+    if [ -z "$budgeted" ]; then
+        fail "the plugin store no longer carries the fuel budget" \
+            "crates/supra_plugin/src/host.rs" \
+            "enabled-but-unset fuel is unlimited fuel"
+    fi
+
+    # Instantiate runs the verify itself: a caller that skips verify still
+    # cannot link an over-classed component - M1's mutation, the paranoid
+    # path.
+    selfverified=$(scan "$pluginsrc/host.rs" 'self\.verify\(name, component, class\)\?;')
+    if [ -z "$selfverified" ]; then
+        fail "instantiate no longer verifies the import set itself" \
+            "crates/supra_plugin/src/host.rs" \
+            "a verify-less caller must still be refused; the paranoid path is the pinned path"
+    fi
+
+    # The fuel trap is classified by name: grepping the chain is the
+    # classifier, and the word it greps for is load-bearing - M6's
+    # mutation greps for nothing.
+    # `scan_sql`, not `scan`: the classifier's subject is the string
+    # literal "fuel" itself, which `scan` blanks by design - the same
+    # case as T17's instruction guard.
+    classified=$(scan_sql "$pluginsrc/host.rs" 'message\.contains\("fuel"\)')
+    if [ -z "$classified" ]; then
+        fail "the fuel trap is no longer classified" \
+            "crates/supra_plugin/src/host.rs" \
+            "a fuel exhaustion that reports as a generic trap hides the budget from the operator"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

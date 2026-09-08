@@ -1,0 +1,23 @@
+[package]
+name = "supra_plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The wasmtime host: WIT-world plugins with ToolClass-derived import sets, verified before instantiation and fuelled after."
+publish = false
+
+[dependencies]
+# ToolClass rides every registration decision (the authority axis, T12.5):
+# a peer's import set is derived from its class, so a tool it may not call
+# has no import to call it through. supra_types owns the class ladder.
+supra_types = { workspace = true }
+# The plugin system executes the Component Model; fuel is the hang
+# containment, typed calls are the ABI. The workspace pins one wasmtime.
+wasmtime = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T19 complete. Stages T20 onward are unimplemented.
+Status: T1-T20 complete. Stages T21 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -427,7 +427,7 @@ backtracking.
 | T17 | `supra_tool` | registry, robust invocation, instruction-carrying preconditions; frozen manifests (I3), closed schema language, effect resolvers per tool |
 | T18 | `supra_mcp` | stdio + HTTP clients behind a static gateway; probe-once cache (third schema_component), append-only discovery, argument-blind resolver |
 | T19 | `supra_skill` | skill loading, dependency resolution, hot reload; one dir per skill, hand-parsed front matter, reload-through-a-copy |
-| T20 | `supra_plugin` | wasmtime host, WIT ABI, verified import set |
+| T20 | `supra_plugin` | wasmtime host, WIT ABI, verified import set; one linker per class (isolation by absence), fuel-contained calls, self-verifying instantiate |
 
 ### Layer E - peer intelligence
 | Stage | Crate | Delivers |
