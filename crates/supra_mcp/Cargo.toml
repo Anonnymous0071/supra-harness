@@ -1,0 +1,42 @@
+[package]
+name = "supra_mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MCP client gateway: stdio and HTTP transports behind one static gateway schema, manifests cached to SQLite, discovery by append."
+publish = false
+
+[dependencies]
+# The gateway registers discovered tools through T17's registry - the
+# append-only surface I3 permits - and each remote tool resolves an Effect
+# for T16.7's gate, exactly as a built-in tool does.
+supra_tool = { workspace = true }
+# Effect (the permission catalogue) and ToolClass ride every manifest.
+supra_permission = { workspace = true }
+supra_types = { workspace = true }
+# Discovered manifests persist to the shared store file under this crate's
+# own schema_component - the same second-owner pattern T11 set and T16.6
+# followed. Probed once, cached; a session with no network starts from the
+# cache and appends what it learns.
+supra_store = { workspace = true }
+rusqlite = { workspace = true }
+# The HTTP transport. The workspace pins one reqwest configuration; this
+# crate adds nothing to it. stdio needs no HTTP dependency at all.
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The async tests need the test macro and a runtime; the workspace pins
+# tokio with default-features off (T13 drives reqwest's runtime and needs
+# nothing else), so the test-only features arrive here instead of widening
+# every crate in the workspace.
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

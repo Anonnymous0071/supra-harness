@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T17 complete. Stages T18 onward are unimplemented.
+Status: T1-T18 complete. Stages T19 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -425,7 +425,7 @@ backtracking.
 | T16.6 | `supra_journal` | write-ahead snapshots, atomic undo; component schema in `schema_component`, `SnapshotId`/kind 0x11, created_at from the id |
 | T16.7 | `supra_permission` | reversibility classification, four modes, batched prompts; closed `Effect` catalogue, gate composes rules->authority->matrix, escape-hatch asks in every mode |
 | T17 | `supra_tool` | registry, robust invocation, instruction-carrying preconditions; frozen manifests (I3), closed schema language, effect resolvers per tool |
-| T18 | `supra_mcp` | stdio + HTTP clients behind a static gateway |
+| T18 | `supra_mcp` | stdio + HTTP clients behind a static gateway; probe-once cache (third schema_component), append-only discovery, argument-blind resolver |
 | T19 | `supra_skill` | skill loading, dependency resolution, hot reload |
 | T20 | `supra_plugin` | wasmtime host, WIT ABI, verified import set |
 

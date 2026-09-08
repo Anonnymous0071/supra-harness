@@ -1630,6 +1630,56 @@ if [ -d "$toolsrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T18 - MCP gateway guards
+#
+# The gateway's load-bearing properties: the cache's append-only rule (I3's
+# compatibility trick), the static tool's argument-blind resolver, and the
+# stdio child's explicit env. All through `scan`/`scan_sql` as the subject
+# demands; probed against the same M-series the suite catches.
+# ---------------------------------------------------------------------------
+mcpsrc="crates/supra_mcp/src"
+
+if [ -d "$mcpsrc" ]; then
+    # Append-only: INSERT OR IGNORE, never REPLACE - a replaced row edits
+    # the manifest the session promised was frozen.
+    appended=$(scan_sql "$mcpsrc/cache.rs" 'INSERT OR IGNORE INTO')
+    if [ -z "$appended" ]; then
+        fail "the manifest cache no longer appends" \
+            "crates/supra_mcp/src/cache.rs" \
+            "an upsert edits the frozen manifest; append does not break a prefix, replacement does"
+    fi
+
+    # The static gateway tool's resolver is argument-blind. The resolver
+    # line appears twice (primary and fallback, identical by design), so a
+    # positive anchor cannot tell which one it sees. Inverted, like the
+    # manifest guard: inside gateway_tool()'s own body, no resolver may
+    # name its parameter - `|args|` or any binding that reads the
+    # arguments is the mutation.
+    gateway_body=$(sed -n '/pub fn gateway_tool()/,/^    }/p' "$mcpsrc/gateway.rs")
+    if printf '%s' "$gateway_body" | grep -E '\|(args?|_[a-z])\|' | grep -qv 'supra_tool::Field'; then
+        fail "the gateway tool's resolver is no longer argument-blind" \
+            "crates/supra_mcp/src/gateway.rs" \
+            "what the servers offer changes content, never the tool"
+    fi
+
+    # The stdio child's env is explicit: env_clear before envs.
+    cleared=$(scan "$mcpsrc/transport.rs" '\.env_clear\(\)')
+    if [ -z "$cleared" ]; then
+        fail "the stdio child no longer runs with an explicit env" \
+            "crates/supra_mcp/src/transport.rs" \
+            "the host env holds secrets no third-party server needs"
+    fi
+
+    # The budget is consulted at probe, before anything is cached.
+    budgeted=$(scan "$mcpsrc/gateway.rs" 'listed\.tools\.len\(\) > TOOLS_PER_SERVER')
+    if [ -z "$budgeted" ]; then
+        fail "the per-server discovery budget is no longer enforced" \
+            "crates/supra_mcp/src/gateway.rs" \
+            "a server that advertises thousands of tools would spend the manifest budget on one remote"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

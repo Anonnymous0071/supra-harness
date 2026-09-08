@@ -9,6 +9,44 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T18** `crates/supra_mcp`: MCP client gateway - stdio and HTTP
+  transports behind one static gateway schema, manifests cached to
+  SQLite, discovery by append.
+  - **The static gateway is one tool** (I3): `mcp` with `server`, `tool`,
+    `arguments` - never changing no matter what the fleet offers. What
+    servers offer reaches the model as content, never as `tools`
+    mutations; the BP1 prefix has nothing dynamic in it to break. A test
+    pins the registration and the argument-blind resolver.
+  - **The cache is append-only by construction** - `INSERT OR IGNORE`,
+    never update, never delete: a server that changed a description
+    between sessions appends nothing and edits nothing. The third
+    `schema_component` owner (T11 set the pattern, T16.6 followed).
+  - **No SDK**: MCP is JSON-RPC 2.0 with a handful of methods; the
+    envelope is ~40 lines and owned. An SDK's version pins would fight
+    the workspace's, and its grammar would be a second implementation of
+    one this crate states in full.
+  - **The stdio child's env is explicit** (`env_clear` + config only):
+    the host env holds secrets no third-party server needs. The test's
+    server exits on host-env markers - and its first version taught this
+    machine a lesson written into the fixture: a piped python sets its
+    own `LC_CTYPE`, so the check marks host variables rather than
+    demanding a one-variable env.
+  - **`-u`, or the afternoon the tests hung**: a piped python
+    block-buffers stdout; an answer in the buffer is a gateway blocked on
+    readline. Every test responder runs `python3 -u`, each with a comment
+    saying why. The hang reproduced in pure python before the fix was
+    found - no assumption, a reproduction.
+  - **A dead server is named, not fatal**; the budget (256 tools/server)
+    refuses at probe time. Text blocks only in `tools/call` answers, and
+    the type check is load-bearing (the fixture gives every block a
+    `text` field, so a filter reading `text` alone fails).
+  - Ten mutations, all CAUGHT after fixture hardening; four survived
+    first, each closed by making the fixture able to observe the
+    difference - M2 needed a 300-tool server, M4 a child that checks its
+    own env, M8 non-text blocks carrying `text`, M9 an empty-map
+    comparison. The pattern is the T15.7 lesson restated: a surviving
+    mutation is a statement about the fixture, not the code. Four guards
+    in `check-invariants.sh`, probed 4/4.
 - **T17** `crates/supra_tool`: the tool registry - frozen manifests, robust
   invocation for weak tool-callers, and instruction-carrying preconditions.
   - **The registry is frozen structurally** (I3): no `remove` exists, and
