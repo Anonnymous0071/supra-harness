@@ -26,6 +26,7 @@ members = [
     "crates/supra_blackboard",
     "crates/supra_introspector",
     "crates/supra_core",
+    "crates/supra_lsp",
 ]
 
 # ---------------------------------------------------------------------------
@@ -87,6 +88,7 @@ supra_plugin = { path = "crates/supra_plugin", version = "0.1.0" }
 supra_blackboard = { path = "crates/supra_blackboard", version = "0.1.0" }
 supra_introspector = { path = "crates/supra_introspector", version = "0.1.0" }
 supra_core = { path = "crates/supra_core", version = "0.1.0" }
+supra_lsp = { path = "crates/supra_lsp", version = "0.1.0" }
 supra_eventbus = { path = "crates/supra_eventbus", version = "0.1.0" }
 supra_vector = { path = "crates/supra_vector", version = "0.1.0" }
 

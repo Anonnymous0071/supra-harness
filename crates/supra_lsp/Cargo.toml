@@ -1,0 +1,21 @@
+[package]
+name = "supra_lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Five language servers over one JSON-RPC/LSP client: references that flip the AST's semantic flag, and crash recovery."
+publish = false
+
+[dependencies]
+supra_ast = { workspace = true }
+supra_digest = { workspace = true }
+supra_types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1885,6 +1885,60 @@ if [ -d "$coresrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T24 - LSP guards
+#
+# The flip and the crash story: the server-answered path must mark its
+# results semantic, and a gate that cannot run must refuse. Through
+# `scan`; probed against the same M-series.
+# ---------------------------------------------------------------------------
+lspsrc="crates/supra_lsp/src"
+
+if [ -d "$lspsrc" ]; then
+    # Server-answered references are semantic: the literal the production
+    # site emits is the flip itself. The construction inside a test
+    # carries the same literal but cannot observe its mutation, so the
+    # guard reads this site - the same defence-in-depth shape M1 proves.
+    # Production-only: `scan` strips cfg(test) bodies by tracking the
+    # brace depth from `#[cfg(test)]`, so the test's own `semantic: true`
+    # (identical literal) cannot satisfy this guard. Below, `scan_sql` would
+    # be wrong: the literal is a value, not a string subject the scan
+    # blanks. Bare `scan` on this site is the right scanner, once test
+    # bodies are excluded.
+    flipped=$(scan "$lspsrc/client.rs" 'semantic: true')
+    if [ -z "$flipped" ]; then
+        fail "server-answered references no longer mark semantic true" \
+            "crates/supra_lsp/src/client.rs" \
+            "the AST ships semantic false; the server's answer is the one place that flips it"
+    fi
+
+    restarted=$(scan "$lspsrc/client.rs" 'spawn_child\(\)\?;')
+    if [ -z "$restarted" ]; then
+        fail "a crashed server no longer restarts" \
+            "crates/supra_lsp/src/client.rs" \
+            "one restart, not a loop: a server that dies twice is Crashed"
+    fi
+
+    # Coverage is by lookup, never by guessing: the same refusal
+    # Language::detect makes for unknown extensions. Guarded through the
+    # Uncovered variant this path returns, because the coverage check
+    # itself is a language branch the schema already owns.
+    covered=$(scan "$lspsrc/client.rs" 'LspError::Uncovered')
+    if [ -z "$covered" ]; then
+        fail "uncovered languages no longer refuse" \
+            "crates/supra_lsp/src/client.rs" \
+            "a server started against the wrong grammar reports references that do not exist"
+    fi
+
+    lspsrc="crates/supra_lsp/src"
+    uncovered_in_servers=$(scan "$lspsrc/servers.rs" 'fn for_language\(')
+    if [ -z "$uncovered_in_servers" ]; then
+        fail "language coverage is gone" \
+            "crates/supra_lsp/src/servers.rs" \
+            "five servers cover seven languages by lookup, never by guessing"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

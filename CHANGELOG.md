@@ -9,6 +9,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T24** `crates/supra_lsp`: five language servers over one client -
+  references that flip the AST's semantic flag, plus crash recovery.
+  - **Five servers cover seven languages** by lookup, never by guessing:
+    rust-analyzer (Rust), typescript-language-server
+    (TypeScript + JavaScript), pyright (Python), gopls (Go), clangd
+    (C + C++). Two share: the same branch the digest's
+    `Language::detect` takes for unknown extensions is the branch this
+    crate takes for uncovered languages - `Uncovered` with the language's
+    name, not a default server.
+  - **The flip itself**: T15.7 ships `semantic: false`; the
+    server-answered path constructs `semantic: true`. A regression to
+    false would silently reintroduce the shadowing false-positives T15.7
+    documents.
+  - **One restart, not a loop**: the client kills, re-spawns,
+    re-initializes, and answers from the fresh instance. A death after a
+    restart is `Crashed` - retrying twice only hides a server that keeps
+    dying.
+  - **The frame is Content-Length, always**: every LSP message carries
+    its length; a frame without it or shorter than it is malformed,
+    because a boundary the sender did not state is one a reader cannot
+    trust. CRLF-terminated headers, byte-counted bodies.
+  - Seven mutations: four CAUGHT; three via guard, control survived.
 - **T23** `crates/supra_core`: the turn loop - thirteen steps, one
   session, no orchestrator.
   - **The loop owns no LLM client**: answers arrive through
