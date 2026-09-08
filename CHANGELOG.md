@@ -9,6 +9,40 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T23** `crates/supra_core`: the turn loop - thirteen steps, one
+  session, no orchestrator.
+  - **The loop owns no LLM client**: answers arrive through
+    `Turn::record`, so the choreography - publish, evaluate per vote,
+    abort on reach, escalate on unreachable - is testable without a
+    network, and the runtime (T30) supplies answers as its shards
+    complete.
+  - **The first answer is the working answer; agreement is the vote**:
+    a peer votes yes exactly when its answer matches, which is what a
+    quorum over answers means. Reached closes the claim (late peers
+    refuse on the closed blackboard row); unreachable escalates
+    immediately, never after a timeout. Every observable moment - vote,
+    reach, abort, escalation, seal, completion - is an event, so the
+    TUI never blocks.
+  - **`finish` seals the winning claim's body** into the ledger as a
+    `SegmentKind::Turn` segment under the same `TurnId` the events
+    carried; the store's segments and the bus's events name the same
+    turn.
+  - **The ceiling and the empty cohort are refused twice,
+    independently** - the explicit check and the `let-else` below it
+    (M7 survives because both produce the same refusal); the claim-body
+    check in `finish` has the same shape against the blackboard's SQL
+    CHECK (M8, same reason). The T15 M6 class, stated rather than
+    hidden.
+  - Ten mutations: eight CAUGHT, two survive as documented
+    defence-in-depth, control survived by design. Three fixture lessons
+    on the way, all arithmetic - the quorum is rational, exact, and
+    unforgiving of off-by-one fixtures: k=3 with one yes, one no, and
+    the never-speaking proposer is still reachable (pending=1,
+    yes+pending=2 >= needed=2); k=4 needs quorum 4, which three
+    validators can never supply, so the late-peer fixture moved to k=6;
+    `peers[1..5]` is four voters, not five. Three guards in
+    `check-invariants.sh` - the ceiling guard needed the inverted shape
+    (`grep -v 'false &&'`), the same lesson as T18's manifest guard.
 - **T22** `crates/supra_introspector`: static, dynamic, and cross-agent
   bug detection - findings carry evidence, the blackboard decides.
   - **A finding never escalates on its own**: the bridge publishes it as

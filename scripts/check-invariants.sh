@@ -1849,6 +1849,42 @@ if [ -d "$introsrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T23 - turn loop guards
+#
+# The loop's load-bearing properties: agreement is the vote, the
+# escalation abort is published, and the ceiling is checked. Through
+# `scan`; probed against the same M-series.
+# ---------------------------------------------------------------------------
+coresrc="crates/supra_core/src"
+
+if [ -d "$coresrc" ]; then
+    agreement=$(scan "$coresrc/turn.rs" 'answer_is_supported\(&answer\).*Vote::Yes.*Vote::No')
+    if [ -z "$agreement" ]; then
+        fail "a disagreeing peer no longer votes no" \
+            "crates/supra_core/src/turn.rs" \
+            "a quorum over answers is a quorum: agreement is the vote"
+    fi
+
+    escalation=$(scan_sql "$coresrc/turn.rs" 'escalating now')
+    if [ -z "$escalation" ]; then
+        fail "unreachable no longer names its escalation" \
+            "crates/supra_core/src/turn.rs" \
+            "the abort reason is what the TUI shows; 'zz' is not it"
+    fi
+
+    # Inverted, like the T18 manifest guard: `if false && agents.len() >
+    # PEER_CEILING` still contains the pattern, so a positive anchor
+    # cannot see the disabling. The check must appear without a
+    # false-guard prefix on its line.
+    ceiling=$(scan "$coresrc/turn.rs" 'agents\.len\(\) > PEER_CEILING' | grep -v 'false &&' || true)
+    if [ -z "$ceiling" ]; then
+        fail "the turn loop no longer checks the peer ceiling" \
+            "crates/supra_core/src/turn.rs" \
+            "no configuration raises PEER_CEILING, and nothing may silently field more"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

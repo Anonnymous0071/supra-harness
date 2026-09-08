@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T22 complete. Stages T23 onward are unimplemented.
+Status: T1-T23 complete. Stages T24 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -434,7 +434,7 @@ backtracking.
 | ----- | ----- | -------- |
 | T21 | `supra_blackboard` | claims, votes, dynamic quorum, choreography, rotating roles; explicit validator roster, tally spans k = proposer + validators, fourth schema_component |
 | T22 | `supra_introspector` | static, dynamic, and cross-agent bug detection; findings as evidence-bearing blackboard claims, quorum decides |
-| T23 | `supra_core` | the turn loop |
+| T23 | `supra_core` | the turn loop; answers driven per-vote (no LLM client inside), agreement is the vote, reach closes / unreachable escalates immediately |
 
 ### Layer F - editor integration and session
 | Stage | Crate | Delivers |

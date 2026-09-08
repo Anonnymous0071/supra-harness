@@ -2701,6 +2701,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_core"
+version = "0.1.0"
+dependencies = [
+ "supra_blackboard",
+ "supra_eventbus",
+ "supra_prompt",
+ "supra_store",
+ "supra_types",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "supra_digest"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,21 @@
+[package]
+name = "supra_core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The turn loop: thirteen steps, one session, no orchestrator."
+publish = false
+
+[dependencies]
+supra_blackboard = { workspace = true }
+supra_eventbus = { workspace = true }
+supra_prompt = { workspace = true }
+supra_store = { workspace = true }
+supra_types = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
