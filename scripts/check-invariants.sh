@@ -1939,6 +1939,45 @@ if [ -d "$lspsrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T25 - DAP guards
+#
+# The client correlates responses by request_seq and reports failure as
+# failure; the breakpoint confirmation carries the adapter's line and
+# verified word. Through `scan`; probed against the M-series.
+# ---------------------------------------------------------------------------
+dapsrc="crates/supra_dap/src"
+
+if [ -d "$dapsrc" ]; then
+    correlated=$(scan "$dapsrc/client.rs" 'if seen == request_seq')
+    if [ -z "$correlated" ]; then
+        fail "responses no longer correlate by request_seq" \
+            "crates/supra_dap/src/client.rs" \
+            "a stale answer to an earlier request must not satisfy a later one"
+    fi
+
+    failures=$(scan "$dapsrc/client.rs" 'if success \{')
+    if [ -z "$failures" ]; then
+        fail "failed responses no longer report failure" \
+            "crates/supra_dap/src/client.rs" \
+            "a refused command that reports success is a silent lie"
+    fi
+
+    confirmed=$(scan_sql "$dapsrc/client.rs" 'confirmed\.get\("line"\)')
+    if [ -z "$confirmed" ]; then
+        fail "the confirmed breakpoint no longer reads the adapter's line" \
+            "crates/supra_dap/src/client.rs" \
+            "a requested line can move; the confirmed position is the one the stop reports"
+    fi
+
+    verified=$(scan_sql "$dapsrc/client.rs" 'confirmed\.get\("verified"\)')
+    if [ -z "$verified" ]; then
+        fail "the breakpoint no longer reads the adapter's verified word" \
+            "crates/supra_dap/src/client.rs" \
+            "verified is the adapter's word that the breakpoint binds"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

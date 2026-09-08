@@ -9,6 +9,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T25** `crates/supra_dap`: three debug adapters over one DAP client -
+  breakpoints and stack traces through the Debug Adapter Protocol.
+  - **Three adapters cover five of seven languages**: `CodeLLDB`
+    (Rust, C, C++ - the LLVM debugger behind one adapter), `debugpy`
+    (Python), `Delve` (Go). TypeScript and JavaScript refuse rather
+    than guess, the same refusal T24 makes for uncovered languages.
+  - **The adapter's confirmation is the breakpoint**: a requested line
+    can move when the compiler plants it elsewhere; the confirmed
+    position and the `verified` word are read from the
+    `setBreakpoints` body, never assumed from the request.
+  - **Responses correlate by `request_seq`, and failure is failure** -
+    both in `Client::request`, where no unit test of framing can reach
+    them, so guards pin the two lines (the T24 closure shape). The
+    frame is Content-Length, always - a boundary the sender did not
+    state is one a reader cannot trust.
+  - Seven mutations: two caught by tests, four by guards, control
+    survived. Two guard-writing lessons from T22 reappeared and were
+    reapplied: `scan_sql` for literal subjects (`confirmed.get("line")`
+    blanks to `confirmed.get("")` under plain `scan`), and shell
+    single-quoted ERE needs one backslash - the double-escaped `\\(`
+    matched nothing.
 - **T24** `crates/supra_lsp`: five language servers over one client -
   references that flip the AST's semantic flag, plus crash recovery.
   - **Five servers cover seven languages** by lookup, never by guessing:

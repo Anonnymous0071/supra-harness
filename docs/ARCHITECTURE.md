@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T24 complete. Stages T25 onward are unimplemented.
+Status: T1-T25 complete. Stages T26 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -440,7 +440,7 @@ backtracking.
 | Stage | Crate | Delivers |
 | ----- | ----- | -------- |
 | T24 | `supra_lsp` | five language servers, crash recovery; five servers cover seven languages (two share), semantic flip, single-restart recovery |
-| T25 | `supra_dap` | three debug adapters |
+| T25 | `supra_dap` | three debug adapters; CodeLLDB/debugpy/Delve cover five languages, confirmed breakpoints, request_seq correlation |
 | T26 | `supra_session` | persistence, resume, branch, export |
 | T27 | `supra_hook` | eight lifecycle events, prefix-safe by type |
 | T28 | `supra_telemetry` | anonymous, opt-in |
