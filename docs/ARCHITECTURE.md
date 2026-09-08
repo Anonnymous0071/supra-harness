@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T20 complete. Stages T21 onward are unimplemented.
+Status: T1-T21 complete. Stages T22 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -432,7 +432,7 @@ backtracking.
 ### Layer E - peer intelligence
 | Stage | Crate | Delivers |
 | ----- | ----- | -------- |
-| T21 | `supra_blackboard` | claims, votes, dynamic quorum, choreography, rotating roles |
+| T21 | `supra_blackboard` | claims, votes, dynamic quorum, choreography, rotating roles; explicit validator roster, tally spans k = proposer + validators, fourth schema_component |
 | T22 | `supra_introspector` | static, dynamic, and cross-agent bug detection |
 | T23 | `supra_core` | the turn loop |
 

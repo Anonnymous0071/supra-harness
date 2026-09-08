@@ -1772,6 +1772,38 @@ if [ -d "$pluginsrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T21 - blackboard guards
+#
+# The peer contract's load-bearing lines: proposer exclusion at vote,
+# membership through the validators map, unreachable closes the claim.
+# Through `scan`; probed against the same M-series the suite catches.
+# ---------------------------------------------------------------------------
+bbsrc="crates/supra_blackboard/src"
+
+if [ -d "$bbsrc" ]; then
+    excluded=$(scan "$bbsrc/board.rs" 'if voter == state\.proposer \{')
+    if [ -z "$excluded" ]; then
+        fail "a proposer may vote on its own claim" \
+            "crates/supra_blackboard/src/board.rs" \
+            "T12.5 L7: a proposer's vote never counts toward its own claim"
+    fi
+
+    membership=$(scan "$bbsrc/board.rs" 'state\.validators\.get_mut\(&voter\)')
+    if [ -z "$membership" ]; then
+        fail "cohort membership is no longer checked through the roster" \
+            "crates/supra_blackboard/src/board.rs" \
+            "a stranger must have no slot to vote through"
+    fi
+
+    closed=$(scan "$bbsrc/board.rs" 'state\.status = outcome;')
+    if [ -z "$closed" ]; then
+        fail "a claim's status no longer updates per vote" \
+            "crates/supra_blackboard/src/board.rs" \
+            "the turn loop evaluates after every vote; a stale status hangs the loop"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

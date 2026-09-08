@@ -9,6 +9,39 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T21** `crates/supra_blackboard`: the shared peer blackboard - claims,
+  per-claim votes with proposer exclusion, incremental quorum, rotating
+  roles, persisted to SQLite.
+  - **The validator roster is explicit**: `publish` takes the validators
+    by id; membership, duplicate-detection, and the closed check all key
+    off one map (`AgentId -> Option<Vote>`), so a stranger has no slot to
+    vote through - the T20 isolation-by-absence lesson, applied to a
+    blackboard. A proposer listed among its own validators is refused at
+    publish.
+  - **The tally spans the cohort, k = proposer + validators**, unchanged
+    from T6: `quorum(k) = ceil(2k/3)` rational, `pending` counts every
+    unspoken member including the proposer who never speaks. At k=2 one
+    yes of two needed stays Open, so an E1 claim escalates rather than
+    carrying on a single vote - small cohorts lean on deterministic
+    gates, exactly as §4 says.
+  - **Unreachable escalates immediately and closes**: `yes + pending <
+    needed` flips the claim the moment it becomes true, and a closed
+    claim refuses further votes; reached closes the same way.
+  - **Rotation is per turn, least-used first, ties by id** -
+    deterministic, test-pinned: two proposals in one turn never repeat a
+    proposer.
+  - **The fourth `schema_component` owner** (`"blackboard"`): claims at
+    publish, each vote in one transaction that also closes the row on a
+    terminal status. The in-memory board is authoritative for the turn;
+    the store is the audit trail T26 resumes from.
+  - Ten mutations: nine CAUGHT; M8 (body budget check dropped) survives
+    as documented defence-in-depth - the SQL CHECK refuses the same
+    overflow independently, so dropping either layer alone changes
+    nothing observable (the T15 M6 class, kept deliberately); control
+    survived by design. Three guards in `check-invariants.sh`, probed
+    3/3.
+  - `QuorumStatus` is now re-exported from `supra_types` (the module doc
+    listed it; the export did not).
 - **T20** `crates/supra_plugin`: the wasmtime host - WIT-world plugins
   with ToolClass-derived import sets, fuel-contained execution.
   - **Isolation by absence** (§3/§6): one linker per class, each holding

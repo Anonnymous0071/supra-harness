@@ -2671,6 +2671,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_blackboard"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "supra_store",
+ "supra_types",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "supra_cohort"
 version = "0.1.0"
 dependencies = [

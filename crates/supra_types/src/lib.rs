@@ -70,8 +70,8 @@ pub use cache::{
     UNCACHED_MULTIPLIER_PERCENT, padding_needed, ttl_order_is_valid,
 };
 pub use cohort::{
-    Confidence, DEFAULT_PEER_LIMIT, MAX_REQUESTS_PER_MINUTE, PEER_CEILING, QuorumTally, TallyError, Tier,
-    Verdict, VerdictError, Vote, admit, byzantine_tolerance, quorum, shards_needed,
+    Confidence, DEFAULT_PEER_LIMIT, MAX_REQUESTS_PER_MINUTE, PEER_CEILING, QuorumStatus, QuorumTally,
+    TallyError, Tier, Verdict, VerdictError, Vote, admit, byzantine_tolerance, quorum, shards_needed,
 };
 pub use ephemeral::{EphemeralBlock, EphemeralKey};
 pub use event::{CacheBreakCause, Event, Topic};
