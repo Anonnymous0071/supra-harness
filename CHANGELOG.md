@@ -9,6 +9,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T26** `crates/supra_session`: session persistence, resume, branch,
+  and export.
+  - **Absent is a state, not an error**: resuming a session that was
+    never saved answers `None` - a clean "nothing to resume". An
+    unreadable file is an error; a missing one is an answer.
+  - **The file names its session, and the load checks it**: every file
+    stores its own id, and a mismatch refuses - a renamed or hand-copied
+    file would otherwise resume under the wrong id with no error
+    anywhere. The mismatch fixture had to write one session's bytes
+    under another's name: merely asking for an unsaved id exercises
+    absence, not mismatch.
+  - **A branch is a copy, not a move**: a fresh id carrying the same
+    turns; the original file is untouched.
+  - **Save creates the directory it was given** - the first mutation
+    run proved the tests had never checked this (every fixture
+    pre-created its scratch), closed by saving into an `a/b/c` that
+    does not exist. The recurring lesson in its fourth appearance: a
+    precondition no test observes is one no mutation can break.
+  - Seven mutations: six CAUGHT, control survived. Three guards in
+    `check-invariants.sh`, probed 3/3.
 - **T25** `crates/supra_dap`: three debug adapters over one DAP client -
   breakpoints and stack traces through the Debug Adapter Protocol.
   - **Three adapters cover five of seven languages**: `CodeLLDB`

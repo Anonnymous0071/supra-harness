@@ -1,0 +1,20 @@
+[package]
+name = "supra_session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Session persistence, resume, branch, and export: the ledger's segments on disk and back."
+publish = false
+
+[dependencies]
+supra_eventbus = { workspace = true }
+supra_prompt = { workspace = true }
+supra_types = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

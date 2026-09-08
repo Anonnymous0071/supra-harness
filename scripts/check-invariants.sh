@@ -1978,6 +1978,37 @@ if [ -d "$dapsrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T26 - session guards
+#
+# The file names its session and the load checks it; absent is None, not
+# an error. Through `scan`; probed against the M-series.
+# ---------------------------------------------------------------------------
+sessrc="crates/supra_session/src"
+
+if [ -d "$sessrc" ]; then
+    mismatched=$(scan "$sessrc/store.rs" 'if stored != session \{')
+    if [ -z "$mismatched" ]; then
+        fail "a session file no longer has to name its session" \
+            "crates/supra_session/src/store.rs" \
+            "a renamed or hand-copied file would resume under the wrong id with no error anywhere"
+    fi
+
+    absent=$(scan "$sessrc/store.rs" 'ErrorKind::NotFound => return Ok\(None\)')
+    if [ -z "$absent" ]; then
+        fail "an absent session is no longer None" \
+            "crates/supra_session/src/store.rs" \
+            "a missing file is an answer - nothing to resume - not an error"
+    fi
+
+    creates=$(scan "$sessrc/store.rs" 'create_dir_all')
+    if [ -z "$creates" ]; then
+        fail "save no longer creates the directory it was given" \
+            "crates/supra_session/src/store.rs" \
+            "a first save into a configured directory must not fail on the directory"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which
