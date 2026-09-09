@@ -48,14 +48,22 @@ void setErrorErrno(char* dest, std::size_t cap, const char* message, int err) {
     if (dest == nullptr || cap == 0) {
         return;
     }
-    // `strerror` rather than `strerror_r`: the reentrant spelling is two
-    // incompatible signatures (GNU returns `char*`, POSIX returns `int`), and
-    // MSVC ships neither. The message is copied into the caller's buffer
-    // before return, so the shared static buffer cannot outlive the call.
-    const char* reason = std::strerror(err);
-    if (reason == nullptr) {
-        reason = "unknown error";
-    }
+    // `strerror_s` on MSVC, `strerror_r` elsewhere: the reentrant spelling
+    // is three incompatible signatures (POSIX returns `int`, GNU returns
+    // `char*`, MSVC names it differently and returns `errno_t`). Each branch
+    // fills `buffer` on its own path, because a shared initialiser is a dead
+    // store under the GNU signature. The message is copied into the caller's
+    // buffer before return, so nothing shared outlives the call.
+    char buffer[128];
+#if defined(_MSC_VER)
+    const char* reason =
+        (::strerror_s(buffer, sizeof buffer, err) == 0) ? buffer : "unknown error";
+#elif defined(__GLIBC__) && defined(_GNU_SOURCE)
+    const char* reason = ::strerror_r(err, buffer, sizeof buffer);
+#else
+    const char* reason =
+        (::strerror_r(err, buffer, sizeof buffer) == 0) ? buffer : "unknown error";
+#endif
     setError(dest, cap, message != nullptr ? message : "error");
     appendTruncated(dest, cap, ": ");
     appendTruncated(dest, cap, reason);

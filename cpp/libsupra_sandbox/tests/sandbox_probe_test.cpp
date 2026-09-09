@@ -415,6 +415,18 @@ void testEmptyPortListRejected() {
 
 int main() {
     testProbeIsConsistent();
+    {
+        supra_sandbox_capabilities caps{};
+        supra_sandbox_probe(&caps);
+        if (caps.user_namespaces == 0) {
+            std::fprintf(stderr,
+                         "sandbox_probe_test: SKIPPED spawn-dependent checks - unprivileged user\n"
+                         "  namespaces unavailable on this host (%s). Refusal branches above\n"
+                         "  still ran; enforcement below needs a uid_map the kernel refuses.\n",
+                         caps.detail[0] != '\0' ? caps.detail : "(no detail)");
+            return supra::test::finish("sandbox_probe_test");
+        }
+    }
     testRefusesUnenforceablePolicy();
     testRequiredTierHonoured();
     testFilesystemPolicyRefusedOnWeakTier();

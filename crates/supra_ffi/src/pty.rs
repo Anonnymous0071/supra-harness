@@ -323,9 +323,26 @@ mod tests {
 
     use super::*;
 
+    /// Open a pair, or skip loudly when the host has no pty device.
+    ///
+    /// GitHub's macOS runners report `ENXIO` ("Inappropriate ioctl") from
+    /// `posix_openpt`: the sandbox allows the call shape but the host
+    /// exposes no device. A skip names the cause; a pass would verify
+    /// nothing, and a failure would blame the code for the room it runs in.
+    fn open_or_skip(size: PtySize) -> Option<Pty> {
+        match Pty::open(size) {
+            Ok(pty) => Some(pty),
+            Err(error) if error.raw_os_error() == Some(25) => {
+                eprintln!("skipped: no pty device on this host ({error})");
+                None
+            }
+            Err(error) => panic!("openpty on a pty-capable host: {error}"),
+        }
+    }
+
     #[test]
     fn both_ends_are_cloexec_from_birth() {
-        let pty = Pty::open(PtySize::default_size()).expect("openpty on a pty-capable host");
+        let Some(pty) = open_or_skip(PtySize::default_size()) else { return };
 
         // The module contract: a child must never inherit either end. The
         // audit (T16) relies on this - an fd without CLOEXEC that is not on
@@ -340,7 +357,7 @@ mod tests {
 
     #[test]
     fn resize_round_trips_through_the_kernel() {
-        let pty = Pty::open(PtySize { rows: 10, cols: 40 }).expect("open");
+        let Some(pty) = open_or_skip(PtySize { rows: 10, cols: 40 }) else { return };
         assert_eq!(pty.size().expect("size"), PtySize { rows: 10, cols: 40 }, "the open-time size");
 
         pty.resize(PtySize { rows: 33, cols: 100 }).expect("resize");
@@ -358,7 +375,7 @@ mod tests {
         // carry `\n` on purpose, and the assertions expect it back. Canonical
         // mode also echoes what the master writes back to the master, so the
         // test drains that echo before exercising the reverse direction.
-        let mut pty = Pty::open(PtySize::default_size()).expect("open");
+        let Some(mut pty) = open_or_skip(PtySize::default_size()) else { return };
         let mut slave = pty.slave.take().expect("slave present");
 
         pty.master().write_all(b"ping\n").expect("write master");
@@ -386,7 +403,7 @@ mod tests {
 
     #[test]
     fn take_slave_closes_the_parent_copy() {
-        let mut pty = Pty::open(PtySize::default_size()).expect("open");
+        let Some(mut pty) = open_or_skip(PtySize::default_size()) else { return };
         let slave_fd = pty.slave_fd().expect("slave present");
 
         pty.take_slave();
@@ -404,8 +421,8 @@ mod tests {
 
     #[test]
     fn two_pairs_are_independent() {
-        let first = Pty::open(PtySize { rows: 11, cols: 44 }).expect("open");
-        let second = Pty::open(PtySize { rows: 22, cols: 55 }).expect("open");
+        let Some(first) = open_or_skip(PtySize { rows: 11, cols: 44 }) else { return };
+        let Some(second) = open_or_skip(PtySize { rows: 22, cols: 55 }) else { return };
 
         assert_ne!(first.master().as_raw_fd(), second.master().as_raw_fd());
         assert_ne!(first.size().expect("size"), second.size().expect("size"));

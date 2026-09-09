@@ -944,7 +944,14 @@ mod tests {
         let mut command = Command::new("/bin/sh").expect("command");
         command.args(["-c", "exit 9"]).expect("args").env("PATH", "/usr/bin:/bin").expect("env");
 
-        let mut process = spawn(&policy, &command).expect("spawn");
+        let mut process = match spawn(&policy, &command) {
+            Ok(process) => process,
+            Err(Error::Refused(message)) if message.contains("uid_map") => {
+                eprintln!("skipped: user namespaces unavailable on this host ({message})");
+                return;
+            }
+            Err(error) => panic!("spawn: {error:?}"),
+        };
         let status = process.wait(Some(core::time::Duration::from_secs(10))).expect("wait").expect("exited");
         assert_eq!(status, 9, "the payload's own exit code reaches the caller");
     }
@@ -971,7 +978,14 @@ mod tests {
             .env("PATH", "/usr/bin:/bin")
             .expect("env");
 
-        let mut process = spawn(&policy, &command).expect("spawn");
+        let mut process = match spawn(&policy, &command) {
+            Ok(process) => process,
+            Err(Error::Refused(message)) if message.contains("uid_map") => {
+                eprintln!("skipped: user namespaces unavailable on this host ({message})");
+                return;
+            }
+            Err(error) => panic!("spawn: {error:?}"),
+        };
         let status = process.wait(Some(core::time::Duration::from_secs(10))).expect("wait").expect("exited");
 
         unsafe { std::env::remove_var("SUPRA_FFI_CANARY") };
@@ -993,7 +1007,14 @@ mod tests {
         command.args(["-c", "sleep 60"]).expect("args").env("PATH", "/usr/bin:/bin").expect("env");
 
         let pid = {
-            let process = spawn(&policy, &command).expect("spawn");
+            let process = match spawn(&policy, &command) {
+                Ok(process) => process,
+                Err(Error::Refused(message)) if message.contains("uid_map") => {
+                    eprintln!("skipped: user namespaces unavailable on this host ({message})");
+                    return;
+                }
+                Err(error) => panic!("spawn: {error:?}"),
+            };
             let pid = process.pid();
             assert!(pid > 0);
             pid
@@ -1022,7 +1043,14 @@ mod tests {
         let mut command = Command::new("/bin/sh").expect("command");
         command.args(["-c", "exit 0"]).expect("args").env("PATH", "/usr/bin:/bin").expect("env");
 
-        let process = spawn(&policy, &command).expect("spawn");
+        let process = match spawn(&policy, &command) {
+            Ok(process) => process,
+            Err(Error::Refused(message)) if message.contains("uid_map") => {
+                eprintln!("skipped: user namespaces unavailable on this host ({message})");
+                return;
+            }
+            Err(error) => panic!("spawn: {error:?}"),
+        };
         let pid = process.detach();
         assert!(pid > 0, "detach hands back the pid");
         // Reaping is now the caller's problem; nothing to assert beyond not
