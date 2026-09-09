@@ -34,6 +34,9 @@ members = [
     "crates/supra_command",
     "crates/supra_theme",
     "crates/supra_tui",
+    "crates/supra_cli",
+    "crates/supra_update",
+    "crates/supra_eval",
 ]
 
 # ---------------------------------------------------------------------------
@@ -103,6 +106,9 @@ supra_telemetry = { path = "crates/supra_telemetry", version = "0.1.0" }
 supra_command = { path = "crates/supra_command", version = "0.1.0" }
 supra_theme = { path = "crates/supra_theme", version = "0.1.0" }
 supra_tui = { path = "crates/supra_tui", version = "0.1.0" }
+supra_update = { path = "crates/supra_update", version = "0.1.0" }
+supra_eval = { path = "crates/supra_eval", version = "0.1.0" }
+supra_cli = { path = "crates/supra_cli", version = "0.1.0" }
 supra_eventbus = { path = "crates/supra_eventbus", version = "0.1.0" }
 supra_vector = { path = "crates/supra_vector", version = "0.1.0" }
 
@@ -173,6 +179,10 @@ notify = "8.2.0"
 
 # cli surface (T30)
 clap = { version = "4.6.6", features = ["derive", "env"] }
+
+# updater (T30) — MIT only, no transitive OpenSSL/native-tls
+minisign-verify = "0.2.5"
+semver = { version = "1.0.28", features = ["serde"] }
 
 # ---------------------------------------------------------------------------
 # Lints applied to every member via `[lints] workspace = true`.

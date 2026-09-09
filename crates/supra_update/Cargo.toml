@@ -1,0 +1,18 @@
+[package]
+name = "supra_update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Updater: verify and apply signed releases (minisign + semver). T30."
+publish = false
+
+[dependencies]
+thiserror = { workspace = true }
+minisign-verify = { workspace = true }
+semver = { workspace = true }
+
+[lints]
+workspace = true

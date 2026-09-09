@@ -1,0 +1,40 @@
+[package]
+name = "supra_cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Binary entry: `supra` with subcommands run/eval/update/config. T30."
+publish = false
+
+[[bin]]
+name = "supra"
+path = "src/main.rs"
+
+[dependencies]
+supra_config = { workspace = true }
+supra_log = { workspace = true }
+supra_types = { workspace = true }
+supra_secrets = { workspace = true }
+supra_store = { workspace = true }
+supra_vector = { workspace = true }
+supra_theme = { workspace = true }
+supra_command = { workspace = true }
+supra_session = { workspace = true }
+supra_hook = { workspace = true }
+supra_mcp = { workspace = true }
+supra_plugin = { workspace = true }
+supra_telemetry = { workspace = true }
+supra_update = { workspace = true }
+supra_eval = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+semver = { workspace = true }
+
+[lints]
+workspace = true
