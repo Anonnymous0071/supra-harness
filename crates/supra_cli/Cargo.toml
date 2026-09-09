@@ -22,6 +22,8 @@ supra_store = { workspace = true }
 supra_vector = { workspace = true }
 supra_theme = { workspace = true }
 supra_command = { workspace = true }
+supra_cohort = { workspace = true }
+supra_core = { workspace = true }
 supra_session = { workspace = true }
 supra_hook = { workspace = true }
 supra_mcp = { workspace = true }

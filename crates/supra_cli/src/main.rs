@@ -10,6 +10,7 @@
 
 mod args;
 mod registry;
+mod runtime;
 mod startup;
 
 use args::{Cli, Command, ConfigAction, UpdateAction};
@@ -36,11 +37,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let sandbox_off = cli.sandbox.eq_ignore_ascii_case("off");
     let wired = registry::wire(&config);
     let assembled = startup::assemble(config, log, sandbox_off);
+    let estimated = runtime::estimate_tier();
+    let planned = runtime::plan_turn(&assembled.config, estimated);
     println!(
-        "mode {} cohort {} sessions {}",
+        "mode {} cohort {} sessions {} | {}",
         assembled.config.permission_mode().label(),
         assembled.config.cohort_limit(),
-        wired.session_dir.display()
+        wired.session_dir.display(),
+        runtime::describe(&planned)
     );
     Ok(())
 }
