@@ -2951,6 +2951,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_telemetry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "supra_types",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "supra_tool"
 version = "0.1.0"
 dependencies = [

@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T27 complete. Stages T28 onward are unimplemented.
+Status: T1-T28 complete. Stages T28.5 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -443,7 +443,7 @@ backtracking.
 | T25 | `supra_dap` | three debug adapters; CodeLLDB/debugpy/Delve cover five languages, confirmed breakpoints, request_seq correlation |
 | T26 | `supra_session` | persistence, resume, branch, export; files name their session (checked at load), absent-is-None, branch-is-copy |
 | T27 | `supra_hook` | eight lifecycle events, prefix-safe by type; four boundaries accept, four inside points refuse at registration; observer-not-gate, exit 42 requests stop |
-| T28 | `supra_telemetry` | anonymous, opt-in |
+| T28 | `supra_telemetry` | anonymous, opt-in; random per-report ids, one-word consent marker (absent/garbage = off), no socket from the library |
 | T28.5 | `supra_theme` | semantic tokens, glyph width probing, responsive banner |
 | T28.7 | `supra_command` | command registry, palette |
 

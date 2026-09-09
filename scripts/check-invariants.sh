@@ -2042,6 +2042,37 @@ if [ -d "$hooksrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T28 - telemetry guards
+#
+# The privacy posture is the design: the report id is random per report,
+# and the consent default is off. Through `scan`/`scan_sql`; probed.
+# ---------------------------------------------------------------------------
+telsrc="crates/supra_telemetry/src"
+
+if [ -d "$telsrc" ]; then
+    per_report=$(scan "$telsrc/report.rs" 'report: supra_types::SessionId::generate\(\)')
+    if [ -z "$per_report" ]; then
+        fail "the report id is no longer random per report" \
+            "crates/supra_telemetry/src/report.rs" \
+            "a stable id across reports ties two reports to one person"
+    fi
+
+    off_default=$(scan "$telsrc/consent.rs" '#\[default\]')
+    if [ -z "$off_default" ]; then
+        fail "consent no longer defaults to off" \
+            "crates/supra_telemetry/src/consent.rs" \
+            "telemetry that ships enabled was never asked for"
+    fi
+
+    atomic=$(scan "$telsrc/consent.rs" 'fs::rename')
+    if [ -z "$atomic" ]; then
+        fail "the consent write is no longer atomic" \
+            "crates/supra_telemetry/src/consent.rs" \
+            "a half-written marker cannot flip consent for the next session"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

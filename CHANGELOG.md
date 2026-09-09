@@ -9,6 +9,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T28** `crates/supra_telemetry`: anonymous, opt-in usage telemetry.
+  - **The report id is random per report, never the session id** - the
+    session id is the identity a resume restores; a report that carried
+    it would let two reports be tied to one person. Two reports from
+    one session share nothing but the counts.
+  - **Nothing but counts and a tier**: no file paths, no environment,
+    no prompt bytes - the JSON round-trip test asserts the serialized
+    form contains no `path` or `user` substring. The report cannot
+    leak what it does not carry.
+  - **Consent is one word, and absent is off**: the marker file holds
+    `on` or `off`; absence reads as `None`; garbage reads as `None` -
+    a corrupted marker is not consent. The default is `Off`. The write
+    is atomic: temp file, sync, rename - a half-written marker cannot
+    flip consent for the next session.
+  - **The sink is not here**: this crate builds bytes; where bytes go
+    is the runtime configuration's (T30) and the operator's decision.
+    No socket opens from a library.
+  - Six mutations: five CAUGHT, control survived. Three guards in
+    `check-invariants.sh`, probed 3/3.
 - **T27** `crates/supra_hook`: eight lifecycle hooks, prefix-safe by
   type.
   - **Prefix safety is a type-level fact, enforced at registration**:
