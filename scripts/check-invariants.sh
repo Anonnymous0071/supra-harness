@@ -2073,6 +2073,40 @@ if [ -d "$telsrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T28.7 - command registry guards
+#
+# The authority check at resolve and the forbidden-name set are the
+# design. Through `scan`; probed against the M-series.
+# ---------------------------------------------------------------------------
+cmdsrc="crates/supra_command/src"
+
+if [ -d "$cmdsrc" ]; then
+    authority=$(scan "$cmdsrc/registry.rs" 'class\.permits\(invoker\)' | grep -v 'false &&' || true)
+    if [ -z "$authority" ]; then
+        fail "commands no longer check authority at resolve" \
+            "crates/supra_command/src/registry.rs" \
+            "a command is subject to the gate, not exempt from it"
+    fi
+
+    # `scan_sql`: FORBIDDEN is an identifier here, but the list's own
+    # strings are the subject; plain scan blanks them. Anchor on the
+    # const with its names present.
+    forbidden=$(scan_sql "$cmdsrc/command.rs" 'FORBIDDEN: \[&str; [1-9]')
+    if [ -z "$forbidden" ]; then
+        fail "the forbidden-name set is gone" \
+            "crates/supra_command/src/command.rs" \
+            "cost/cache/context have no commands by design, and there is no /think"
+    fi
+
+    subseq=$(scan "$cmdsrc/registry.rs" 'fn subsequence')
+    if [ -z "$subseq" ]; then
+        fail "the palette search is no longer a subsequence match" \
+            "crates/supra_command/src/registry.rs" \
+            "a palette that ignores the query is a list, not a search"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

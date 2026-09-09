@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T28 complete. Stages T28.5 onward are unimplemented.
+Status: T1-T28 and T28.7 complete. Stages T28.5, T29, T30 onward are unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -445,7 +445,7 @@ backtracking.
 | T27 | `supra_hook` | eight lifecycle events, prefix-safe by type; four boundaries accept, four inside points refuse at registration; observer-not-gate, exit 42 requests stop |
 | T28 | `supra_telemetry` | anonymous, opt-in; random per-report ids, one-word consent marker (absent/garbage = off), no socket from the library |
 | T28.5 | `supra_theme` | semantic tokens, glyph width probing, responsive banner |
-| T28.7 | `supra_command` | command registry, palette |
+| T28.7 | `supra_command` | command registry, palette; authority checked at resolve on the gate's axis, FORBIDDEN names tested, subsequence search |
 
 ### Layer G - interface and release
 | Stage | Crate | Delivers |

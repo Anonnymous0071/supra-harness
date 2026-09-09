@@ -9,6 +9,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T28.7** `crates/supra_command`: the command registry and palette.
+  - **Commands are descriptions plus an authority class; the runtime
+    owns the action** - the registry never holds a closure over harness
+    state. Resolve checks authority on the permission gate's own axis:
+    `/sandbox` demands `ToolClass::Host`, an Agent invoker is refused
+    even under `yolo` - the same two-axis property T16.7 established,
+    applied to the palette.
+  - **Two prohibitions live in code and are tested, not remembered**:
+    no `cost`/`cache`/`context` commands (section 7 - transparency that
+    must be requested is never consulted when it matters; those
+    surfaces live in the status line, T29), and no `/think` (the
+    thinking budget is frozen per session, section 6). `FORBIDDEN`
+    names them and the test asserts none appears in the built-ins.
+  - **Names are lowercase letters, digits, and hyphens** - register-time
+    refuses anything else: a name with a space or a semicolon is a name
+    the palette cannot type safely. Duplicates refuse; the built-in
+    name-uniqueness test pins the same for the shipped set.
+  - **Search is a subsequence in name order**, case-insensitive; ties
+    keep name order so the palette never reorders under a slow typist.
+  - Seven mutations: six CAUGHT, control survived. Three guards in
+    `check-invariants.sh` (the FORBIDDEN guard anchors on the const's
+    non-empty length through `scan_sql`, because plain `scan` blanks
+    the list's strings), probed 3/3.
 - **T28** `crates/supra_telemetry`: anonymous, opt-in usage telemetry.
   - **The report id is random per report, never the session id** - the
     session id is the identity a resume restores; a report that carried
