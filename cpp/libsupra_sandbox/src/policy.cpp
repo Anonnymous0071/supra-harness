@@ -25,6 +25,25 @@ void setError(char* dest, std::size_t cap, const char* message) {
     dest[i] = '\0';
 }
 
+void appendTruncated(char* dest, std::size_t cap, const char* tail) {
+    if (dest == nullptr || cap == 0 || tail == nullptr) {
+        return;
+    }
+    std::size_t end = 0;
+    while (end < cap && dest[end] != '\0') {
+        ++end;
+    }
+    if (end + 1 >= cap) {
+        return;
+    }
+    std::size_t i = 0;
+    while (end + i + 1 < cap && tail[i] != '\0') {
+        dest[end + i] = tail[i];
+        ++i;
+    }
+    dest[end + i] = '\0';
+}
+
 void setErrorErrno(char* dest, std::size_t cap, const char* message, int err) {
     if (dest == nullptr || cap == 0) {
         return;

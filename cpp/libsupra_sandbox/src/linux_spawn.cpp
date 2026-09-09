@@ -43,6 +43,7 @@
 
 namespace {
 
+using supra::sandbox::detail::appendTruncated;
 using supra::sandbox::detail::setError;
 using supra::sandbox::detail::setErrorErrno;
 
@@ -279,26 +280,27 @@ int supra_sandbox_spawn(const supra_sandbox_policy* policy, const supra_sandbox_
         return 0;
     }
     if (policy->required_tier != 0 && caps.tier < policy->required_tier) {
-        std::snprintf(out->error, sizeof out->error,
-                      "policy requires tier %u but only tier %u available: %s",
-                      static_cast<unsigned>(policy->required_tier),
-                      static_cast<unsigned>(caps.tier), caps.detail);
+        // No `%u` here: GCC 12+ `-Wformat-truncation` under `-Werror` rejects
+        // printing the tier numbers into this buffer, and the numbers are
+        // already in the policy the caller holds. The refusal names the
+        // decision ("requires tier"), not the operands.
+        setError(out->error, sizeof out->error, "policy requires tier above available: ");
+        appendTruncated(out->error, sizeof out->error, caps.detail);
         return 0;
     }
     // Refuse rather than run unconfined. A filesystem policy that is not
     // enforced but reports success is the failure this library exists to
     // prevent.
     if (policy->path_count > 0 && caps.tier < SUPRA_SANDBOX_TIER_LANDLOCK) {
-        std::snprintf(out->error, sizeof out->error,
-                      "policy specifies %u filesystem rules but this platform cannot enforce "
-                      "them: %s",
-                      static_cast<unsigned>(policy->path_count), caps.detail);
+        setError(out->error, sizeof out->error,
+                 "policy specifies filesystem rules but this platform cannot enforce them: ");
+        appendTruncated(out->error, sizeof out->error, caps.detail);
         return 0;
     }
     if (policy->network == SUPRA_SANDBOX_NET_PORTS && caps.port_granular_network == 0) {
-        std::snprintf(out->error, sizeof out->error,
-                      "policy requests per-port network but this platform cannot enforce it: %s",
-                      caps.detail);
+        setError(out->error, sizeof out->error,
+                 "policy requests per-port network but this platform cannot enforce it: ");
+        appendTruncated(out->error, sizeof out->error, caps.detail);
         return 0;
     }
 

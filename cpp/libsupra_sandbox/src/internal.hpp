@@ -19,6 +19,11 @@ void setError(char* dest, std::size_t cap, const char* message);
 /// Format `message: strerror(err)` into a fixed buffer.
 void setErrorErrno(char* dest, std::size_t cap, const char* message, int err);
 
+/// Append `tail` to the NUL-terminated string in `dest`, truncating rather
+/// than overflowing. `snprintf` with `%s` warns under `-Wformat-truncation`
+/// on GCC 12+; the loop states the truncation the warning asks about.
+void appendTruncated(char* dest, std::size_t cap, const char* tail);
+
 /// True when `path` is absolute.
 ///
 /// A relative path is rejected at policy-construction time: resolving it would
