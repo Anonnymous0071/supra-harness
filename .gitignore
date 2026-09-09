@@ -50,5 +50,8 @@ secrets.toml
 /tmp/
 /scratch/
 
+# Agent scratch (transcripts, planner state) — never committed
+.qwen/
+
 # ASan build tree
 /build-asan/
