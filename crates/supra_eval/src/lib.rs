@@ -103,3 +103,48 @@ pub fn offline_shape_check() -> bool {
     }
     true
 }
+
+/// Pricing assumption from §1: cache read costs 0.1x base input.
+pub const CACHE_READ_MULTIPLIER: f64 = 0.1;
+
+/// Base input price in mills per megatoken ($3/MTok).
+pub const BASE_MILLS_PER_MTOK: f64 = 3000.0;
+
+/// Estimate cost in mills for a turn: cached input at 0.1x, uncached at 1x,
+/// output at full price (never cached).
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn estimate_mills(input_tokens: u32, cached_tokens: u32, output_tokens: u32) -> u64 {
+    let cached = f64::from(cached_tokens) * CACHE_READ_MULTIPLIER;
+    let uncached = f64::from(input_tokens.saturating_sub(cached_tokens));
+    let total_input_mtok = (cached + uncached) / 1_000_000.0;
+    let output_mtok = f64::from(output_tokens) / 1_000_000.0;
+    ((total_input_mtok + output_mtok) * BASE_MILLS_PER_MTOK).round() as u64
+}
+
+/// Build a [`TurnMeasurement`] from a live [`supra_llm::Completion`].
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn measure(
+    predicted: &str,
+    admitted: &str,
+    completion: &supra_llm::Completion,
+    input_tokens: u32,
+) -> TurnMeasurement {
+    let (output_tokens, cached_tokens) = match &completion.usage {
+        Some(usage) => (
+            u32::try_from(usage.output_tokens).unwrap_or(u32::MAX),
+            u32::try_from(usage.cached_tokens).unwrap_or(u32::MAX),
+        ),
+        None => (0, 0),
+    };
+    let cost_mills = estimate_mills(input_tokens, cached_tokens, output_tokens);
+    TurnMeasurement {
+        predicted: predicted.to_owned(),
+        admitted: admitted.to_owned(),
+        input_tokens,
+        output_tokens,
+        cache_hit: cached_tokens > 0,
+        cost_mills,
+    }
+}
