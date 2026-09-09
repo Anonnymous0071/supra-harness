@@ -9,6 +9,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T28.5** `crates/supra_theme`: semantic tokens, per-glyph width
+  probing, and a responsive banner - the TUI's palette, measured.
+  - **The TUI asks for roles, never embeds an escape sequence**:
+    eight semantic tokens (`Plain`..`Accent`), the theme answers with
+    bytes. A theme also carries its East Asian Ambiguous resolution,
+    because a theme is a locale decision as much as a colour decision.
+    The default theme is ANSI-only - the first render never depends on
+    24-bit support, tested by asserting no `;38;2;` sequence appears.
+  - **Per-glyph probing, per the T2 finding**: the Block Elements range
+    is not one width class - U+2588 is Ambiguous, U+2591 is Neutral -
+    so the obvious `█`/`░` pairing mixes classes and a gauge silently
+    changes length under a CJK locale. `GaugeGlyphs::cells` measures
+    each glyph individually; `gauge_for` picks the block pair when
+    stable and the same-class portable `#`/`.` pair otherwise.
+  - **The banner measures every line against the terminal it was asked
+    for**: wide terminals get the block art, narrow ones get the word,
+    and the fits test asserts `cells <= cols` strictly.
+  - Six mutations: five CAUGHT, control survived. M3 survived first
+    because the fits assertion was a truism - `cells <= cols.max(cells)`
+    is always true, the sharpest statement yet of the recurring lesson:
+    a test that cannot fail is not a test. Closed by making the
+    assertion mean what it says. Three guards in
+    `check-invariants.sh` - the glyph-probe guard requires *two*
+    measurement lines (both glyphs), the banner guard anchors on the
+    measurement expression itself, and all three patterns needed the
+    single-backslash ERE fix the T22/T25 lessons named - probed 3/3
+    after two rounds of guard hardening.
 - **T28.7** `crates/supra_command`: the command registry and palette.
   - **Commands are descriptions plus an authority class; the runtime
     owns the action** - the registry never holds a closure over harness

@@ -2107,6 +2107,38 @@ if [ -d "$cmdsrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T28.5 - theme guards
+#
+# The per-glyph probing is the T2 finding made executable; the banner
+# must measure. Through `scan`; probed against the M-series.
+# ---------------------------------------------------------------------------
+themesrc="crates/supra_theme/src"
+
+if [ -d "$themesrc" ]; then
+    probed=$(scan "$themesrc/gauge.rs" 'char_width\(' | grep -v 'false' || true)
+    probed_count=$(printf '%s' "$probed" | grep -c . || true)
+    if [ "$probed_count" -lt 2 ]; then
+        fail "gauge glyphs are no longer probed individually" \
+            "crates/supra_theme/src/gauge.rs" \
+            "block elements are not one width class: U+2588 is Ambiguous, U+2591 is Neutral - both glyphs must be measured"
+    fi
+
+    fallback=$(scan_sql "$themesrc/gauge.rs" 'PORTABLE: Self')
+    if [ -z "$fallback" ]; then
+        fail "the stable fallback pair is gone" \
+            "crates/supra_theme/src/gauge.rs" \
+            "a CJK locale must never silently change a gauge's length"
+    fi
+
+    measured=$(scan "$themesrc/banner.rs" 'wide_fits = WORDMARK_WIDE')
+    if [ -z "$measured" ]; then
+        fail "the banner no longer measures itself against the terminal" \
+            "crates/supra_theme/src/banner.rs" \
+            "a banner that assumes its own width is the first thing a narrow terminal scrolls off"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

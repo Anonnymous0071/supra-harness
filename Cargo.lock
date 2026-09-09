@@ -2969,6 +2969,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_theme"
+version = "0.1.0"
+dependencies = [
+ "supra_ffi",
+ "supra_types",
+]
+
+[[package]]
 name = "supra_tool"
 version = "0.1.0"
 dependencies = [
