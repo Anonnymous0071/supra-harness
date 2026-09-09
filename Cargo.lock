@@ -2910,7 +2910,6 @@ dependencies = [
  "supra_cohort",
  "supra_llm",
  "supra_types",
- "supra_vector",
  "thiserror 2.0.20",
 ]
 
