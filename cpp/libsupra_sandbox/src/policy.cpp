@@ -48,22 +48,17 @@ void setErrorErrno(char* dest, std::size_t cap, const char* message, int err) {
     if (dest == nullptr || cap == 0) {
         return;
     }
-    // strerror_r rather than strerror: this can be reached from a forked child
-    // while other threads exist, and the non-reentrant form may return a shared
-    // buffer.
-    //
-    // Two incompatible signatures exist. The GNU variant returns `char*`, which
-    // may point at a static string rather than into `buffer`; the POSIX variant
-    // returns `int` and fills `buffer`. Each branch initialises `reason` on its
-    // own path, because a shared initialiser is a dead store under the GNU
-    // signature and the analyser is right to flag it.
-    char buffer[128];
-#if defined(__GLIBC__) && defined(_GNU_SOURCE)
-    const char* reason = ::strerror_r(err, buffer, sizeof buffer);
-#else
-    const char* reason = ::strerror_r(err, buffer, sizeof buffer) == 0 ? buffer : "unknown error";
-#endif
-    std::snprintf(dest, cap, "%s: %s", message != nullptr ? message : "error", reason);
+    // `strerror` rather than `strerror_r`: the reentrant spelling is two
+    // incompatible signatures (GNU returns `char*`, POSIX returns `int`), and
+    // MSVC ships neither. The message is copied into the caller's buffer
+    // before return, so the shared static buffer cannot outlive the call.
+    const char* reason = std::strerror(err);
+    if (reason == nullptr) {
+        reason = "unknown error";
+    }
+    setError(dest, cap, message != nullptr ? message : "error");
+    appendTruncated(dest, cap, ": ");
+    appendTruncated(dest, cap, reason);
 }
 
 bool isAbsolute(const char* path) {
