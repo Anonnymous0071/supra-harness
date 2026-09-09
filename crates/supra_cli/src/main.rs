@@ -9,6 +9,7 @@
 #![allow(clippy::needless_pass_by_value, reason = "handler enums small; reference adds noise")]
 
 mod args;
+mod startup;
 
 use args::{Cli, Command, ConfigAction, UpdateAction};
 use clap::Parser;
@@ -26,8 +27,16 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn run(_cli: Cli) -> anyhow::Result<()> {
-    println!("supra run: wiring lands in T30.2+");
+fn run(cli: Cli) -> anyhow::Result<()> {
+    let config = startup::discover_resolve(&cli)?;
+    let _log = startup::init_logging(&cli)?;
+    let _secrets = startup::open_secrets(&cli);
+    println!(
+        "mode {} cohort {} thinking {}",
+        config.permission_mode().label(),
+        config.cohort_limit(),
+        config.thinking_budget()
+    );
     Ok(())
 }
 
@@ -56,9 +65,13 @@ fn update_cmd(action: UpdateAction) -> anyhow::Result<()> {
 }
 
 fn config_cmd(action: ConfigAction) -> anyhow::Result<()> {
+    let cli = Cli::parse();
     match action {
         ConfigAction::Show => {
-            println!("supra config show: not yet wired");
+            let config = startup::discover_resolve(&cli)?;
+            for setting in supra_config::Setting::ALL {
+                println!("{} = {:?}", setting.path(), config.source_of(setting));
+            }
             Ok(())
         }
     }
