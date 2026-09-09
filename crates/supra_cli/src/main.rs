@@ -8,79 +8,14 @@
 #![allow(clippy::unnecessary_wraps, reason = "handlers return Result for ? in later wiring")]
 #![allow(clippy::needless_pass_by_value, reason = "handler enums small; reference adds noise")]
 
-use clap::{Parser, Subcommand};
+mod args;
 
-/// Top-level CLI.
-#[derive(Debug, Parser)]
-#[command(name = "supra", version, about = "supra-harness T30")]
-struct Cli {
-    /// Do not load the project config (`.supra/config.toml`).
-    #[arg(long)]
-    ignore_project_config: bool,
-
-    /// Confirm `--ignore-project-config`.
-    #[arg(long)]
-    yes: bool,
-
-    /// Path to an explicit secrets file.
-    #[arg(long, value_name = "PATH")]
-    secrets_file: Option<std::path::PathBuf>,
-
-    /// Permission mode override.
-    #[arg(long, value_name = "MODE")]
-    mode: Option<String>,
-
-    /// Thinking budget override (tokens, 0 to disable).
-    #[arg(long, value_name = "N")]
-    think: Option<u32>,
-
-    /// Subcommand; defaults to `run` when absent.
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Run the harness (default).
-    Run,
-    /// Economy gate.
-    Eval {
-        /// Live probe against providers (needs credentials).
-        #[arg(long)]
-        live: bool,
-    },
-    /// Updater.
-    Update {
-        #[command(subcommand)]
-        action: UpdateAction,
-    },
-    /// Show resolved configuration.
-    Config {
-        #[command(subcommand)]
-        action: ConfigAction,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum UpdateAction {
-    /// Check for a newer release.
-    Check,
-    /// Apply the latest release.
-    Apply,
-}
-
-#[derive(Debug, Subcommand)]
-enum ConfigAction {
-    /// Print the resolved config and where each value came from.
-    Show,
-}
+use args::{Cli, Command, ConfigAction, UpdateAction};
+use clap::Parser;
 
 fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
-
-    if cli.ignore_project_config && !cli.yes {
-        anyhow::bail!("--ignore-project-config requires --yes to confirm");
-    }
+    cli.validate()?;
 
     let command = cli.command.take().unwrap_or(Command::Run);
     match command {
