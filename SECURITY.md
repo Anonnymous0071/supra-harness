@@ -8,7 +8,7 @@ Do not open a public issue.
 Include: affected version or commit, reproduction steps, and the impact you
 believe it has. If you have a proof of concept, attach it privately.
 
-[advisories]: https://github.com/trubs/supra-harness/security/advisories/new
+[advisories]: https://github.com/Anonnymous0071/supra-harness/security/advisories/new
 
 ## Scope
 

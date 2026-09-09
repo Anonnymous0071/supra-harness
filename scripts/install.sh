@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Install the latest signed supra release for this platform.
 #
-#   curl -fsSL https://raw.githubusercontent.com/trubs/supra-harness/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Anonnymous0071/supra-harness/main/scripts/install.sh | bash
 #
 # Env: PREFIX (default ~/.local/bin), SUPRA_VERSION (default: latest tag).
 # Verifies SHA-256 and, when the release carries .minisig files, the minisign
 # signature against the embedded public key before installing anything.
 set -euo pipefail
 
-REPO="trubs/supra-harness"
+REPO="Anonnymous0071/supra-harness"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 VERSION="${SUPRA_VERSION:-latest}"
 # Release signing key. Published on first signed release; until then the
