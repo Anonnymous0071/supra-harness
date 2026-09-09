@@ -89,3 +89,76 @@ impl Cli {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> Cli {
+        <Cli as clap::Parser>::try_parse_from(["supra"]).expect("defaults parse")
+    }
+
+    #[test]
+    fn the_defaults_require_no_confirmation() {
+        let cli = base();
+        assert!(!cli.ignore_project_config);
+        assert!(!cli.yes);
+        assert_eq!(cli.sandbox, "on");
+        cli.validate().expect("defaults are valid");
+    }
+
+    #[test]
+    fn ignoring_the_project_config_requires_confirmation() {
+        let mut cli = base();
+        cli.ignore_project_config = true;
+        assert!(cli.validate().is_err(), "without --yes");
+        cli.yes = true;
+        cli.validate().expect("with --yes");
+    }
+
+    #[test]
+    fn turning_the_sandbox_off_requires_confirmation() {
+        let mut cli = base();
+        cli.sandbox = "off".to_owned();
+        assert!(cli.validate().is_err(), "without --yes");
+        cli.yes = true;
+        cli.validate().expect("with --yes");
+    }
+
+    #[test]
+    fn the_sandbox_flag_only_names_on_or_off() {
+        let mut cli = base();
+        cli.sandbox = "sometimes".to_owned();
+        assert!(cli.validate().is_err());
+        for spelling in ["on", "ON", "off", "OFF"] {
+            let mut cli = base();
+            cli.sandbox = spelling.to_owned();
+            cli.yes = true;
+            cli.validate().unwrap_or_else(|error| panic!("{spelling} is valid: {error}"));
+        }
+    }
+
+    #[test]
+    fn the_mode_flag_only_names_a_real_mode() {
+        for mode in ["plan", "ask", "auto", "yolo"] {
+            let mut cli = base();
+            cli.mode = Some(mode.to_owned());
+            cli.validate().unwrap_or_else(|error| panic!("{mode} is valid: {error}"));
+        }
+        let mut cli = base();
+        cli.mode = Some("reckless".to_owned());
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
+    fn the_log_format_only_names_json_or_compact() {
+        for format in ["json", "compact"] {
+            let mut cli = base();
+            cli.log_format = Some(format.to_owned());
+            cli.validate().unwrap_or_else(|error| panic!("{format} is valid: {error}"));
+        }
+        let mut cli = base();
+        cli.log_format = Some("xml".to_owned());
+        assert!(cli.validate().is_err());
+    }
+}

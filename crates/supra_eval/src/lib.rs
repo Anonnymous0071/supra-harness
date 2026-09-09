@@ -148,3 +148,78 @@ pub fn measure(
         cost_mills,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_offline_shape_check_holds_for_every_tier() {
+        assert!(offline_shape_check());
+    }
+
+    #[test]
+    fn cached_input_costs_a_tenth_of_uncached() {
+        let all_cached = estimate_mills(1_000_000, 1_000_000, 0);
+        let none_cached = estimate_mills(1_000_000, 0, 0);
+        assert_eq!(none_cached, 3000, "1 MTok at $3/MTok is 3000 mills");
+        assert_eq!(all_cached, 300, "cache read is 0.1x");
+    }
+
+    #[test]
+    fn output_is_never_discounted() {
+        let with_output = estimate_mills(0, 0, 1_000_000);
+        assert_eq!(with_output, 3000, "output is full price");
+    }
+
+    #[test]
+    fn the_report_aggregates_and_gates() {
+        let measurements = vec![
+            TurnMeasurement {
+                predicted: "E2".to_owned(),
+                admitted: "E2".to_owned(),
+                input_tokens: 1000,
+                output_tokens: 100,
+                cache_hit: true,
+                cost_mills: 10,
+            },
+            TurnMeasurement {
+                predicted: "E2".to_owned(),
+                admitted: "E3".to_owned(),
+                input_tokens: 1000,
+                output_tokens: 100,
+                cache_hit: false,
+                cost_mills: 30,
+            },
+        ];
+        let report = EconomyReport::from_measurements(&measurements);
+        assert!((report.tier_accuracy - 0.5).abs() < f64::EPSILON);
+        assert!((report.cache_hit_rate - 0.5).abs() < f64::EPSILON);
+        assert!((report.mean_mills_per_turn - 20.0).abs() < f64::EPSILON);
+        assert_eq!(report.turns, 2);
+        assert!(report.passes(0.5, 20.0));
+        assert!(!report.passes(0.9, 20.0), "accuracy gate");
+        assert!(!report.passes(0.5, 10.0), "cost gate");
+        assert!(report.summary().contains("tier-accuracy 50.0%"));
+    }
+
+    #[test]
+    fn an_empty_session_passes_vacuously() {
+        let report = EconomyReport::from_measurements(&[]);
+        assert_eq!(report.turns, 0);
+        assert!(report.passes(1.0, 0.0));
+    }
+
+    #[test]
+    fn measure_marks_a_cache_hit_from_usage() {
+        let completion = supra_llm::Completion {
+            text: "ok".to_owned(),
+            usage: Some(supra_llm::Usage { input_tokens: 1000, output_tokens: 50, cached_tokens: 900 }),
+            thinking: supra_llm::Thinking { budget_tokens: 0 },
+        };
+        let measured = measure("E1", "E1", &completion, 1000);
+        assert!(measured.cache_hit);
+        assert_eq!(measured.output_tokens, 50);
+        assert!(measured.cost_mills < estimate_mills(1000, 0, 50), "cache must discount");
+    }
+}

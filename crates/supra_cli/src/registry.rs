@@ -44,3 +44,41 @@ pub(crate) fn register_hook(
 ) -> Result<(), supra_hook::HookError> {
     registry.register_named(point, command)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_registry_wires_builtins_and_a_session_dir() {
+        let text = "[cohort]\nlimit = 4\n";
+        let layer = supra_config::ConfigLayer::parse(
+            text,
+            supra_config::ConfigSource::User,
+            std::path::PathBuf::from("test"),
+        )
+        .expect("valid");
+        let config = supra_config::resolve(&[(supra_config::ConfigSource::User, layer)]);
+        let wired = wire(&config);
+        assert!(wired.session_dir.ends_with("sessions"), "{}", wired.session_dir.display());
+        assert!(!wired.commands.all().is_empty(), "builtins registered");
+    }
+
+    #[test]
+    fn an_inside_hook_point_is_refused_at_registration() {
+        let mut registry = supra_hook::Registry::new();
+        let refused = register_hook(&mut registry, "before-tool", "echo hi");
+        assert!(refused.is_err(), "inside points are not prefix-safe");
+        register_hook(&mut registry, "turn-start", "echo hi").expect("boundary points register");
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn the_session_dir_falls_back_without_a_home() {
+        let dir = session_dir();
+        assert!(dir.is_some() || std::env::var_os("HOME").is_none(), "fallback exists without HOME");
+        if let Some(dir) = dir {
+            assert!(dir.ends_with("sessions"), "{}", dir.display());
+        }
+    }
+}

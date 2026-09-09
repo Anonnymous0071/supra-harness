@@ -58,3 +58,30 @@ pub fn parse_version(raw: &str) -> Result<semver::Version, UpdateError> {
     let stripped = raw.strip_prefix('v').unwrap_or(raw);
     stripped.parse().map_err(|source| UpdateError::BadVersion { version: raw.to_owned(), source })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_version_with_a_leading_v_parses() {
+        let parsed = parse_version("v0.1.0").expect("strip v");
+        assert_eq!(parsed, semver::Version::new(0, 1, 0));
+        let bare = parse_version("1.2.3").expect("bare");
+        assert_eq!(bare, semver::Version::new(1, 2, 3));
+        assert!(parse_version("not-a-version").is_err());
+    }
+
+    #[test]
+    fn a_tampered_payload_fails_verification() {
+        let key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+        let result = verify(b"tampered", key, "untrusted comment: signature\ninvalid-base64");
+        assert!(matches!(result, Err(UpdateError::BadSignature(_))));
+    }
+
+    #[test]
+    fn a_garbage_key_is_a_signature_error_not_a_panic() {
+        let result = verify(b"data", "not-a-key", "not-a-signature");
+        assert!(matches!(result, Err(UpdateError::BadSignature(_))));
+    }
+}

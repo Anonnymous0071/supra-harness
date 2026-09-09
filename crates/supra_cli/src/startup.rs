@@ -62,3 +62,56 @@ pub(crate) fn open_secrets(cli: &Cli) -> supra_secrets::SecretManager {
         None => supra_secrets::SecretManager::open(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::Cli;
+
+    fn cli_with(args: &[&str]) -> Cli {
+        let mut full = vec!["supra"];
+        full.extend_from_slice(args);
+        <Cli as clap::Parser>::try_parse_from(full).expect("args parse")
+    }
+
+    #[test]
+    fn resolution_is_total_over_an_empty_environment() {
+        let cli = cli_with(&[]);
+        let config = discover_resolve(&cli).expect("empty env resolves to builtins");
+        assert_eq!(config.cohort_limit(), supra_types::DEFAULT_PEER_LIMIT);
+        assert_eq!(config.thinking_budget(), 0);
+    }
+
+    #[test]
+    fn a_cli_mode_rides_the_cli_layer() {
+        let cli = cli_with(&["--mode", "yolo"]);
+        let config = discover_resolve(&cli).expect("mode parses");
+        assert_eq!(config.permission_mode(), supra_types::Mode::Yolo);
+        assert_eq!(config.source_of(supra_config::Setting::PermissionMode), supra_config::ConfigSource::Cli);
+    }
+
+    #[test]
+    fn a_cli_think_budget_rides_the_cli_layer() {
+        let cli = cli_with(&["--think", "1024"]);
+        let config = discover_resolve(&cli).expect("budget parses");
+        assert_eq!(config.thinking_budget(), 1024);
+    }
+
+    #[test]
+    fn ignoring_the_project_config_needs_no_filesystem() {
+        let cli = cli_with(&["--ignore-project-config", "--yes"]);
+        discover_resolve(&cli).expect("escape hatch resolves");
+    }
+
+    #[test]
+    fn secrets_open_with_an_explicit_file() {
+        let dir = std::env::temp_dir().join("supra-cli-startup-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let file = dir.join("secrets.enc");
+        let cli = cli_with(&["--secrets-file", file.to_str().expect("utf8")]);
+        let manager = open_secrets(&cli);
+        assert_eq!(manager.file_store_path(), file.as_path());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

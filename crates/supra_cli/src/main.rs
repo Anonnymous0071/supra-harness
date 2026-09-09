@@ -7,6 +7,7 @@
 #![allow(clippy::print_stdout, reason = "binary output")]
 #![allow(clippy::unnecessary_wraps, reason = "handlers return Result for ? in later wiring")]
 #![allow(clippy::needless_pass_by_value, reason = "handler enums small; reference adds noise")]
+#![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::print_stderr))]
 
 mod args;
 mod registry;
@@ -57,12 +58,24 @@ fn eval_cmd(live: bool) -> anyhow::Result<()> {
     if !live {
         return Ok(());
     }
-    let Some(key) = live_probe_key() else {
-        println!("live probe skipped: no provider credential in the environment");
-        return Ok(());
-    };
-    let _ = key;
-    anyhow::bail!("live probe needs a provider credential and network; shape-check passed");
+    live_probe()
+}
+
+fn live_probe() -> anyhow::Result<()> {
+    live_probe_report(live_probe_key())?;
+    Ok(())
+}
+
+fn live_probe_report(key: Option<String>) -> anyhow::Result<&'static str> {
+    match key {
+        None => {
+            println!("live probe skipped: no provider credential in the environment");
+            Ok("skipped")
+        }
+        Some(_) => {
+            anyhow::bail!("live probe needs a provider credential and network; shape-check passed")
+        }
+    }
 }
 
 fn live_probe_key() -> Option<String> {
@@ -76,13 +89,15 @@ fn live_probe_key() -> Option<String> {
     None
 }
 
-fn update_cmd(action: UpdateAction) -> anyhow::Result<()> {
+fn update_check_message() -> anyhow::Result<String> {
     let current = supra_update::parse_version(env!("CARGO_PKG_VERSION"))?;
+    Ok(format!("supra {current}: update check needs network; verify artefacts with supra_update::verify"))
+}
+
+fn update_cmd(action: UpdateAction) -> anyhow::Result<()> {
     match action {
         UpdateAction::Check => {
-            println!(
-                "supra {current}: update check needs network; verify artefacts with supra_update::verify"
-            );
+            println!("{}", update_check_message()?);
             Ok(())
         }
         UpdateAction::Apply => {
@@ -103,5 +118,39 @@ fn config_cmd(action: ConfigAction) -> anyhow::Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::live_probe_report;
+    use super::*;
+
+    #[test]
+    fn the_live_probe_skips_explicitly_without_a_credential() {
+        let report = live_probe_report(None).expect("absence is Ok");
+        assert_eq!(report, "skipped");
+    }
+
+    #[test]
+    fn presence_refuses_until_the_networked_probe_lands() {
+        let error = live_probe_report(Some("key".to_owned())).expect_err("presence refuses");
+        assert!(error.to_string().contains("needs a provider credential and network"), "{error}");
+    }
+
+    #[test]
+    fn update_check_names_the_verifier() {
+        let message = update_check_message().expect("check never fails without network");
+        assert!(
+            message.contains("supra_update::verify"),
+            "check must name the verifier, not just any help: {message}"
+        );
+        update_cmd(UpdateAction::Check).expect("check never fails without network");
+    }
+
+    #[test]
+    fn update_apply_refuses_without_a_signature() {
+        let error = update_cmd(UpdateAction::Apply).expect_err("apply must refuse");
+        assert!(error.to_string().contains("verified signature"), "{error}");
     }
 }

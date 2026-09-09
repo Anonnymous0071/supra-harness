@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Package a built binary into dist/ for a release target.
-#
-# There is no binary to package before T30 supra_cli. Failing loudly is
-# correct: a tag pushed today has nothing to ship, and a silent success would
-# publish an empty release.
+# Package the supra binary into dist/ for a release target.
 set -euo pipefail
 
 target=${1:?usage: package.sh <target-triple>}
 
-echo "packaging is implemented in T30 (supra_cli + supra_update)." >&2
-echo "requested target: $target" >&2
-exit 1
+cargo build --locked --release -p supra_cli --target "$target"
+mkdir -p dist
+name="supra-${target}"
+cp "target/${target}/release/supra" "dist/${name}"
+sha256sum "dist/${name}" > "dist/${name}.sha256"
+echo "packaged dist/${name}"

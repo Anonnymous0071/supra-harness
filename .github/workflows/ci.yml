@@ -128,13 +128,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: just test-rust
 
-  # Guards the economics claims in docs/ARCHITECTURE.md. Not yet wired: the
-  # gate lands with T30 supra_eval. Left visible so the pipeline shows the
-  # obligation rather than hiding it.
+  # Guards the economics claims in docs/ARCHITECTURE.md: the offline
+  # shape-check always runs; the live probe skips explicitly without keys.
   economy-gate:
-    name: economy gate (T30)
+    name: economy gate
     runs-on: ubuntu-latest
-    if: false
     steps:
       - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v3
+      - uses: Swatinem/rust-cache@v2
       - run: just eval

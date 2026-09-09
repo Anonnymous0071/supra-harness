@@ -178,9 +178,8 @@ bench:
     cargo bench --workspace --locked
 
 # Economy gate (T30 supra_eval): cache hit rate, USD/turn, tier accuracy.
-eval:
-    @echo "supra_eval lands in T30; not yet implemented."
-    @exit 1
+eval *args:
+    cargo run --locked -p supra_cli -- eval {{args}}
 
 docs:
     cargo doc --workspace --locked --no-deps
@@ -189,9 +188,8 @@ docs:
 # Distribution
 # ---------------------------------------------------------------------------
 
-package:
-    @echo "Cross-target packaging lands in T30; not yet implemented."
-    @exit 1
+package target:
+    @bash scripts/package.sh {{target}}
 
 # ---------------------------------------------------------------------------
 # Housekeeping
