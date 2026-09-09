@@ -1,0 +1,17 @@
+[package]
+name = "supra_tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The terminal surface: status line with priority shed, gauge meter, thinking display, viewport, spinner, panels."
+publish = false
+
+[dependencies]
+supra_theme = { workspace = true }
+supra_ffi = { workspace = true }
+
+[lints]
+workspace = true

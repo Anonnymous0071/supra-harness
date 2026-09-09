@@ -9,6 +9,34 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T29** `crates/supra_tui`: the terminal surface - status line,
+  gauge meter, thinking display, viewport, spinner, panels.
+  - **Five segments never shed**: context %, cache %, session spend,
+    the cache-break marker, and the permission mode. Section 7 names
+    four; the mode joins them because a silently changed mode is a
+    consent the operator never gave. Sheddables (model, missed-event
+    count, telemetry, hooks) vanish lowest-priority-first; a single
+    over-wide never-shed truncates rather than vanishes.
+  - **Cost is mills, not cents**: `Cost { mills }` renders the §7
+    shape `+$0.014~` while estimated, `+$0.014` once reconciled. The
+    first draft used cents and could not render the document's own
+    example - the type now matches the spec it quotes.
+  - **The meter never assumes a cell cost**: every bar goes through
+    `gauge_for`, so a Wide locale renders the portable `#`/`.`
+    pair instead of the block pair that doubles under CJK (the T2
+    finding, made executable).
+  - **The thinking display is read-only and cost-free**: `∵
+    Thinking…` while streaming, `∴ Thought for Ns (ctrl+o to …)`
+    after - no cost preview, the tokens are billed either way.
+  - **The viewport clamps twice**: `new` clamps the offset and
+    `visible_range` clamps again, so a field-built struct cannot
+    render past the transcript.
+  - Seven mutations: six CAUGHT, control survived. M3 survived first
+    because the probe injected dead code (`let _ =`), which no test
+    could observe; closed by injecting a visible `$0.01`. Six guards
+    in `check-invariants.sh`, probed 6/6 - the cost-preview guard
+    needs `scan_sql`, since the `$` lives inside a format string the
+    plain scan blanks (the T28.7 FORBIDDEN lesson restated).
 - **T28.5** `crates/supra_theme`: semantic tokens, per-glyph width
   probing, and a responsive banner - the TUI's palette, measured.
   - **The TUI asks for roles, never embeds an escape sequence**:

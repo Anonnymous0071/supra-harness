@@ -266,10 +266,10 @@ print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -3260
             // The JSON-RPC body rides at the end of the HTTP request.
             let body_start = request.find('{').expect("body");
             let request: serde_json::Value = serde_json::from_str(&request[body_start..]).expect("json");
+            let body = format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"served":true}}}}"#, request["id"]);
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"served":true}}}}"#, request["id"]).len(),
-                format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"served":true}}}}"#, request["id"]),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
             );
             stream.write_all(response.as_bytes()).expect("write");
         });

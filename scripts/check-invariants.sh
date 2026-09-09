@@ -2107,6 +2107,61 @@ if [ -d "$cmdsrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T29 - terminal surface guards
+#
+# The status line's never-shed set, the probed gauge, and the cost-free
+# thinking display are the section 7 economics made executable: an
+# invisible cost leak is the failure the never-shed set exists to
+# prevent. Through `scan`; probed against the M-series.
+# ---------------------------------------------------------------------------
+tuisrc="crates/supra_tui/src"
+
+if [ -d "$tuisrc" ]; then
+    never_shed=$(scan "$tuisrc/status.rs" 'shed_at: NEVER_SHED')
+    never_count=$(printf '%s' "$never_shed" | grep -c . || true)
+    if [ "$never_count" -lt 5 ]; then
+        fail "the status line lost a never-shed segment" \
+            "crates/supra_tui/src/status.rs" \
+            "context, cache, spend, cache-break, and mode never shed; an invisible cost leak is the failure this prevents"
+    fi
+
+    probed_gauge=$(scan "$tuisrc/meter.rs" 'gauge_for\(self\.ambiguous\)')
+    if [ -z "$probed_gauge" ]; then
+        fail "the meter no longer renders through the probed gauge" \
+            "crates/supra_tui/src/meter.rs" \
+            "a fixed gauge pair mixes width classes under a CJK locale; see the T2 finding"
+    fi
+
+    # `scan_sql`: the cost marker is a literal inside a format string, and
+    # plain `scan` blanks literals - the same lesson as the T28.7 FORBIDDEN
+    # guard. A `$` in shipped code outside a string is not the violation;
+    # the violation is a `$` inside the rendered text.
+    if scan_sql "$tuisrc/thinking.rs" '\$' | grep -q .; then
+        fail "the thinking display carries a cost preview" \
+            "$(scan_sql "$tuisrc/thinking.rs" '\$')" \
+            "thinking tokens are billed either way; a preview is a leak into the wrong surface"
+    fi
+
+    if ! scan "$tuisrc/viewport.rs" 'self\.offset\.min\(self\.total\)' | grep -q .; then
+        fail "the viewport range is no longer clamped to the total" \
+            "crates/supra_tui/src/viewport.rs" \
+            "an unclamped offset renders past the transcript or panics on the range"
+    fi
+
+    if ! scan "$tuisrc/status.rs" 'supra_ffi::width::truncate' | grep -q .; then
+        fail "the status line no longer truncates an over-wide segment" \
+            "crates/supra_tui/src/status.rs" \
+            "a single over-wide never-shed must cut, not vanish"
+    fi
+
+    if ! scan "$tuisrc/spinner.rs" 'wrapping_add\(1\)' | grep -q .; then
+        fail "the spinner no longer advances" \
+            "crates/supra_tui/src/spinner.rs" \
+            "a stuck frame is a hung turn wearing a live one"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # T28.5 - theme guards
 #
 # The per-glyph probing is the T2 finding made executable; the banner

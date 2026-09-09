@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T28, T28.5, T28.7 complete. Stages T29, T30 onward are unimplemented.
+Status: T1-T28, T28.5, T28.7, T29 complete. Stage T30 onward is unimplemented.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.
@@ -375,8 +375,10 @@ which disappears on reconciliation. A divergence above 10% emits
 `Event::UsageDrift`: the token counter needs calibration, and that is worth
 knowing.
 
-Never shed at any width: context %, cache %, session spend, and the cache-break
-marker. An invisible cost leak is the failure this design exists to prevent.
+Never shed at any width: context %, cache %, session spend, the cache-break
+marker, and the permission mode - the mode joins the four because a silently
+changed mode is a consent the operator never gave. An invisible cost leak is
+the failure this design exists to prevent.
 
 ---
 

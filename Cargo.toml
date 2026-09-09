@@ -33,6 +33,7 @@ members = [
     "crates/supra_telemetry",
     "crates/supra_command",
     "crates/supra_theme",
+    "crates/supra_tui",
 ]
 
 # ---------------------------------------------------------------------------
@@ -101,6 +102,7 @@ supra_hook = { path = "crates/supra_hook", version = "0.1.0" }
 supra_telemetry = { path = "crates/supra_telemetry", version = "0.1.0" }
 supra_command = { path = "crates/supra_command", version = "0.1.0" }
 supra_theme = { path = "crates/supra_theme", version = "0.1.0" }
+supra_tui = { path = "crates/supra_tui", version = "0.1.0" }
 supra_eventbus = { path = "crates/supra_eventbus", version = "0.1.0" }
 supra_vector = { path = "crates/supra_vector", version = "0.1.0" }
 
