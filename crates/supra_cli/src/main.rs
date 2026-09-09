@@ -9,6 +9,7 @@
 #![allow(clippy::needless_pass_by_value, reason = "handler enums small; reference adds noise")]
 
 mod args;
+mod registry;
 mod startup;
 
 use args::{Cli, Command, ConfigAction, UpdateAction};
@@ -29,13 +30,17 @@ fn main() -> anyhow::Result<()> {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     let config = startup::discover_resolve(&cli)?;
-    let _log = startup::init_logging(&cli)?;
-    let _secrets = startup::open_secrets(&cli);
+    let log = startup::init_logging(&cli)?;
+    let secrets = startup::open_secrets(&cli);
+    let _ = secrets.primary_backend();
+    let sandbox_off = cli.sandbox.eq_ignore_ascii_case("off");
+    let wired = registry::wire(&config);
+    let assembled = startup::assemble(config, log, sandbox_off);
     println!(
-        "mode {} cohort {} thinking {}",
-        config.permission_mode().label(),
-        config.cohort_limit(),
-        config.thinking_budget()
+        "mode {} cohort {} sessions {}",
+        assembled.config.permission_mode().label(),
+        assembled.config.cohort_limit(),
+        wired.session_dir.display()
     );
     Ok(())
 }
