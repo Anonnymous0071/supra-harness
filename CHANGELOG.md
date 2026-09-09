@@ -9,6 +9,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T27** `crates/supra_hook`: eight lifecycle hooks, prefix-safe by
+  type.
+  - **Prefix safety is a type-level fact, enforced at registration**:
+    only the four boundary points (session start, session end, turn
+    start, turn end) accept hooks; the four inside points
+    (before/after tool, before evict, after cache break) exist in the
+    enum, are nameable in configuration, and refuse with
+    `NotPrefixSafe` - a user command executing mid-prefix can mutate
+    what the provider has already cached, and a cache break is the tax
+    nobody asked for.
+  - **A hook is an observer, not a gate**: a failing command is
+    reported but does not stop the other hooks; exit 42 requests a
+    `Stop` the caller may honor, and already-sealed segments stay
+    sealed. The triggering `Event` travels as JSON on stdin
+    (`{"TurnStarted":{...}}` - externally tagged, serde's default,
+    verified by probe before the fixtures were written);
+    `SUPRA_HOOK_POINT` and `SUPRA_TURN_COUNT` ride the environment.
+  - **`shell_words` is POSIX for the subset hooks use**: backslash is
+    *not* special inside single quotes - the first implementation
+    unescaped `\"` inside a single-quoted python `-c` argument, and
+    the command that worked verbatim in a shell failed under the
+    harness. Measured by running the exact command both ways before
+    fixing the helper.
+  - Eight mutations: seven CAUGHT, control survived. Three guards in
+    `check-invariants.sh` - two needed the inverted shape (a disabling
+    `if false &&` keeps the text; the T18/T23 lesson, now in its
+    fourth statement), probed 3/3.
 - **T26** `crates/supra_session`: session persistence, resume, branch,
   and export.
   - **Absent is a state, not an error**: resuming a session that was

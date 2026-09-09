@@ -2009,6 +2009,39 @@ if [ -d "$sessrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T27 - hook guards
+#
+# Prefix safety at registration is the stage's whole point; the exit-42
+# stop is the only authority a hook has. Through `scan`; probed.
+# ---------------------------------------------------------------------------
+hooksrc="crates/supra_hook/src"
+
+if [ -d "$hooksrc" ]; then
+    # Inverted, like the T18/T23 manifest and ceiling guards: a disabling
+    # `if false &&` keeps the text, so a positive anchor cannot see it.
+    safe=$(scan "$hooksrc/registry.rs" 'is_prefix_safe\(\)' | grep -v 'false &&' || true)
+    if [ -z "$safe" ]; then
+        fail "hooks no longer check prefix safety at registration" \
+            "crates/supra_hook/src/registry.rs" \
+            "a user command executing mid-prefix mutates what the provider already cached"
+    fi
+
+    stop=$(scan "$hooksrc/registry.rs" 'Some\(42\)' | grep -v '=>' | grep -v 'status.code() == Some(42) => {}' || scan "$hooksrc/registry.rs" 'Some\(42\) => outcome = HookOutcome::Stop' || true)
+    if [ -z "$stop" ]; then
+        fail "exit 42 no longer requests a stop" \
+            "crates/supra_hook/src/registry.rs" \
+            "the stop request is the only authority a hook carries"
+    fi
+
+    stdin_payload=$(scan "$hooksrc/registry.rs" 'write_all\(payload')
+    if [ -z "$stdin_payload" ]; then
+        fail "the event no longer reaches the hook's stdin" \
+            "crates/supra_hook/src/registry.rs" \
+            "a hook that cannot see what fired it is a cron job, not a lifecycle hook"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

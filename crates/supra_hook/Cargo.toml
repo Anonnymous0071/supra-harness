@@ -1,0 +1,19 @@
+[package]
+name = "supra_hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Eight lifecycle hooks, prefix-safe by type: user commands run at turn boundaries only, never inside the prefix."
+publish = false
+
+[dependencies]
+supra_eventbus = { workspace = true }
+supra_types = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

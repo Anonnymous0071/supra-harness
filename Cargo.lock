@@ -2774,6 +2774,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "supra_hook"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "supra_eventbus",
+ "supra_types",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "supra_introspector"
 version = "0.1.0"
 dependencies = [

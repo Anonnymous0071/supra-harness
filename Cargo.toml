@@ -29,6 +29,7 @@ members = [
     "crates/supra_lsp",
     "crates/supra_dap",
     "crates/supra_session",
+    "crates/supra_hook",
 ]
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,7 @@ supra_core = { path = "crates/supra_core", version = "0.1.0" }
 supra_lsp = { path = "crates/supra_lsp", version = "0.1.0" }
 supra_dap = { path = "crates/supra_dap", version = "0.1.0" }
 supra_session = { path = "crates/supra_session", version = "0.1.0" }
+supra_hook = { path = "crates/supra_hook", version = "0.1.0" }
 supra_eventbus = { path = "crates/supra_eventbus", version = "0.1.0" }
 supra_vector = { path = "crates/supra_vector", version = "0.1.0" }
 
