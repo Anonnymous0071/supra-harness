@@ -1,6 +1,6 @@
 # supra-harness architecture
 
-Status: T1-T28, T28.5, T28.7, T29 complete. Stage T30 onward is unimplemented.
+Status: T1-T28, T28.5, T28.7, T29, T30 complete. The 37-stage sequence is closed.
 
 This document is normative. Where an implementation disagrees with an invariant
 stated here, the implementation is wrong.

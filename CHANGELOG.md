@@ -9,6 +9,30 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **T30** `crates/supra_cli`, `crates/supra_update`,
+  `crates/supra_eval`: the single binary, the updater, the economy
+  gate - Layer G, closing the 37-stage sequence.
+  - **One binary, `supra`**: `run` (default), `eval [--live]`,
+    `update check|apply`, `config show`. Startup wires in order -
+    discover, resolve, log, secrets, registry, runtime - and `run`
+    reports mode, cohort limit, session dir, and the admission plan.
+  - **Two flags need their own confirmation**: `--ignore-project-config`
+    and `--sandbox off` each require `--yes`; the first escapes the
+    project tightening rule, the second disables the sandbox.
+  - **Eval is offline-first**: the shape-check over every tier and
+    limit 1-80 always runs; `--live` skips explicitly without a
+    credential and refuses with one until the networked probe lands.
+    `estimate_mills` prices cache read at 0.1x ($3/MTok), output
+    never discounted.
+  - **Update refuses before it verifies**: `apply` bails without a
+    verified minisign signature; `check` names `supra_update::verify`.
+    `package.sh` builds and checksums, `sign-release.sh` skips
+    without `MINISIGN_KEY`, the economy gate runs in CI.
+  - Thirty tests (cli 21, eval 6, update 3); 7/7 behavior mutations
+    CAUGHT. Two probes survived first - a `println!`-only skip and a
+    help-text change - closed by extracting `live_probe_report` and
+    `update_check_message` as testable pure functions. Six guards in
+    `check-invariants.sh`, probed 6/6.
 - **T29** `crates/supra_tui`: the terminal surface - status line,
   gauge meter, thinking display, viewport, spinner, panels.
   - **Five segments never shed**: context %, cache %, session spend,

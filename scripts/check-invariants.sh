@@ -2162,6 +2162,62 @@ if [ -d "$tuisrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# T30 - interface and release guards
+#
+# The confirmation gates, the offline-first eval, and the signature
+# refusal are the trust boundary made executable: an escape hatch
+# without confirmation is a bypass, and an update without a signature
+# is a download, not a release. Through `scan`; probed 6/6.
+# ---------------------------------------------------------------------------
+clisrc="crates/supra_cli/src"
+
+if [ -d "$clisrc" ]; then
+    if ! scan "$clisrc/args.rs" 'ignore_project_config && !self\.yes' | grep -q .; then
+        fail "the --ignore-project-config confirmation is gone" \
+            "crates/supra_cli/src/args.rs" \
+            "a tightening escape hatch without confirmation is a bypass with a flag"
+    fi
+
+    # No `"off"` in the pattern: literals are blanked, so match the shape -
+    # a case-insensitive sandbox comparison gated on `!self.yes`.
+    if ! scan "$clisrc/args.rs" 'sandbox\.eq_ignore_ascii_case.*&& !self\.yes' | grep -q .; then
+        fail "the --sandbox off confirmation is gone" \
+            "crates/supra_cli/src/args.rs" \
+            "disabling the sandbox is a separate flag with its own confirmation, per section 6"
+    fi
+
+    if ! scan "$clisrc/main.rs" 'offline_shape_check\(\)' | grep -q .; then
+        fail "eval no longer runs the offline shape-check first" \
+            "crates/supra_cli/src/main.rs" \
+            "the shape-check is what always runs in CI; live is the exception, not the rule"
+    fi
+
+    # `scan_sql`: `"skipped"` is a literal, blanked by plain `scan` - same
+    # lesson, third restatement.
+    if ! scan_sql "$clisrc/main.rs" 'Ok\("skipped"\)' | grep -q .; then
+        fail "the live-probe skip is no longer explicit" \
+            "crates/supra_cli/src/main.rs" \
+            "a probe that cannot run must say so; silence reads as a pass"
+    fi
+
+    # `scan_sql`: the refusal text is a literal inside `anyhow::bail!`, and
+    # plain `scan` blanks literals - the same lesson as the thinking-display
+    # cost guard in T29. The `Ok("skipped")` above stays on `scan`: it is an
+    # identifier, not a literal.
+    if ! scan_sql "$clisrc/main.rs" 'refuses without a verified signature' | grep -q .; then
+        fail "update apply no longer refuses an unverified artefact" \
+            "crates/supra_cli/src/main.rs" \
+            "fetch, verify, then apply - in that order, or it is a download"
+    fi
+
+    if ! scan_sql "$clisrc/main.rs" 'supra_update::verify' | grep -q .; then
+        fail "update check no longer names the verifier" \
+            "crates/supra_cli/src/main.rs" \
+            "the check must say what verifies the artefact, via scan_sql since the name lives in a literal"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # T28.5 - theme guards
 #
 # The per-glyph probing is the T2 finding made executable; the banner
