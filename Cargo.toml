@@ -248,3 +248,13 @@ lto = "thin"
 codegen-units = 4
 strip = "none"
 debug = 1
+
+# The Anthropic SDK pins reqwest's default features, which pull native-tls
+# and openssl into the graph; this tree is rustls-only by policy (deny.toml
+# bans both crates). The SDK exposes no feature to turn its reqwest defaults
+# off, so the one-line fix ships as a vendored copy: identical to
+# anthropic-sdk-rust 0.1.1 except `default-features = false` plus
+# `rustls-tls` on its reqwest dependency. Every other byte matches the
+# published crate; re-vendor when the SDK publishes an upstream fix.
+[patch.crates-io]
+anthropic-sdk-rust = { path = "vendor/anthropic-sdk-rust" }
