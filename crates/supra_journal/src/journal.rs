@@ -217,11 +217,18 @@ impl Journal {
     /// slash command, a TUI surface) can show the file and the time before
     /// committing to it. Choosing is still the caller's job.
     ///
+    /// The path is resolved the way [`Journal::snapshot`] resolves it, so a
+    /// report asked through a symlinked directory (macOS `$TMPDIR` resolves
+    /// through `/var/folders` to `/private/var`) names the snapshots taken
+    /// through that same symlink rather than finding none. A path that
+    /// cannot be resolved reads as empty - the caller named a file no
+    /// snapshot ever saw.
+    ///
     /// # Errors
     ///
     /// [`JournalError::Store`] when the store refuses.
     pub fn newest_for_path(&self, path: impl AsRef<Path>) -> Result<Option<SnapshotRow>, JournalError> {
-        let path_text = path.as_ref().to_string_lossy().into_owned();
+        let path_text = resolved_path_text(path)?;
         self.store.with_transaction::<_, JournalError>(TransactionBehavior::Deferred, |transaction| {
             Ok(schema::newest_for_path(transaction, &path_text)?)
         })
@@ -230,17 +237,27 @@ impl Journal {
     /// How many snapshots are stored for one path, undone or not.
     ///
     /// A budget the operator can watch: an unbounded stack is a disk cost
-    /// nobody asked for, and later stages prune on this number.
+    /// nobody asked for, and later stages prune on this number. Resolved
+    /// like [`newest_for_path`] for the same reason.
     ///
     /// # Errors
     ///
     /// [`JournalError::Store`] when the store refuses.
     pub fn count_for_path(&self, path: impl AsRef<Path>) -> Result<i64, JournalError> {
-        let path_text = path.as_ref().to_string_lossy().into_owned();
+        let path_text = resolved_path_text(path)?;
         self.store.with_transaction::<_, JournalError>(TransactionBehavior::Deferred, |transaction| {
             Ok(schema::count_for_path(transaction, &path_text)?)
         })
     }
+}
+
+/// The path text a snapshot row stores: absolute and symlink-resolved.
+///
+/// One resolver for insert and query, because two spellings of one file are
+/// two different keys in the table - macOS `$TMPDIR` proves it.
+fn resolved_path_text(path: impl AsRef<Path>) -> Result<String, JournalError> {
+    let canonical = std::fs::canonicalize(path)?;
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 impl core::fmt::Debug for Journal {
@@ -520,7 +537,7 @@ mod tests {
         let row = journal
             .store
             .with_transaction::<_, JournalError>(TransactionBehavior::Deferred, |transaction| {
-                Ok(crate::schema::newest_for_path(transaction, file.to_str().expect("utf-8"))
+                Ok(schema::newest_for_path(transaction, &resolved_path_text(&file)?)
                     .expect("read")
                     .expect("present"))
             })
@@ -532,6 +549,33 @@ mod tests {
             "created_at must come from the id, not a second clock read"
         );
         assert_eq!(row.snapshot, id);
+    }
+
+    #[test]
+    fn a_symlinked_temp_directory_reports_its_snapshots() {
+        // macOS CI proved the shape: $TMPDIR resolves through /var/folders
+        // to /private/var, snapshot stored the resolved path, and a query
+        // asked through the unresolved spelling found nothing. Reproduced
+        // here with a symlink on any Unix, so the regression guards Linux
+        // too.
+        let (journal, dir) = journal();
+        let file = dir.join("a.rs");
+        write_file(&file, b"x");
+        let _id = journal.snapshot(&file).expect("snapshot");
+
+        #[cfg(unix)]
+        {
+            let linked = dir.join("linked");
+            std::os::unix::fs::symlink(&dir, &linked).expect("symlink");
+            let through_link = linked.join("a.rs");
+            assert_eq!(std::fs::read(&through_link).expect("read"), b"x");
+            let count = journal.count_for_path(&through_link).expect("count");
+            assert_eq!(count, 1, "a query through the symlink finds the snapshot");
+            assert!(
+                journal.newest_for_path(&through_link).expect("report").is_some(),
+                "the newest report resolves the path the way snapshot did"
+            );
+        }
     }
 
     #[test]
