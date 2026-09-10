@@ -73,7 +73,11 @@ jobs:
 
       - name: Package
         shell: bash
-        run: bash scripts/package.sh "${{ matrix.target }}"
+        run: |
+          bash scripts/package.sh "${{ matrix.target }}"
+          if [[ "${{ matrix.target }}" == *linux* ]]; then
+            bash scripts/package-os.sh "${{ matrix.target }}" "${{ github.ref_name }}"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -109,3 +113,15 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          body: |
+            ## Install
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/Anonnymous0071/supra-harness/main/scripts/install.sh | bash
+            ```
+
+            Or grab the artefact for your platform below: `.tar.gz` everywhere,
+            `.deb`/`.rpm` on Linux, or `brew install --formula
+            https://raw.githubusercontent.com/Anonnymous0071/supra-harness/main/packaging/homebrew/supra.rb`
+            (replace the `REPLACE_WITH_*` hashes with the ones in `SHA256SUMS`).
+            `cargo install supra_cli` works once the crate is published.

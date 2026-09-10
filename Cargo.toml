@@ -44,7 +44,7 @@ members = [
 # `field.workspace = true` so version/licence/MSRV live in exactly one place.
 # ---------------------------------------------------------------------------
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -75,33 +75,33 @@ authors = ["supra-harness contributors"]
 # version literal in exactly one place - Cargo has no `version.workspace = true`
 # inside a dependency spec, so one literal is unavoidable, and
 # `scripts/check-invariants.sh` asserts it still matches `workspace.package.version`.
-supra_types = { path = "crates/supra_types", version = "0.1.0" }
-supra_config = { path = "crates/supra_config", version = "0.1.0" }
-supra_store = { path = "crates/supra_store", version = "0.1.0" }
+supra_types = { path = "crates/supra_types", version = "0.2.0" }
+supra_config = { path = "crates/supra_config", version = "0.2.0" }
+supra_store = { path = "crates/supra_store", version = "0.2.0" }
 libc = "0.2.189"
-supra_secrets = { path = "crates/supra_secrets", version = "0.1.0" }
-supra_log = { path = "crates/supra_log", version = "0.1.0" }
-supra_guard = { path = "crates/supra_guard", version = "0.1.0" }
-supra_ffi = { path = "crates/supra_ffi", version = "0.1.0" }
-supra_llm = { path = "crates/supra_llm", version = "0.1.0" }
-supra_prompt = { path = "crates/supra_prompt", version = "0.1.0" }
-supra_cohort = { path = "crates/supra_cohort", version = "0.1.0" }
-supra_ast = { path = "crates/supra_ast", version = "0.1.0" }
-supra_digest = { path = "crates/supra_digest", version = "0.1.0" }
-supra_sandbox = { path = "crates/supra_sandbox", version = "0.1.0" }
-supra_shell = { path = "crates/supra_shell", version = "0.1.0" }
-supra_journal = { path = "crates/supra_journal", version = "0.1.0" }
-supra_permission = { path = "crates/supra_permission", version = "0.1.0" }
-supra_tool = { path = "crates/supra_tool", version = "0.1.0" }
-supra_mcp = { path = "crates/supra_mcp", version = "0.1.0" }
-supra_skill = { path = "crates/supra_skill", version = "0.1.0" }
-supra_plugin = { path = "crates/supra_plugin", version = "0.1.0" }
-supra_blackboard = { path = "crates/supra_blackboard", version = "0.1.0" }
-supra_introspector = { path = "crates/supra_introspector", version = "0.1.0" }
-supra_core = { path = "crates/supra_core", version = "0.1.0" }
-supra_lsp = { path = "crates/supra_lsp", version = "0.1.0" }
-supra_dap = { path = "crates/supra_dap", version = "0.1.0" }
-supra_session = { path = "crates/supra_session", version = "0.1.0" }
+supra_secrets = { path = "crates/supra_secrets", version = "0.2.0" }
+supra_log = { path = "crates/supra_log", version = "0.2.0" }
+supra_guard = { path = "crates/supra_guard", version = "0.2.0" }
+supra_ffi = { path = "crates/supra_ffi", version = "0.2.0" }
+supra_llm = { path = "crates/supra_llm", version = "0.2.0" }
+supra_prompt = { path = "crates/supra_prompt", version = "0.2.0" }
+supra_cohort = { path = "crates/supra_cohort", version = "0.2.0" }
+supra_ast = { path = "crates/supra_ast", version = "0.2.0" }
+supra_digest = { path = "crates/supra_digest", version = "0.2.0" }
+supra_sandbox = { path = "crates/supra_sandbox", version = "0.2.0" }
+supra_shell = { path = "crates/supra_shell", version = "0.2.0" }
+supra_journal = { path = "crates/supra_journal", version = "0.2.0" }
+supra_permission = { path = "crates/supra_permission", version = "0.2.0" }
+supra_tool = { path = "crates/supra_tool", version = "0.2.0" }
+supra_mcp = { path = "crates/supra_mcp", version = "0.2.0" }
+supra_skill = { path = "crates/supra_skill", version = "0.2.0" }
+supra_plugin = { path = "crates/supra_plugin", version = "0.2.0" }
+supra_blackboard = { path = "crates/supra_blackboard", version = "0.2.0" }
+supra_introspector = { path = "crates/supra_introspector", version = "0.2.0" }
+supra_core = { path = "crates/supra_core", version = "0.2.0" }
+supra_lsp = { path = "crates/supra_lsp", version = "0.2.0" }
+supra_dap = { path = "crates/supra_dap", version = "0.2.0" }
+supra_session = { path = "crates/supra_session", version = "0.2.0" }
 # provider SDKs (T13): official OpenAI client; Anthropic Messages client.
 # The full OpenAI API surface is enabled (chat, responses, realtime,
 # audio, images, video, embeddings, files, batches, vectorstores, admin,
@@ -110,16 +110,16 @@ supra_session = { path = "crates/supra_session", version = "0.1.0" }
 # `anthropic_sdk`.
 async-openai = { version = "0.42.0", default-features = false, features = ["full", "rustls"] }
 anthropic_sdk = { version = "0.1.1", package = "anthropic-sdk-rust" }
-supra_hook = { path = "crates/supra_hook", version = "0.1.0" }
-supra_telemetry = { path = "crates/supra_telemetry", version = "0.1.0" }
-supra_command = { path = "crates/supra_command", version = "0.1.0" }
-supra_theme = { path = "crates/supra_theme", version = "0.1.0" }
-supra_tui = { path = "crates/supra_tui", version = "0.1.0" }
-supra_update = { path = "crates/supra_update", version = "0.1.0" }
-supra_eval = { path = "crates/supra_eval", version = "0.1.0" }
-supra_cli = { path = "crates/supra_cli", version = "0.1.0" }
-supra_eventbus = { path = "crates/supra_eventbus", version = "0.1.0" }
-supra_vector = { path = "crates/supra_vector", version = "0.1.0" }
+supra_hook = { path = "crates/supra_hook", version = "0.2.0" }
+supra_telemetry = { path = "crates/supra_telemetry", version = "0.2.0" }
+supra_command = { path = "crates/supra_command", version = "0.2.0" }
+supra_theme = { path = "crates/supra_theme", version = "0.2.0" }
+supra_tui = { path = "crates/supra_tui", version = "0.2.0" }
+supra_update = { path = "crates/supra_update", version = "0.2.0" }
+supra_eval = { path = "crates/supra_eval", version = "0.2.0" }
+supra_cli = { path = "crates/supra_cli", version = "0.2.0" }
+supra_eventbus = { path = "crates/supra_eventbus", version = "0.2.0" }
+supra_vector = { path = "crates/supra_vector", version = "0.2.0" }
 
 # async runtime + streams
 tokio = { version = "1.53.1", default-features = false }

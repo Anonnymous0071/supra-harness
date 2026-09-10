@@ -3337,7 +3337,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "supra_ast"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_digest",
  "supra_types",
@@ -3354,7 +3354,7 @@ dependencies = [
 
 [[package]]
 name = "supra_blackboard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "supra_store",
@@ -3364,7 +3364,7 @@ dependencies = [
 
 [[package]]
 name = "supra_cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3395,7 +3395,7 @@ dependencies = [
 
 [[package]]
 name = "supra_cohort"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "supra_types",
@@ -3403,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "supra_command"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_types",
  "thiserror 2.0.20",
@@ -3411,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "supra_config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "supra_core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_blackboard",
  "supra_eventbus",
@@ -3435,7 +3435,7 @@ dependencies = [
 
 [[package]]
 name = "supra_dap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3447,7 +3447,7 @@ dependencies = [
 
 [[package]]
 name = "supra_digest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "notify",
@@ -3468,7 +3468,7 @@ dependencies = [
 
 [[package]]
 name = "supra_eval"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3480,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "supra_eventbus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_types",
  "thiserror 2.0.20",
@@ -3488,7 +3488,7 @@ dependencies = [
 
 [[package]]
 name = "supra_ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "cmake",
@@ -3497,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "supra_guard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.4.3",
  "hmac 0.13.0",
@@ -3510,7 +3510,7 @@ dependencies = [
 
 [[package]]
 name = "supra_hook"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "supra_eventbus",
@@ -3520,7 +3520,7 @@ dependencies = [
 
 [[package]]
 name = "supra_introspector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_blackboard",
  "supra_ffi",
@@ -3531,7 +3531,7 @@ dependencies = [
 
 [[package]]
 name = "supra_journal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "supra_store",
@@ -3541,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "supra_llm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anthropic-sdk-rust",
  "async-openai",
@@ -3558,7 +3558,7 @@ dependencies = [
 
 [[package]]
 name = "supra_log"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "supra_ffi",
@@ -3570,7 +3570,7 @@ dependencies = [
 
 [[package]]
 name = "supra_lsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3583,7 +3583,7 @@ dependencies = [
 
 [[package]]
 name = "supra_mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "reqwest 0.13.4",
  "rusqlite",
@@ -3599,7 +3599,7 @@ dependencies = [
 
 [[package]]
 name = "supra_permission"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_types",
  "thiserror 2.0.20",
@@ -3607,7 +3607,7 @@ dependencies = [
 
 [[package]]
 name = "supra_plugin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_types",
  "thiserror 2.0.20",
@@ -3616,7 +3616,7 @@ dependencies = [
 
 [[package]]
 name = "supra_prompt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_store",
  "supra_types",
@@ -3625,7 +3625,7 @@ dependencies = [
 
 [[package]]
 name = "supra_sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_ffi",
  "supra_guard",
@@ -3635,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "supra_secrets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "getrandom 0.4.3",
@@ -3651,7 +3651,7 @@ dependencies = [
 
 [[package]]
 name = "supra_session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "supra_eventbus",
@@ -3662,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "supra_shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_ffi",
  "supra_guard",
@@ -3673,7 +3673,7 @@ dependencies = [
 
 [[package]]
 name = "supra_skill"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "notify",
  "supra_types",
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "supra_store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -3692,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "supra_telemetry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "supra_theme"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_ffi",
  "supra_types",
@@ -3710,7 +3710,7 @@ dependencies = [
 
 [[package]]
 name = "supra_tool"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "supra_llm",
@@ -3721,7 +3721,7 @@ dependencies = [
 
 [[package]]
 name = "supra_tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "supra_ffi",
  "supra_theme",
@@ -3729,7 +3729,7 @@ dependencies = [
 
 [[package]]
 name = "supra_types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "serde",
@@ -3740,7 +3740,7 @@ dependencies = [
 
 [[package]]
 name = "supra_update"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "minisign-verify",
  "semver",
@@ -3751,7 +3751,7 @@ dependencies = [
 
 [[package]]
 name = "supra_vector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "supra_store",
