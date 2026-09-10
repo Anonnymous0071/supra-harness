@@ -86,6 +86,17 @@ impl DependencyGraph {
         }
     }
 
+    /// Drop a file's module and its outgoing edges.
+    ///
+    /// The mirror of [`DependencyGraph::record_imports`]: a removed or
+    /// re-read file must not keep the edges its old content declared,
+    /// or the blast radius of a change would include dependents that
+    /// stopped depending on it.
+    pub fn remove_file(&mut self, path: &Path) {
+        self.modules.retain(|_, file| file != path);
+        self.edges.retain(|edge| edge.from != path);
+    }
+
     /// Resolve a module path to a file inside the root, if it is internal.
     #[must_use]
     pub fn resolve(&self, module: &str) -> Option<&PathBuf> {

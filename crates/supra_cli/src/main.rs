@@ -14,7 +14,7 @@ mod registry;
 mod runtime;
 mod startup;
 
-use args::{Cli, Command, ConfigAction, UpdateAction};
+use args::{Cli, Command, ConfigAction, SandboxArg, UpdateAction};
 use clap::Parser;
 
 fn main() -> anyhow::Result<()> {
@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
         Command::Run => run(cli),
         Command::Eval { live } => eval_cmd(live),
         Command::Update { action } => update_cmd(action),
-        Command::Config { action } => config_cmd(action),
+        Command::Config { action } => config_cmd(&cli, action),
     }
 }
 
@@ -35,7 +35,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let log = startup::init_logging(&cli)?;
     let secrets = startup::open_secrets(&cli);
     let _ = secrets.primary_backend();
-    let sandbox_off = cli.sandbox.eq_ignore_ascii_case("off");
+    let sandbox_off = cli.sandbox == SandboxArg::Off;
     let wired = registry::wire(&config);
     let assembled = startup::assemble(config, log, sandbox_off);
     let estimated = runtime::estimate_tier();
@@ -108,11 +108,10 @@ fn update_cmd(action: UpdateAction) -> anyhow::Result<()> {
     }
 }
 
-fn config_cmd(action: ConfigAction) -> anyhow::Result<()> {
-    let cli = Cli::parse();
+fn config_cmd(cli: &Cli, action: ConfigAction) -> anyhow::Result<()> {
     match action {
         ConfigAction::Show => {
-            let config = startup::discover_resolve(&cli)?;
+            let config = startup::discover_resolve(cli)?;
             for setting in supra_config::Setting::ALL {
                 println!("{} = {:?}", setting.path(), config.source_of(setting));
             }

@@ -66,17 +66,21 @@ impl ThinkingDisposition {
 ///
 /// `Keep` renders every block verbatim.
 ///
-/// `Drop` renders every block except `Thinking`. A `ToolResult` without its `ToolUse`
-/// can never reach here: a turn holding a result always holds the call, because
-/// dropping the call while keeping the result would leave an unanswered invocation,
-/// which every provider rejects.
+/// `Drop` renders every block except unsigned `Thinking`. A signature-bearing
+/// thinking block is opaque provider state - the API requires it back byte-exact
+/// wherever the conversation continues - so it survives eviction even in a prose-only
+/// turn. A `ToolResult` without its `ToolUse` can never reach here: a turn holding a
+/// result always holds the call, because dropping the call while keeping the result
+/// would leave an unanswered invocation, which every provider rejects.
 #[must_use]
 pub fn render_body(blocks: &[Block], disposition: ThinkingDisposition) -> Vec<Block> {
     match disposition {
         ThinkingDisposition::Keep => blocks.to_vec(),
-        ThinkingDisposition::Drop => {
-            blocks.iter().filter(|block| !matches!(block, Block::Thinking { .. })).cloned().collect()
-        }
+        ThinkingDisposition::Drop => blocks
+            .iter()
+            .filter(|block| !matches!(block, Block::Thinking { signature: None, .. }))
+            .cloned()
+            .collect(),
     }
 }
 
@@ -198,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prose_turn_drops_its_thinking() {
+    fn a_prose_turn_drops_its_unsigned_thinking_only() {
         let segment = Sealed::seal(
             SeqNo::ZERO,
             Segment::new(
@@ -206,6 +210,7 @@ mod tests {
                 SegmentKind::Turn { turn: TurnId::generate(), role: Role::Assistant },
                 vec![
                     Block::Thinking { text: "hmm".to_owned(), signature: None },
+                    Block::Thinking { text: "opaque".to_owned(), signature: Some("sig".to_owned()) },
                     Block::Text("answer".to_owned()),
                 ],
             )
@@ -213,7 +218,14 @@ mod tests {
         );
         let (body, disposition) = plan_eviction(&segment);
         assert_eq!(disposition, ThinkingDisposition::Drop);
-        assert_eq!(body, vec![Block::Text("answer".to_owned())]);
+        assert_eq!(
+            body,
+            vec![
+                Block::Thinking { text: "opaque".to_owned(), signature: Some("sig".to_owned()) },
+                Block::Text("answer".to_owned()),
+            ],
+            "unsigned thinking goes, signed thinking stays verbatim"
+        );
     }
 
     #[test]

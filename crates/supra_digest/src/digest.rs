@@ -86,19 +86,7 @@ impl Digest {
     pub fn open_with_rescan(root: PathBuf, store: Arc<Store>, rescan_secs: u64) -> Result<Self, DigestError> {
         let mut index = SymbolIndex::new(root.clone());
         let stats = scan_tree(&mut index, &root)?;
-        let mut graph = crate::graph::DependencyGraph::new();
-        for path in index.indexed_paths() {
-            graph.register_module(&path);
-        }
-        // Second pass: imports need every module registered before any resolves.
-        for path in index.indexed_paths() {
-            let absolute = root.join(&path);
-            let Ok(source) = std::fs::read(&absolute) else { continue };
-            let text = String::from_utf8_lossy(&source);
-            let Some(language) = crate::symbol::Language::detect(&path) else { continue };
-            let targets = crate::graph::import_targets(language, &text);
-            graph.record_imports(&path, &targets);
-        }
+        let graph = build_graph(&root, &index);
         let _ = stats;
         Ok(Self {
             root,
@@ -326,11 +314,16 @@ impl Digest {
     ///
     /// Create/modify re-reads the file and re-indexes its bytes (unchanged bytes
     /// re-parse nothing - the fingerprint short-circuits); remove drops the entry.
-    /// Anything else (chmod, atime) is ignored after the fingerprint check.
+    /// The dependency graph moves with the index both ways: a re-read file drops
+    /// its old edges and re-records the imports the new bytes declare, and a
+    /// removed file drops its module and edges with it. Anything else (chmod,
+    /// atime) is ignored after the fingerprint check.
     pub fn apply_event(&self, event: &notify::Event) {
         for path in &event.paths {
+            let relative = relative_to(&self.root, path);
             if event.kind.is_remove() {
                 self.index_mut().remove_file(path);
+                self.graph_mut().remove_file(&relative);
                 continue;
             }
             if !(event.kind.is_create() || event.kind.is_modify()) {
@@ -341,10 +334,18 @@ impl Digest {
                 continue;
             }
             self.index_mut().index_bytes(path, &source);
-            // The graph follows: re-register the module and re-record its imports.
-            // A file that became unparseable drops its edges with its symbols -
-            // `index_bytes` removed the entry, so rebuild from what remains.
-            self.graph_mut().register_module(&relative_to(&self.root, path));
+            let text = String::from_utf8_lossy(&source).into_owned();
+            let language = crate::symbol::Language::detect(&relative);
+            let still_indexed = self.index().indexed_paths().contains(&relative);
+            let mut graph = self.graph_mut();
+            graph.remove_file(&relative);
+            if still_indexed {
+                graph.register_module(&relative);
+                if let Some(language) = language {
+                    let targets = crate::graph::import_targets(language, &text);
+                    graph.record_imports(&relative, &targets);
+                }
+            }
         }
     }
 
@@ -365,7 +366,9 @@ impl Digest {
         }
         let mut index = SymbolIndex::new(self.root.clone());
         scan_tree(&mut index, &self.root)?;
+        let graph = build_graph(&self.root, &index);
         *self.index_mut_guard() = index;
+        *self.graph_mut() = graph;
         *self.last_scan_ms_mut() = now_ms();
         Ok(())
     }
@@ -404,6 +407,24 @@ fn relative_to(root: &Path, path: &Path) -> PathBuf {
         return relative.to_path_buf();
     }
     path.to_path_buf()
+}
+
+/// Build the dependency graph over an index: modules first, imports
+/// second, because an import resolves only against a registered module.
+fn build_graph(root: &Path, index: &SymbolIndex) -> crate::graph::DependencyGraph {
+    let mut graph = crate::graph::DependencyGraph::new();
+    for path in index.indexed_paths() {
+        graph.register_module(&path);
+    }
+    for path in index.indexed_paths() {
+        let absolute = root.join(&path);
+        let Ok(source) = std::fs::read(&absolute) else { continue };
+        let text = String::from_utf8_lossy(&source);
+        let Some(language) = crate::symbol::Language::detect(&path) else { continue };
+        let targets = crate::graph::import_targets(language, &text);
+        graph.record_imports(&path, &targets);
+    }
+    graph
 }
 
 /// Split a task description into lowercase identifier terms.
@@ -682,5 +703,54 @@ mod tests {
             attrs: notify::event::EventAttributes::default(),
         });
         assert!(digest.symbols_named("alpha").is_empty());
+    }
+
+    #[test]
+    fn a_changed_file_drops_the_imports_its_old_bytes_declared() {
+        use notify::EventKind;
+
+        let scratch = scratch::Scratch::new();
+        scratch.write("src/turns.rs", "fn recall_turn() {}\n");
+        let main = scratch.write("src/main.rs", "use crate::turns::recall_turn;\nfn main() {}\n");
+        let store = test_store();
+        let digest = Digest::open(scratch.path().to_path_buf(), Arc::clone(&store)).expect("open");
+        let radius = digest.blast_radius(Path::new("src/turns.rs"));
+        assert!(radius.contains(&PathBuf::from("src/main.rs")), "the import edge exists: {radius:?}");
+
+        std::fs::write(&main, "fn main() {}\n").expect("rewrite without the import");
+        digest.apply_event(&notify::Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(notify::event::DataChange::Content)),
+            paths: vec![main],
+            attrs: notify::event::EventAttributes::default(),
+        });
+
+        let radius = digest.blast_radius(Path::new("src/turns.rs"));
+        assert!(
+            !radius.contains(&PathBuf::from("src/main.rs")),
+            "the edge the old bytes declared is gone: {radius:?}"
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_drops_its_edges() {
+        use notify::EventKind;
+
+        let scratch = scratch::Scratch::new();
+        scratch.write("src/turns.rs", "fn recall_turn() {}\n");
+        let main = scratch.write("src/main.rs", "use crate::turns::recall_turn;\nfn main() {}\n");
+        let store = test_store();
+        let digest = Digest::open(scratch.path().to_path_buf(), Arc::clone(&store)).expect("open");
+        assert!(digest.blast_radius(Path::new("src/turns.rs")).contains(&PathBuf::from("src/main.rs")));
+
+        std::fs::remove_file(&main).expect("delete main");
+        digest.apply_event(&notify::Event {
+            kind: EventKind::Remove(notify::event::RemoveKind::File),
+            paths: vec![main],
+            attrs: notify::event::EventAttributes::default(),
+        });
+
+        let radius = digest.blast_radius(Path::new("src/turns.rs"));
+        assert!(!radius.contains(&PathBuf::from("src/main.rs")), "a deleted file has no edges: {radius:?}");
+        assert!(!radius.is_empty(), "the target itself remains: {radius:?}");
     }
 }

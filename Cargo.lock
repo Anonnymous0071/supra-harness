@@ -2876,6 +2876,7 @@ dependencies = [
  "serde",
  "serde_json",
  "supra_digest",
+ "supra_ffi",
  "supra_types",
  "thiserror 2.0.20",
 ]
@@ -2927,6 +2928,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "cmake",
+ "libc",
 ]
 
 [[package]]
@@ -2957,6 +2959,7 @@ name = "supra_introspector"
 version = "0.1.0"
 dependencies = [
  "supra_blackboard",
+ "supra_ffi",
  "supra_store",
  "supra_types",
  "thiserror 2.0.20",
@@ -2992,6 +2995,7 @@ name = "supra_log"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "supra_ffi",
  "supra_types",
  "thiserror 2.0.20",
  "tracing",
@@ -3006,6 +3010,7 @@ dependencies = [
  "serde_json",
  "supra_ast",
  "supra_digest",
+ "supra_ffi",
  "supra_types",
  "thiserror 2.0.20",
 ]
@@ -3173,6 +3178,8 @@ version = "0.1.0"
 dependencies = [
  "minisign-verify",
  "semver",
+ "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
 ]
 
@@ -3339,6 +3346,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

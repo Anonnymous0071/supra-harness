@@ -113,16 +113,25 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
 
-        let existing: Option<Vec<u8>> = transaction
-            .query_row("SELECT body_hash FROM evicted_turn WHERE turn_id = ?1", [&id], |row| row.get(0))
+        let existing: Option<(Vec<u8>, Vec<u8>)> = transaction
+            .query_row("SELECT body, body_hash FROM evicted_turn WHERE turn_id = ?1", [&id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()
             .map_err(StoreError::Sqlite)?;
 
-        if let Some(stored_bytes) = existing {
+        if let Some((stored_body, stored_bytes)) = existing {
             let stored = decode_digest(&stored_bytes, turn)?;
             if stored == digest {
-                // Same turn, same bytes: a retry. Nothing to do, and not an error.
-                return Ok(digest);
+                // Same turn, same digest: only a retry when the stored bytes still
+                // match it. A row whose body was damaged in place keeps its hash
+                // column, so treating it as idempotent would let the caller discard
+                // its last good copy over silently corrupted data.
+                if body_digest(&stored_body) == digest {
+                    return Ok(digest);
+                }
+                let computed = body_digest(&stored_body);
+                return Err(StoreError::Corrupt { turn, stored, computed });
             }
             return Err(StoreError::Conflict { turn, stored, offered: digest });
         }
@@ -480,6 +489,31 @@ mod tests {
         }
 
         assert!(matches!(store.recall_turn(turn), Err(StoreError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn a_tampered_body_makes_the_eviction_retry_refuse_not_certify() {
+        // Idempotence must be earned by the bytes, not the digest column alone: a row
+        // damaged in place keeps its hash, so a retry that compared only hashes would
+        // tell the caller "already stored, safe to drop your copy" over corrupted data.
+        let store = store();
+        let turn = TurnId::generate();
+        store.evict_turn(turn, b"the real conversation").expect("evict");
+
+        {
+            let connection = store.connection();
+            connection
+                .execute(
+                    "UPDATE evicted_turn SET body = ?1, byte_len = length(?1) WHERE turn_id = ?2",
+                    rusqlite::params![b"a forged conversation".as_slice(), turn.to_string()],
+                )
+                .expect("tamper");
+        }
+
+        match store.evict_turn(turn, b"the real conversation") {
+            Err(error @ StoreError::Corrupt { .. }) => assert!(error.is_damage(), "{error}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1,19 +1,33 @@
 /// One telemetry report: what a session did, with no way to tell which
 /// session did it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Report {
-    /// A random per-report id, not the session id: the session id is
-    /// the identity a resume restores, and a report that carried it
-    /// would let two reports be tied to one person.
-    pub report: supra_types::SessionId,
-    /// The cohort tier the session ran at.
-    pub tier: supra_types::Tier,
-    /// Turns completed.
-    pub turns: u32,
-    /// Tool invocations that ran.
-    pub tools: u32,
-    /// Cache hits among provider requests.
-    pub cache_hits: u32,
+    /// A fresh, uncorrelated identity: not the session id, and not
+    /// anything two reports could be joined on. Constructed only by
+    /// [`Counters::report`], so a caller cannot smuggle a session id in
+    /// where a report id belongs.
+    identity: ReportId,
+    tier: supra_types::Tier,
+    turns: u32,
+    tools: u32,
+    cache_hits: u32,
+}
+
+/// The opaque identity of one report.
+///
+/// Wraps a ULID the same shape as the other identities in the system,
+/// but the wrapping type is the point: a `ReportId` cannot be built
+/// from a [`supra_types::SessionId`], so the linkable field cannot hold
+/// linkable data by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ReportId(supra_types::SessionId);
+
+impl ReportId {
+    /// The textual spelling, for a log line or a header.
+    #[must_use]
+    pub fn as_str(&self) -> String {
+        self.0.to_string()
+    }
 }
 
 /// The counts a session accumulates before its first report.
@@ -49,12 +63,44 @@ impl Counters {
     #[must_use]
     pub fn report(&self, tier: supra_types::Tier) -> Report {
         Report {
-            report: supra_types::SessionId::generate(),
+            identity: ReportId(supra_types::SessionId::generate()),
             tier,
             turns: self.turns,
             tools: self.tools,
             cache_hits: self.cache_hits,
         }
+    }
+}
+
+impl Report {
+    /// The report's own identity.
+    #[must_use]
+    pub const fn id(&self) -> ReportId {
+        self.identity
+    }
+
+    /// The cohort tier the session ran at.
+    #[must_use]
+    pub const fn tier(&self) -> supra_types::Tier {
+        self.tier
+    }
+
+    /// Turns completed.
+    #[must_use]
+    pub const fn turns(&self) -> u32 {
+        self.turns
+    }
+
+    /// Tool invocations that ran.
+    #[must_use]
+    pub const fn tools(&self) -> u32 {
+        self.tools
+    }
+
+    /// Cache hits among provider requests.
+    #[must_use]
+    pub const fn cache_hits(&self) -> u32 {
+        self.cache_hits
     }
 }
 
@@ -71,10 +117,10 @@ mod tests {
         counters.cache_hit();
 
         let report = counters.report(supra_types::Tier::E2);
-        assert_eq!(report.turns, 2);
-        assert_eq!(report.tools, 1);
-        assert_eq!(report.cache_hits, 1);
-        assert_eq!(report.tier, supra_types::Tier::E2);
+        assert_eq!(report.turns(), 2);
+        assert_eq!(report.tools(), 1);
+        assert_eq!(report.cache_hits(), 1);
+        assert_eq!(report.tier(), supra_types::Tier::E2);
     }
 
     #[test]
@@ -82,16 +128,16 @@ mod tests {
         let counters = Counters { turns: 5, tools: 3, cache_hits: 2 };
         let first = counters.report(supra_types::Tier::E1);
         let second = counters.report(supra_types::Tier::E1);
-        assert_ne!(first.report, second.report, "the report id is random per report");
-        assert_eq!(first.turns, second.turns, "the counts are the counts");
+        assert_ne!(first.id(), second.id(), "the report id is random per report");
+        assert_eq!(first.turns(), second.turns(), "the counts are the counts");
     }
 
     #[test]
-    fn a_report_round_trips_through_json() {
+    fn a_report_serialises_without_linkable_fields() {
         let report = Counters { turns: 9, tools: 4, cache_hits: 7 }.report(supra_types::Tier::E3);
         let text = serde_json::to_string(&report).expect("serialise");
-        let back: Report = serde_json::from_str(&text).expect("parse");
-        assert_eq!(back, report);
+        assert!(text.contains("\"identity\":"), "{text}");
+        assert!(!text.contains("session"), "{text}");
         assert!(!text.contains("path"), "{text}");
         assert!(!text.contains("user"), "{text}");
     }

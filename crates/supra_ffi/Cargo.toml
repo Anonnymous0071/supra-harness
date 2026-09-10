@@ -29,6 +29,7 @@ include = [
 workspace = true
 
 [dependencies]
+libc = { workspace = true }
 
 [build-dependencies]
 cmake = "0.1.58"

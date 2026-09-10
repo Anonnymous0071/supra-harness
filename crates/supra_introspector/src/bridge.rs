@@ -21,8 +21,18 @@ pub fn append_finding(
     validators: &[AgentId],
     finding: &Finding,
 ) -> Result<ClaimId, BlackboardError> {
-    let claim = board.publish(turn, proposer, validators, &finding.summary)?;
-    Ok(claim)
+    let mut distinct = std::collections::BTreeSet::new();
+    for agent in validators {
+        if !distinct.insert(*agent) {
+            return Err(BlackboardError::Store(supra_store::StoreError::Malformed {
+                detail: format!("duplicate validator {agent}"),
+            }));
+        }
+    }
+    if distinct.contains(&proposer) {
+        return Err(BlackboardError::NotAProposer { agent: proposer, claim: ClaimId::generate() });
+    }
+    board.publish(turn, proposer, validators, &finding.summary)
 }
 
 /// Record one validator's verdict on a finding claim, with the finding's
@@ -140,7 +150,7 @@ mod tests {
             Answer { agent: agents[1], text: "fix a".to_owned() },
             Answer { agent: agents[2], text: "fix b".to_owned() },
         ];
-        let found = cross_check("the fix", &answers);
+        let found = cross_check("the fix", &answers).expect("unique agents");
         assert_eq!(found.len(), 1);
 
         let claim = append_finding(&mut board, TurnId::generate(), agents[0], &agents[1..], &found[0])

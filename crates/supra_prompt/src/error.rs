@@ -91,4 +91,19 @@ pub enum PromptError {
         /// The repeated segment identity.
         id: SegmentId,
     },
+
+    /// The ledger's regions are out of prefix order.
+    ///
+    /// The plan's breakpoints are cache-write boundaries, and a region that
+    /// appears after one it must precede (a tool manifest after a system
+    /// contract) yields offsets that would bill writes the provider can never
+    /// read back. Refused before planning rather than clamped: a clamped
+    /// offset silently moves the boundary onto the wrong segment.
+    #[error("regions are out of prefix order: {earlier} follows {later}")]
+    RegionOrder {
+        /// The region that appeared too late.
+        earlier: &'static str,
+        /// The region it followed.
+        later: &'static str,
+    },
 }

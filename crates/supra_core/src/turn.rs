@@ -42,6 +42,7 @@ pub struct Turn {
     answer: Option<String>,
     votes_seen: usize,
     steps_seen: Vec<Step>,
+    finished: bool,
 }
 
 impl Turn {
@@ -95,6 +96,7 @@ impl Turn {
             answer: None,
             votes_seen: 0,
             steps_seen: Vec::new(),
+            finished: false,
         })
     }
 
@@ -190,27 +192,49 @@ impl Turn {
         }
     }
 
-    /// Steps 8 and 13: the winning claim's body, sealed into the ledger
-    /// as the turn's answer segment.
+    /// Steps 8 and 13: the agreed answer, sealed into the ledger as the
+    /// turn's answer segment.
+    ///
+    /// The peers validated the working answer, so that is what the
+    /// ledger receives - the claim's body on the blackboard is the task
+    /// the cohort fanned out about, not the answer.
     ///
     /// # Errors
     ///
-    /// [`TurnError::EmptyClaim`] when the winning claim carries no body;
-    /// [`TurnError::Ledger`] when the ledger refuses the append.
+    /// [`TurnError::NoAnswer`] before quorum, after an escalation, or on
+    /// a second finish; [`TurnError::EmptyClaim`] when the working
+    /// answer is empty; [`TurnError::Ledger`] when the ledger refuses.
     pub fn finish(&mut self, ledger: &mut supra_prompt::PromptLedger) -> Result<SegmentId, TurnError> {
-        let body = self.blackboard.claim(self.claim).map(|stored| stored.body).unwrap_or_default();
-        if body.is_empty() {
+        if self.finished {
+            return Err(TurnError::NoAnswer("the turn is already finished".to_owned()));
+        }
+        match self.status() {
+            Some(QuorumStatus::Reached) => {}
+            Some(QuorumStatus::Open) => {
+                return Err(TurnError::NoAnswer("quorum has not been reached".to_owned()));
+            }
+            Some(QuorumStatus::Unreachable) | None => {
+                return Err(TurnError::NoAnswer(
+                    "the turn cannot finish once quorum is unreachable".to_owned(),
+                ));
+            }
+        }
+        let Some(answer) = &self.answer else {
+            return Err(TurnError::NoAnswer("quorum reached without a working answer".to_owned()));
+        };
+        if answer.is_empty() {
             return Err(TurnError::EmptyClaim);
         }
         let id = SegmentId::generate();
         let segment = Segment::new(
             id,
             SegmentKind::Turn { turn: self.id, role: Role::Assistant },
-            vec![Block::Text(body)],
+            vec![Block::Text(answer.clone())],
         )?;
         let seq = ledger.append(segment)?;
         self.bus.publish(Event::SegmentSealed { seq, hash: ledger.prefix_hash() });
         self.bus.publish(Event::TurnCompleted { turn: self.id });
+        self.finished = true;
         Ok(id)
     }
 
@@ -288,6 +312,48 @@ mod tests {
         assert_eq!(ledger.len(), 1);
         assert!(turn.answer().is_some());
         assert_ne!(id, SegmentId::generate());
+    }
+
+    #[test]
+    fn the_ledger_seals_the_agreed_answer_not_the_task() {
+        let peers = agents(3);
+        let mut turn = Turn::start(board(), Bus::new(), "the task text", peers.clone()).expect("turn");
+        turn.record(answer(peers[1], "the agreed answer")).expect("v1");
+        turn.record(answer(peers[2], "the agreed answer")).expect("v2");
+
+        let mut ledger = supra_prompt::PromptLedger::new();
+        turn.finish(&mut ledger).expect("finish");
+        let sealed: Vec<String> = ledger
+            .segments()
+            .iter()
+            .flat_map(|entry| entry.blocks().iter())
+            .filter_map(|block| match block {
+                Block::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(sealed.contains(&"the agreed answer".to_owned()), "{sealed:?}");
+        assert!(!sealed.contains(&"the task text".to_owned()), "{sealed:?}");
+
+        let error = turn.finish(&mut ledger).expect_err("second finish");
+        assert!(matches!(error, TurnError::NoAnswer(_)));
+    }
+
+    #[test]
+    fn finish_is_refused_before_quorum_and_after_escalation() {
+        let peers = agents(2);
+        let mut turn = Turn::start(board(), Bus::new(), "task", peers.clone()).expect("turn");
+        turn.record(answer(peers[1], "an answer")).expect("v1");
+        let mut ledger = supra_prompt::PromptLedger::new();
+        assert!(turn.finish(&mut ledger).is_err(), "open quorum cannot finish");
+
+        let cohort = agents(4);
+        let mut escalated = Turn::start(board(), Bus::new(), "task", cohort.clone()).expect("turn");
+        for peer in &cohort[1..] {
+            let _ = escalated.record(answer(*peer, &format!("answer from {peer:?}")));
+        }
+        assert_eq!(escalated.steps().last(), Some(&Step::Escalate));
+        assert!(escalated.finish(&mut ledger).is_err(), "escalated cannot finish");
     }
 
     #[test]

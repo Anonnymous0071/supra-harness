@@ -18,6 +18,7 @@ workspace = true
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+supra_ffi = { workspace = true }
 
 # `supra_types` is needed only by the test that proves a `ContentHash` survives
 # redaction. The redactor itself is string-in, string-out, so the shipped crate

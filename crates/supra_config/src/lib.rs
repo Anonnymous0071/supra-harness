@@ -142,12 +142,24 @@ impl Loader {
     /// A working directory that cannot be read leaves the project layer absent rather
     /// than failing: supra is still usable, and a hard failure here would make an
     /// unrelated permission problem look like a configuration error.
+    ///
+    /// `vars_os` keeps an unrelated non-UTF-8 variable from panicking startup; such
+    /// entries are skipped, as are `SUPRA_` entries whose value is not valid UTF-8.
     #[must_use]
     pub fn from_environment() -> Self {
         Self {
             user_path: discover::user_config_path(),
             project_start: std::env::current_dir().ok(),
-            environment: std::env::vars().filter(|(name, _)| name.starts_with(ENV_PREFIX)).collect(),
+            environment: std::env::vars_os()
+                .filter_map(|(name, value)| {
+                    let name = name.into_string().ok()?;
+                    if !name.starts_with(ENV_PREFIX) {
+                        return None;
+                    }
+                    let value = value.into_string().ok()?;
+                    Some((name, value))
+                })
+                .collect(),
             cli: None,
             session: None,
         }
@@ -216,7 +228,7 @@ impl Loader {
         }
 
         if let Some(start) = &self.project_start {
-            if let Some(path) = discover::project_config_path(start) {
+            if let Some(path) = discover::project_config_path(start)? {
                 if let Some(text) = discover::read_shared(ConfigSource::Project, &path)? {
                     layers.push((
                         ConfigSource::Project,
@@ -334,8 +346,11 @@ pub fn user_config_path() -> Option<PathBuf> {
 }
 
 /// Where the nearest project configuration file is, if any.
-#[must_use]
-pub fn project_config_path(start: &Path) -> Option<PathBuf> {
+///
+/// # Errors
+///
+/// [`ConfigError::Unreadable`] when a candidate path cannot be inspected.
+pub fn project_config_path(start: &Path) -> Result<Option<PathBuf>, ConfigError> {
     discover::project_config_path(start)
 }
 
@@ -589,7 +604,10 @@ mod tests {
     fn the_crate_root_paths_are_the_discovery_module_paths() {
         // Guards the re-exports against drifting from the discovery module.
         let start = Path::new("/nonexistent-supra-config-probe");
-        assert_eq!(project_config_path(start), discover::project_config_path(start));
+        assert_eq!(
+            project_config_path(start).expect("walk"),
+            discover::project_config_path(start).expect("walk")
+        );
         assert_eq!(user_config_path(), discover::user_config_path());
     }
 
@@ -619,5 +637,32 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("never reads a literal credential"), "{text}");
         assert!(!text.contains("would-be-a-real-key"), "the value must not be echoed: {text}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unrelated_non_utf8_variable_does_not_panic_startup() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ENV_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let name = "SUPRA_TEST_NON_UTF8_VALUE";
+        let value = OsString::from_vec(vec![0xFF, 0xFE]);
+        // SAFETY: serialised by the module lock; no other test reads this variable.
+        unsafe {
+            std::env::set_var(name, &value);
+        }
+        let loader = Loader::from_environment();
+        // SAFETY: as above; the variable is removed before any other test can see it.
+        unsafe {
+            std::env::remove_var(name);
+        }
+
+        assert!(
+            !loader.environment.iter().any(|(seen, _)| seen == name),
+            "the non-UTF-8 entry must be skipped, not parsed"
+        );
     }
 }

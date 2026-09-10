@@ -119,7 +119,7 @@ impl fmt::Display for MicroUsd {
     /// is watching for.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let sign = if self.0 < 0 { "-" } else { "" };
-        let millis = self.0.abs() / 1_000;
+        let millis = self.0.unsigned_abs() / 1_000;
         write!(f, "{sign}${}.{:03}", millis / 1_000, millis % 1_000)
     }
 }
@@ -136,6 +136,12 @@ mod tests {
         assert_eq!(MicroUsd::from_micros(1_030_000).to_string(), "$1.030");
         assert_eq!(MicroUsd::from_micros(-14_000).to_string(), "-$0.014");
         assert_eq!(MicroUsd::from_micros(6_300_000).to_string(), "$6.300");
+    }
+
+    #[test]
+    fn the_extrema_display_without_overflow() {
+        assert_eq!(MicroUsd::from_micros(i64::MIN).to_string(), "-$9223372036854.775");
+        assert_eq!(MicroUsd::from_micros(i64::MAX).to_string(), "$9223372036854.775");
     }
 
     #[test]

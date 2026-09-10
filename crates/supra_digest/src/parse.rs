@@ -66,7 +66,11 @@ pub fn parse_file(path: &std::path::Path, source: &[u8]) -> Result<ParseOutcome,
         });
     };
     let mut parser = tree_sitter::Parser::new();
-    let grammar = grammar(language);
+    let grammar = if path.extension().and_then(|extension| extension.to_str()) == Some("tsx") {
+        tree_sitter_typescript::LANGUAGE_TSX.into()
+    } else {
+        grammar(language)
+    };
     parser.set_language(&grammar).map_err(|_| DigestError::Unreadable {
         path: path.to_path_buf(),
         detail: "the grammar failed to load".to_owned(),
@@ -327,6 +331,18 @@ mod tests {
         assert!(names(&symbols).contains(&"greet"), "{symbols:?}");
         let open = symbols.iter().find(|symbol| symbol.name == "open").expect("open");
         assert_eq!(open.parent.as_deref(), Some("Store"), "{open:?}");
+    }
+
+    #[test]
+    fn tsx_files_parse_with_the_tsx_grammar() {
+        let path = std::path::PathBuf::from("a.tsx");
+        let source = b"export function App() { return <div className=\"x\">hi</div>; }\n";
+        let outcome = parse_file(&path, source).expect("parses");
+        let symbols = match outcome {
+            ParseOutcome::Clean(symbols) => symbols,
+            ParseOutcome::HasErrors { path } => panic!("JSX must parse clean, got errors in {path:?}"),
+        };
+        assert!(names(&symbols).contains(&"App"), "{symbols:?}");
     }
 
     #[test]

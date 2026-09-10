@@ -20,7 +20,9 @@ pub fn banner(cols: usize, ambiguous: Ambiguous) -> Vec<String> {
     if wide_fits && cols >= 20 {
         return WORDMARK_WIDE.iter().map(|line| (*line).to_owned()).collect();
     }
-    vec![String::from("supra")]
+    let fallback = "supra";
+    let truncated = width::truncate(fallback.as_bytes(), cols, ambiguous);
+    vec![String::from_utf8_lossy(&fallback.as_bytes()[..truncated.bytes]).into_owned()]
 }
 
 #[cfg(test)]
@@ -42,7 +44,7 @@ mod tests {
 
     #[test]
     fn every_form_fits_the_terminal_it_was_asked_for() {
-        for cols in [5, 10, 16, 20, 34, 40, 80] {
+        for cols in 0..=80 {
             for ambiguous in [Ambiguous::Narrow, Ambiguous::Wide] {
                 for line in &banner(cols, ambiguous) {
                     let cells = width::width(line.as_bytes(), ambiguous);

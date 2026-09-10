@@ -13,6 +13,7 @@ publish = false
 supra_blackboard = { workspace = true }
 supra_store = { workspace = true }
 supra_types = { workspace = true }
+supra_ffi = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]

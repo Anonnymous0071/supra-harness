@@ -258,34 +258,21 @@ impl Client {
     ) -> Result<supra_types::CanonicalJson, crate::CanonicalError> {
         let mut body = serde_json::Map::new();
         body.insert("model".to_owned(), serde_json::Value::String(self.model.clone()));
-        body.insert(
-            "messages".to_owned(),
-            serde_json::Value::Array(
-                request
-                    .messages
-                    .iter()
-                    .map(|message| {
-                        serde_json::json!({
-                            "role": match message.role {
-                                Role::User => "user",
-                                Role::Assistant => "assistant",
-                            },
-                            "content": message.content,
-                        })
-                    })
-                    .collect(),
-            ),
-        );
+        match self.policy.kind {
+            ProviderKind::Anthropic => Self::render_anthropic(request, &mut body),
+            ProviderKind::OpenAI => Self::render_openai(request, &mut body),
+            ProviderKind::Google => Self::render_google(request, &mut body),
+        }
+        crate::canonicalize_value(&serde_json::Value::Object(body))
+    }
+
+    fn render_anthropic(request: &Request, body: &mut serde_json::Map<String, serde_json::Value>) {
+        body.insert("max_tokens".to_owned(), serde_json::Value::from(32_000));
+        body.insert("messages".to_owned(), Self::messages_value(request));
         if !request.tools.is_empty() {
-            // Tools arrive already canonical; re-parse for embedding, then re-emit as one
-            // canonical document. Parsing here does not break I7: the parse-emit round
-            // trip passes through the same canonicaliser, so the bytes are stable.
-            let tools: Vec<serde_json::Value> = request
-                .tools
-                .iter()
-                .map(|tool| serde_json::from_str(tool.as_str()).unwrap_or(serde_json::Value::Null))
-                .collect();
-            body.insert("tools".to_owned(), serde_json::Value::Array(tools));
+            if let Ok(tools) = Self::tools_value(request) {
+                body.insert("tools".to_owned(), tools);
+            }
         }
         if request.thinking.enabled() {
             body.insert(
@@ -296,36 +283,94 @@ impl Client {
                 }),
             );
         }
-        // Provider-specific cache fields. Anthropic: explicit breakpoints with TTLs.
-        // OpenAI: one prompt_cache_key. Google: nothing - implicit.
-        match self.policy.kind {
-            ProviderKind::Anthropic => {
-                let breakpoints: Vec<serde_json::Value> = request
-                    .effective_breakpoints()
-                    .iter()
-                    .map(|breakpoint| {
-                        serde_json::json!({
-                            "type": "ephemeral",
-                            "ttl": match self.policy.ttl_for(*breakpoint) {
-                                supra_types::CacheTtl::OneHour => "1h",
-                                supra_types::CacheTtl::FiveMinutes => "5m",
-                            },
-                        })
-                    })
-                    .collect();
-                if !breakpoints.is_empty() {
-                    body.insert("cache_breakpoints".to_owned(), serde_json::Value::Array(breakpoints));
-                }
-            }
-            ProviderKind::OpenAI => {
-                body.insert(
-                    "prompt_cache_key".to_owned(),
-                    serde_json::Value::String("supra-prefix".to_owned()),
-                );
-            }
-            ProviderKind::Google => {}
+        let policy = CachePolicy::for_kind(ProviderKind::Anthropic);
+        let breakpoints: Vec<serde_json::Value> = request
+            .effective_breakpoints()
+            .iter()
+            .map(|breakpoint| {
+                serde_json::json!({
+                    "type": "ephemeral",
+                    "ttl": match policy.ttl_for(*breakpoint) {
+                        supra_types::CacheTtl::OneHour => "1h",
+                        supra_types::CacheTtl::FiveMinutes => "5m",
+                    },
+                })
+            })
+            .collect();
+        if !breakpoints.is_empty() {
+            body.insert("cache_control".to_owned(), serde_json::Value::Array(breakpoints));
         }
-        crate::canonicalize_value(&serde_json::Value::Object(body))
+    }
+
+    fn render_openai(request: &Request, body: &mut serde_json::Map<String, serde_json::Value>) {
+        body.insert("messages".to_owned(), Self::messages_value(request));
+        if !request.tools.is_empty() {
+            if let Ok(tools) = Self::tools_value(request) {
+                body.insert("tools".to_owned(), tools);
+            }
+        }
+        if request.thinking.enabled() {
+            body.insert("reasoning_effort".to_owned(), serde_json::Value::String("medium".to_owned()));
+        }
+        body.insert("prompt_cache_key".to_owned(), serde_json::Value::String("supra-prefix".to_owned()));
+    }
+
+    fn render_google(request: &Request, body: &mut serde_json::Map<String, serde_json::Value>) {
+        let contents: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "role": match message.role {
+                        Role::User => "user",
+                        Role::Assistant => "model",
+                    },
+                    "parts": [{"text": message.content}],
+                })
+            })
+            .collect();
+        body.insert("contents".to_owned(), serde_json::Value::Array(contents));
+        if !request.tools.is_empty() {
+            if let Ok(tools) = Self::tools_value(request) {
+                body.insert("tools".to_owned(), serde_json::json!([{"function_declarations": tools}]));
+            }
+        }
+        if request.thinking.enabled() {
+            body.insert(
+                "generationConfig".to_owned(),
+                serde_json::json!({
+                    "thinkingConfig": {"thinkingBudget": request.thinking.budget_tokens},
+                }),
+            );
+        }
+    }
+
+    fn messages_value(request: &Request) -> serde_json::Value {
+        serde_json::Value::Array(
+            request
+                .messages
+                .iter()
+                .map(|message| {
+                    serde_json::json!({
+                        "role": match message.role {
+                            Role::User => "user",
+                            Role::Assistant => "assistant",
+                        },
+                        "content": message.content,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn tools_value(request: &Request) -> Result<serde_json::Value, crate::CanonicalError> {
+        let mut tools = Vec::new();
+        for tool in &request.tools {
+            let parsed: serde_json::Value = serde_json::from_str(tool.as_str())
+                .map_err(|error| crate::CanonicalError::Invalid { detail: error.to_string() })?;
+            tools.push(parsed);
+        }
+        Ok(serde_json::Value::Array(tools))
     }
 
     /// Send one request and read the completion.
@@ -350,7 +395,8 @@ impl Client {
             .http
             .post(&self.endpoint)
             .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {}", credential.expose()))
+            .header("accept", "text/event-stream")
+            .headers(auth_headers(self.policy.kind, credential))
             .body(body.as_str().to_owned())
             .send()
             .await
@@ -383,6 +429,32 @@ impl Client {
     }
 }
 
+/// The auth headers each provider expects: Anthropic wants `x-api-key` plus its version
+/// header; the others take Bearer credentials.
+fn auth_headers(kind: ProviderKind, credential: &supra_secrets::SecretString) -> reqwest::header::HeaderMap {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    let value = credential.expose();
+    match kind {
+        ProviderKind::Anthropic => {
+            headers.insert(
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_str(value)
+                    .unwrap_or_else(|_| HeaderValue::from_static("invalid-credential")),
+            );
+            headers
+                .insert(HeaderName::from_static("anthropic-version"), HeaderValue::from_static("2023-06-01"));
+        }
+        ProviderKind::OpenAI | ProviderKind::Google => {
+            if let Ok(parsed) = HeaderValue::from_str(&format!("Bearer {value}")) {
+                headers.insert(reqwest::header::AUTHORIZATION, parsed);
+            }
+        }
+    }
+    headers
+}
+
 /// Milliseconds to wait after a 429, from the provider's own headers or the documented
 /// default of 60 s. Never zero: retrying immediately is how a limit becomes a ban.
 fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
@@ -411,6 +483,9 @@ fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
 /// deltas, and takes usage from the final event. `[DONE]` ends the stream. A malformed
 /// event is [`BadResponse`](LlmError::BadResponse), not a skip: silently dropping one
 /// would lose tokens without a trace.
+///
+/// A stream that ends without a terminal marker is refused even when text arrived:
+/// partial text returned as a success is a wrong answer wearing a green light.
 async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Completion, LlmError> {
     use futures::StreamExt as _;
 
@@ -422,6 +497,7 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
     let mut buffer = Vec::new();
     let mut text = String::new();
     let mut usage: Option<Usage> = None;
+    let mut terminal = false;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
@@ -430,7 +506,6 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
         // Drain complete events, keeping a partial tail buffered.
         while let Some(end) = find_event_end(&buffer) {
             let event: Vec<u8> = buffer.drain(..end).collect();
-            // Skip the trailing blank line.
             let event = String::from_utf8_lossy(&event).into_owned();
             for line in event.lines() {
                 let Some(payload) = line.strip_prefix("data:") else { continue };
@@ -443,6 +518,22 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
                         provider: provider.clone(),
                         detail: format!("event is not JSON: {payload:.80}"),
                     })?;
+                if json.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+                    let detail = json
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("the provider sent an error event");
+                    return Err(LlmError::BadResponse { provider, detail: detail.to_owned() });
+                }
+                if json.get("error").is_some() && json.get("choices").is_none() {
+                    let detail = json
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("the provider sent an error object");
+                    return Err(LlmError::BadResponse { provider, detail: detail.to_owned() });
+                }
                 if let Some(delta) =
                     json.get("delta").and_then(|delta| delta.get("text")).and_then(serde_json::Value::as_str)
                 {
@@ -457,6 +548,17 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
                 {
                     text.push_str(delta);
                 }
+                // A message_delta with stop_reason, or a finish_reason, ends the answer
+                // even where the sentinel is absent.
+                if json.get("stop_reason").is_some()
+                    || json
+                        .get("choices")
+                        .and_then(|choices| choices.get(0))
+                        .and_then(|choice| choice.get("finish_reason"))
+                        .is_some()
+                {
+                    terminal = true;
+                }
                 // Usage arrives on the final event (Anthropic) or as usage (OpenAI).
                 if let Some(reported) = parse_usage(&json) {
                     usage = Some(reported);
@@ -464,11 +566,13 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
             }
         }
     }
-    // Stream ended without [DONE]: return what arrived, because providers differ on the
-    // sentinel and a complete body without one is still a complete answer. An empty body
-    // with no usage is BadResponse - nothing arrived at all.
-    if text.is_empty() && usage.is_none() {
-        return Err(LlmError::BadResponse { provider, detail: "the stream ended with no events".to_owned() });
+    if !terminal {
+        let detail = if text.is_empty() {
+            "the stream ended with no events".to_owned()
+        } else {
+            "the stream ended before a terminal marker".to_owned()
+        };
+        return Err(LlmError::BadResponse { provider, detail });
     }
     Ok(Completion { text, usage, thinking })
 }
@@ -541,7 +645,7 @@ mod tests {
             breakpoints: Breakpoint::ALL.to_vec(),
         };
         let body = anthropic.render_body(&request).expect("renders");
-        assert!(body.as_str().contains("cache_breakpoints"), "{}", body.as_str());
+        assert!(body.as_str().contains("cache_control"), "{}", body.as_str());
 
         let openai = test_client(ProviderKind::OpenAI);
         let request = Request {
@@ -554,7 +658,70 @@ mod tests {
         };
         let body = openai.render_body(&request).expect("renders");
         assert!(body.as_str().contains("prompt_cache_key"), "{}", body.as_str());
-        assert!(!body.as_str().contains("cache_breakpoints"), "{}", body.as_str());
+        assert!(!body.as_str().contains("cache_control"), "{}", body.as_str());
+    }
+
+    #[test]
+    fn each_provider_renders_its_own_wire_shape() {
+        let messages = vec![Message { role: Role::User, content: "hi".to_owned() }];
+
+        let anthropic = test_client(ProviderKind::Anthropic);
+        let request = Request {
+            provider: ProviderKind::Anthropic,
+            model: "m".to_owned(),
+            messages: messages.clone(),
+            tools: Vec::new(),
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+        let body = anthropic.render_body(&request).expect("anthropic renders");
+        assert!(body.as_str().contains("\"max_tokens\""), "{}", body.as_str());
+        assert!(
+            body.as_str().contains(r#""messages":[{"content":"hi","role":"user"}]"#),
+            "{}",
+            body.as_str()
+        );
+
+        let openai = test_client(ProviderKind::OpenAI);
+        let request = Request { provider: ProviderKind::OpenAI, model: "m".to_owned(), ..request.clone() };
+        let body = openai.render_body(&request).expect("openai renders");
+        assert!(
+            body.as_str().contains(r#""messages":[{"content":"hi","role":"user"}]"#),
+            "{}",
+            body.as_str()
+        );
+        assert!(!body.as_str().contains("max_tokens"), "{}", body.as_str());
+
+        let google = test_client(ProviderKind::Google);
+        let request = Request { provider: ProviderKind::Google, model: "m".to_owned(), ..request.clone() };
+        let body = google.render_body(&request).expect("google renders");
+        assert!(
+            body.as_str().contains(r#""contents":[{"parts":[{"text":"hi"}],"role":"user"}]"#),
+            "{}",
+            body.as_str()
+        );
+        assert!(!body.as_str().contains("\"messages\""), "{}", body.as_str());
+    }
+
+    #[test]
+    fn anthropic_auth_is_x_api_key_openai_is_bearer() {
+        use supra_secrets::SecretString;
+
+        let credential = SecretString::new("key-material".to_owned());
+        let anthropic = auth_headers(ProviderKind::Anthropic, &credential);
+        assert!(anthropic.contains_key("x-api-key"), "{anthropic:?}");
+        assert_eq!(
+            anthropic.get("anthropic-version").and_then(|value| value.to_str().ok()),
+            Some("2023-06-01")
+        );
+        assert!(!anthropic.contains_key(reqwest::header::AUTHORIZATION));
+
+        let openai = auth_headers(ProviderKind::OpenAI, &credential);
+        assert_eq!(
+            openai.get(reqwest::header::AUTHORIZATION).and_then(|value| value.to_str().ok()),
+            Some("Bearer key-material")
+        );
+        assert!(!openai.contains_key("x-api-key"));
     }
 
     #[test]

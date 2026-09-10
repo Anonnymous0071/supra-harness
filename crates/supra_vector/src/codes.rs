@@ -154,7 +154,7 @@ pub fn validate(vector: &[f32], dims: usize) -> Result<(), VectorError> {
         return Err(VectorError::WrongWidth { expected: dims, found: vector.len() });
     }
 
-    let mut magnitude = 0.0_f32;
+    let mut magnitude_sq = 0.0_f32;
     for (index, value) in vector.iter().enumerate() {
         if !value.is_finite() {
             return Err(VectorError::Degenerate {
@@ -163,15 +163,32 @@ pub fn validate(vector: &[f32], dims: usize) -> Result<(), VectorError> {
                 ),
             });
         }
-        magnitude += value * value;
+        magnitude_sq += value * value;
     }
-    if magnitude == 0.0 {
+    if magnitude_sq == 0.0 {
         return Err(VectorError::Degenerate {
             detail: "every component is zero, so it has no direction".to_owned(),
         });
     }
+    let magnitude = magnitude_sq.sqrt();
+    if (magnitude - 1.0).abs() > UNIT_NORM_TOLERANCE {
+        return Err(VectorError::Degenerate {
+            detail: format!(
+                "magnitude {magnitude:.6} is not unit length: ranking is a raw dot product, so a \
+                 longer vector would outrank a better match - normalise before indexing"
+            ),
+        });
+    }
     Ok(())
 }
+
+/// How far from 1.0 an embedding's magnitude may sit before `validate`
+/// refuses it.
+///
+/// Embedding models emit unit vectors to well inside `1e-4`; `1e-2` is
+/// headroom for a caller's own float pipeline, while still refusing the
+/// magnitudes that rearrange a ranking.
+pub const UNIT_NORM_TOLERANCE: f32 = 1e-2;
 
 /// Serialise a vector as little-endian `f32`.
 ///
@@ -198,10 +215,21 @@ pub fn decode_embedding(bytes: &[u8], dims: usize) -> Result<Vec<f32>, VectorErr
             detail: format!("an embedding blob of {} bytes cannot hold {dims} f32 values", bytes.len()),
         });
     }
-    Ok(bytes
+    let vector: Vec<f32> = bytes
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
+        .collect();
+    for (index, value) in vector.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(VectorError::Malformed {
+                detail: format!(
+                    "a stored vector holds {value} at dimension {index}, which fails every \
+                     comparison a ranking makes"
+                ),
+            });
+        }
+    }
+    Ok(vector)
 }
 
 #[cfg(test)]

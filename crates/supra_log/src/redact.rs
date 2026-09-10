@@ -243,13 +243,13 @@ fn match_field(line: &str, index: usize) -> Option<(usize, String)> {
             }
         }
 
-        // Compact: the bare name, an equals sign, then a value up to the next space.
+        // Compact: the bare name, an equals sign, then a bare or quoted value.
         if let Some(after) = rest.strip_prefix(*field) {
             if let Some(value) = after.strip_prefix('=') {
                 if !is_boundary(line.as_bytes(), index) {
                     continue;
                 }
-                let value_len = value.bytes().take_while(|byte| !byte.is_ascii_whitespace()).count();
+                let value_len = compact_value_len(value);
                 if value_len > 0 {
                     return Some((field.len() + 1 + value_len, format!("{field}={}", marker(value_len))));
                 }
@@ -257,6 +257,13 @@ fn match_field(line: &str, index: usize) -> Option<(usize, String)> {
         }
     }
     None
+}
+
+fn compact_value_len(value: &str) -> usize {
+    if value.starts_with('"') {
+        return json_string_value(value).map_or_else(|| value.len(), |(_, total)| total);
+    }
+    value.bytes().take_while(|byte| !byte.is_ascii_whitespace()).count()
 }
 
 /// Match `"<field>":` allowing the whitespace a formatter may insert.
@@ -420,6 +427,16 @@ mod tests {
         assert!(!redacted.contains("hunter2"), "{redacted}");
         assert!(redacted.contains(r#""api_key":"<redacted:7>""#), "{redacted}");
         assert!(redacted.contains("provider"), "context must survive: {redacted}");
+    }
+
+    #[test]
+    fn compact_quoted_values_are_redacted_whole() {
+        let line = r#"password="correct horse \"battery\" staple" next=visible"#;
+        let redacted = redact(line);
+        for secret in ["correct", "horse", "battery", "staple"] {
+            assert!(!redacted.contains(secret), "{redacted}");
+        }
+        assert!(redacted.contains("next=visible"), "{redacted}");
     }
 
     #[test]

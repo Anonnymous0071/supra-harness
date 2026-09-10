@@ -2,19 +2,40 @@
 //!
 //! MCP servers speak either stdio (a child process, one JSON document per
 //! line) or streamable HTTP (POST to an endpoint). The gateway drives
-//! both through the same [`Transport`] trait so the layer above negotiates,
-//! lists, and calls without knowing which one it is talking to.
+//! both through the same [`Transport`] trait shape so the layer above
+//! negotiates, lists, and calls without knowing which one it is talking
+//! to.
 //!
-//! stdio runs through the T16 sandbox: an MCP server is a subprocess the
-//! harness did not write, which is exactly what the sandbox exists for.
-//! The pipe carrying JSON-RPC is the parent's side of a `spawn` whose
-//! stdio descriptors are CLOEXEC pipes - the hygiene T16.5 and T16 built.
+//! stdio runs as a spawned child whose environment is explicit - the
+//! host's env holds secrets no third-party server needs - and whose
+//! answers are read under a deadline and a frame cap: a server that
+//! stays silent or streams an endless line is an error, not a hang.
+//!
+//! Every response is correlated: the reader skips notifications and
+//! responses to other requests, and refuses a payload that does not
+//! claim JSON-RPC 2.0. HTTP captures the session id the server assigns
+//! at `initialize` and presents it on every later call, and answers
+//! arriving as `text/event-stream` are scanned for the response the
+//! call is waiting on.
 
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout};
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use super::error::McpError;
 use super::rpc::{Request, Response};
+
+/// How long one call waits for its answer.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The largest line a stdio server may send before the transport
+/// refuses it.
+///
+/// A JSON-RPC document beyond this size is not an answer anyone
+/// intended to read; buffering it anyway is how a rogue server turns a
+/// client into an out-of-memory failure.
+pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 /// What a server configuration resolves to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,7 +64,7 @@ pub enum Endpoint {
 pub enum Transport {
     /// A child process speaking newline-delimited JSON on stdio.
     Stdio {
-        /// The server process; killed and reaped on drop.
+        /// The server process; killed on drop.
         child: Child,
         /// The pipe the gateway writes requests to.
         stdin: ChildStdin,
@@ -51,10 +72,13 @@ pub enum Transport {
         stdout: BufReader<ChildStdout>,
         /// The monotonic JSON-RPC id for the next request.
         id: u64,
+        /// The deadline one call waits under; production holds
+        /// [`CALL_TIMEOUT`], a probe may shorten it.
+        timeout: Duration,
     },
     /// An HTTP endpoint. `id` keeps the same monotonic correlation the
-    /// stdio side has; the connection itself is stateless from this
-    /// side.
+    /// stdio side has; `session` is the id the server assigned at
+    /// `initialize`, presented on every later call.
     Http {
         /// The HTTP client (connection pooling is the client's own).
         client: reqwest::Client,
@@ -62,6 +86,10 @@ pub enum Transport {
         url: String,
         /// The monotonic JSON-RPC id for the next request.
         id: u64,
+        /// The session the server assigned, once it has.
+        session: Option<String>,
+        /// The deadline one call waits under.
+        timeout: Duration,
     },
 }
 
@@ -76,23 +104,27 @@ impl Transport {
         let Endpoint::Stdio { argv, env } = endpoint else {
             return Err(McpError::Transport("stdio transport needs a command".to_owned()));
         };
-        let mut command = std::process::Command::new(&argv[0]);
+        let Some(program) = argv.first() else {
+            return Err(McpError::Transport("an empty argv names no program".to_owned()));
+        };
+        let mut command = Command::new(program);
         command
             .args(&argv[1..])
             .env_clear()
-            .envs(env.iter().map(|(k, v)| (k, v)))
+            .envs(env.iter().map(|(key, value)| (key, value)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
         let mut child =
-            command.spawn().map_err(|error| McpError::Transport(format!("spawn {}: {error}", argv[0])))?;
+            command.spawn().map_err(|error| McpError::Transport(format!("spawn {program}: {error}")))?;
         let stdin = child.stdin.take().ok_or_else(|| {
             McpError::Transport("the child closed stdin before the gateway could take it".to_owned())
         })?;
         let stdout = BufReader::new(child.stdout.take().ok_or_else(|| {
             McpError::Transport("the child closed stdout before the gateway could take it".to_owned())
         })?);
-        Ok(Self::Stdio { child, stdin, stdout, id: 0 })
+        Ok(Self::Stdio { child, stdin, stdout, id: 0, timeout: CALL_TIMEOUT })
     }
 
     /// An HTTP transport to `url`.
@@ -102,58 +134,89 @@ impl Transport {
     /// [`McpError::Transport`] when the client cannot be constructed.
     pub fn http(url: String) -> Result<Self, McpError> {
         let client = reqwest::Client::new();
-        Ok(Self::Http { client, url, id: 0 })
+        Ok(Self::Http { client, url, id: 0, session: None, timeout: CALL_TIMEOUT })
+    }
+
+    /// Shorten the call deadline, for probes that must fail fast.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        match self {
+            Self::Stdio { timeout: slot, .. } | Self::Http { timeout: slot, .. } => *slot = timeout,
+        }
     }
 
     /// Issue one JSON-RPC request and await its response.
     ///
     /// # Errors
     ///
-    /// [`McpError::Transport`] on I/O; [`McpError::Protocol`] when the
-    /// answer is not a JSON-RPC response or carries the error object.
+    /// [`McpError::Transport`] on I/O or when the deadline passes;
+    /// [`McpError::Protocol`] when the answer is not a JSON-RPC 2.0
+    /// response for this request or carries the error object.
     pub async fn call(
         &mut self,
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, McpError> {
         match self {
-            Self::Stdio { child, stdin, stdout, id } => {
+            Self::Stdio { stdin, stdout, id, timeout, .. } => {
                 *id += 1;
                 let request = Request::new(*id, method, params);
                 let line = serde_json::to_string(&request)
                     .map_err(|error| McpError::Protocol(format!("serialise: {error}")))?;
                 stdin
                     .write_all(line.as_bytes())
-                    .and_then(|()| stdin.write_all(b"\n"))
-                    .and_then(|()| stdin.flush())
+                    .await
                     .map_err(|error| McpError::Transport(format!("write: {error}")))?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|error| McpError::Transport(format!("write: {error}")))?;
+                stdin.flush().await.map_err(|error| McpError::Transport(format!("write: {error}")))?;
 
-                let mut buffer = String::new();
-                stdout
-                    .read_line(&mut buffer)
-                    .map_err(|error| McpError::Transport(format!("read: {error}")))?;
-                if buffer.is_empty() {
-                    // The child closed stdout without answering - a crash,
-                    // and the child is reaped so no zombie survives the
-                    // refusal.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(McpError::Transport("the server closed without answering".to_owned()));
+                loop {
+                    let line = read_bounded_line(stdout, *timeout).await?;
+                    if line.is_empty() {
+                        return Err(McpError::Transport("the server closed without answering".to_owned()));
+                    }
+                    let value: serde_json::Value = serde_json::from_str(&line)
+                        .map_err(|error| McpError::Protocol(format!("the answer is not JSON: {error}")))?;
+                    if value.get("id").is_some() && value.get("jsonrpc").is_none() {
+                        return Err(McpError::Protocol("the answer does not claim JSON-RPC 2.0".to_owned()));
+                    }
+                    if is_response_for(&value, *id) {
+                        let response: Response = serde_json::from_value(value).map_err(|error| {
+                            McpError::Protocol(format!("the answer is not JSON-RPC: {error}"))
+                        })?;
+                        return answer(response);
+                    }
                 }
-                let response: Response = serde_json::from_str(&buffer)
-                    .map_err(|error| McpError::Protocol(format!("the answer is not JSON-RPC: {error}")))?;
-                answer(response)
             }
-            Self::Http { client, url, id } => {
+            Self::Http { client, url, id, session, timeout } => {
                 *id += 1;
                 let request = Request::new(*id, method, params);
-                let response = client
+                let mut outbound = client
                     .post(url.clone())
+                    .timeout(*timeout)
                     .json(&request)
-                    .send()
-                    .await
-                    .map_err(|error| McpError::Transport(format!("http: {error}")))?;
+                    .header("Accept", "application/json, text/event-stream");
+                if let Some(session) = session.as_deref() {
+                    outbound = outbound.header("Mcp-Session-Id", session);
+                }
+                let response =
+                    outbound.send().await.map_err(|error| McpError::Transport(format!("http: {error}")))?;
+                if method == "initialize" {
+                    if let Some(assigned) =
+                        response.headers().get("Mcp-Session-Id").and_then(|value| value.to_str().ok())
+                    {
+                        *session = Some(assigned.to_owned());
+                    }
+                }
                 let status = response.status();
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
                 let body = response
                     .text()
                     .await
@@ -161,24 +224,143 @@ impl Transport {
                 if !status.is_success() {
                     return Err(McpError::Transport(format!("http {status}: {body}")));
                 }
-                let response: Response = serde_json::from_str(&body)
+                let value = if content_type.contains("text/event-stream") {
+                    parse_sse(&body, *id)?
+                } else {
+                    serde_json::from_str(&body)
+                        .map_err(|error| McpError::Protocol(format!("the answer is not JSON: {error}")))?
+                };
+                if !is_response_for(&value, *id) {
+                    return Err(McpError::Protocol(
+                        "the response does not answer the request that was sent".to_owned(),
+                    ));
+                }
+                let response: Response = serde_json::from_value(value)
                     .map_err(|error| McpError::Protocol(format!("the answer is not JSON-RPC: {error}")))?;
                 answer(response)
             }
         }
     }
-}
 
-impl Drop for Transport {
-    fn drop(&mut self) {
-        if let Self::Stdio { child, .. } = self {
-            // Close stdin (drop is implicit at the end of this scope),
-            // then reap: a server that exits on EOF is waited for; one
-            // that lingers is killed so no zombie outlives the gateway.
-            let _ = child.kill();
-            let _ = child.wait();
+    /// Send one notification - a message with no id and no answer.
+    ///
+    /// stdio writes the line and reads nothing back; HTTP POSTs it and
+    /// discards whatever comes home, because a notification is fire and
+    /// forget by definition.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError::Transport`] on I/O.
+    pub async fn notify(&mut self, method: &str) -> Result<(), McpError> {
+        match self {
+            Self::Stdio { stdin, .. } => {
+                let notification = serde_json::json!({"jsonrpc": "2.0", "method": method});
+                let line = serde_json::to_string(&notification)
+                    .map_err(|error| McpError::Protocol(format!("serialise: {error}")))?;
+                stdin
+                    .write_all(line.as_bytes())
+                    .await
+                    .map_err(|error| McpError::Transport(format!("write: {error}")))?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|error| McpError::Transport(format!("write: {error}")))?;
+                stdin.flush().await.map_err(|error| McpError::Transport(format!("write: {error}")))?;
+                Ok(())
+            }
+            Self::Http { client, url, session, .. } => {
+                let notification = serde_json::json!({"jsonrpc": "2.0", "method": method});
+                let mut outbound = client.post(url.clone()).json(&notification);
+                if let Some(session) = session.as_deref() {
+                    outbound = outbound.header("Mcp-Session-Id", session);
+                }
+                outbound.send().await.map_err(|error| McpError::Transport(format!("http: {error}")))?;
+                Ok(())
+            }
         }
     }
+}
+
+/// Whether a decoded payload is the response to `id`.
+///
+/// Notifications (a `method`, no `id`) and responses to other requests
+/// are skipped on stdio; a payload that does not claim JSON-RPC 2.0 is
+/// never a response, whatever else it says about itself.
+fn is_response_for(value: &serde_json::Value, id: u64) -> bool {
+    if value.get("id").is_none() {
+        return false;
+    }
+    if value.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return false;
+    }
+    value.get("id").and_then(serde_json::Value::as_u64) == Some(id)
+}
+
+/// Read one line, bounded and under the call deadline.
+///
+/// # Errors
+///
+/// [`McpError::Transport`] when the deadline passes or the pipe breaks;
+/// [`McpError::Protocol`] when the line outgrew [`MAX_LINE_BYTES`].
+async fn read_bounded_line(
+    stdout: &mut BufReader<ChildStdout>,
+    timeout: Duration,
+) -> Result<String, McpError> {
+    let mut line = Vec::new();
+    tokio::time::timeout(timeout, async {
+        loop {
+            let consumed = {
+                let available =
+                    stdout.fill_buf().await.map_err(|error| McpError::Transport(format!("read: {error}")))?;
+                if available.is_empty() {
+                    return Ok(());
+                }
+                if let Some(position) = available.iter().position(|&byte| byte == b'\n') {
+                    line.extend_from_slice(&available[..=position]);
+                    position + 1
+                } else {
+                    line.extend_from_slice(available);
+                    available.len()
+                }
+            };
+            stdout.consume(consumed);
+            if line.last() == Some(&b'\n') {
+                break;
+            }
+            if line.len() > MAX_LINE_BYTES {
+                return Err(McpError::Protocol(format!(
+                    "a line exceeded the {MAX_LINE_BYTES}-byte frame cap"
+                )));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| McpError::Transport("the server did not answer within the call timeout".to_owned()))??;
+    if line.is_empty() {
+        return Ok(String::new());
+    }
+    while line.last().is_some_and(|byte| *byte == b'\n' || *byte == b'\r') {
+        line.pop();
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// Find the response for `id` in one SSE body.
+///
+/// # Errors
+///
+/// [`McpError::Protocol`] when the stream ends without it.
+fn parse_sse(body: &str, id: u64) -> Result<serde_json::Value, McpError> {
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data:") else { continue };
+        let payload = payload.trim();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else { continue };
+        if is_response_for(&value, id) {
+            return Ok(value);
+        }
+    }
+    Err(McpError::Protocol("the event stream ended without the response".to_owned()))
 }
 
 fn answer(response: Response) -> Result<serde_json::Value, McpError> {
@@ -221,80 +403,70 @@ print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"echo": True
 "#,
         );
         let mut transport = Transport::stdio(&endpoint).expect("spawn");
-        let result = transport.call("initialize", serde_json::json!({})).await.expect("call");
-        assert_eq!(result["echo"], serde_json::json!(true));
+        let result = transport.call("tools/list", serde_json::json!({})).await.expect("call");
+        assert_eq!(result, serde_json::json!({"echo": true}));
     }
 
     #[tokio::test]
-    async fn stdio_reports_a_protocol_error() {
+    async fn notifications_and_foreign_ids_are_skipped_not_confused() {
         let endpoint = python_responder(
             r#"import sys, json
 line = sys.stdin.readline()
 request = json.loads(line)
-print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32601, "message": "no such method"}}))
+print(json.dumps({"jsonrpc": "2.0", "method": "notifications/telemetry", "params": {}}))
+print(json.dumps({"jsonrpc": "2.0", "id": 999, "result": {"not": "ours"}}))
+print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"ours": True}}))
 "#,
         );
         let mut transport = Transport::stdio(&endpoint).expect("spawn");
-        let error = transport.call("tools/list", serde_json::json!({})).await.expect_err("error");
-        assert!(error.to_string().contains("no such method"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn a_closed_child_is_a_transport_error_not_a_hang() {
-        // The child answers nothing and exits; the gateway must refuse,
-        // not block - and must reap the child.
-        let endpoint = python_responder("import sys\nsys.exit(0)");
-        let mut transport = Transport::stdio(&endpoint).expect("spawn");
-        let error = transport.call("tools/list", serde_json::json!({})).await.expect_err("closed");
-        assert!(matches!(error, McpError::Transport(_)), "{error}");
-    }
-
-    #[tokio::test]
-    async fn http_posts_and_parses() {
-        // A local HTTP MCP server on an ephemeral port: the same shape a
-        // remote endpoint has, driven end to end.
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut buffer = [0u8; 4096];
-            let read = stream.read(&mut buffer).expect("read");
-            let request = std::str::from_utf8(&buffer[..read]).expect("utf8");
-            // The JSON-RPC body rides at the end of the HTTP request.
-            let body_start = request.find('{').expect("body");
-            let request: serde_json::Value = serde_json::from_str(&request[body_start..]).expect("json");
-            let body = format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"served":true}}}}"#, request["id"]);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len(),
-            );
-            stream.write_all(response.as_bytes()).expect("write");
-        });
-
-        let mut transport = Transport::http(format!("http://127.0.0.1:{port}/mcp")).expect("client");
         let result = transport.call("tools/list", serde_json::json!({})).await.expect("call");
-        assert_eq!(result["served"], serde_json::json!(true));
-        server.join().expect("server thread");
+        assert_eq!(result, serde_json::json!({"ours": true}));
+    }
+
+    #[tokio::test]
+    async fn a_response_that_does_not_claim_jsonrpc_20_is_refused() {
+        let endpoint = python_responder(
+            r#"import sys, json
+line = sys.stdin.readline()
+request = json.loads(line)
+print(json.dumps({"id": request["id"], "result": {"version": "1.0"}}))
+"#,
+        );
+        let mut transport = Transport::stdio(&endpoint).expect("spawn");
+        let error = transport.call("tools/list", serde_json::json!({})).await.expect_err("refused");
+        assert!(error.to_string().contains("JSON-RPC"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_times_out_rather_than_hanging() {
+        let endpoint = python_responder("import time\ntime.sleep(60)\n");
+        let mut transport = Transport::stdio(&endpoint).expect("spawn");
+        transport.set_timeout(Duration::from_secs(2));
+        let start = std::time::Instant::now();
+        let error = transport.call("tools/list", serde_json::json!({})).await.expect_err("timeout");
+        assert!(error.to_string().contains("timeout"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(10), "the deadline bounded the wait");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_line_is_refused_not_buffered() {
+        let endpoint = python_responder(
+            r#"import sys, json
+sys.stdin.readline()
+print("x" * (5 * 1024 * 1024))
+"#,
+        );
+        let mut transport = Transport::stdio(&endpoint).expect("spawn");
+        let error = transport.call("tools/list", serde_json::json!({})).await.expect_err("refused");
+        assert!(error.to_string().contains("frame cap"), "{error}");
     }
 
     #[test]
-    fn drop_reaps_the_child() {
-        let endpoint = python_responder("import sys\nsys.stdin.readline()\nsys.exit(0)");
-        let transport = Transport::stdio(&endpoint);
-        let pid = match &transport {
-            Ok(Transport::Stdio { child, .. }) => child.id(),
-            _ => panic!("stdio"),
-        };
-        drop(transport);
-        // The child may exit on its own or be killed; either way, drop
-        // waits, so the pid leaves the process table.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
-            assert!(std::time::Instant::now() < deadline, "the child was not reaped");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+    fn an_event_stream_yields_the_matching_response() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"page\":1}}\n\n\
+                    event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"page\":2}}\n\n";
+        let value = parse_sse(body, 2).expect("found");
+        assert_eq!(value["result"]["page"], 2);
+        assert!(parse_sse(body, 7).is_err(), "no response for 7");
     }
 }

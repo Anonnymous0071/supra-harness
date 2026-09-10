@@ -96,12 +96,31 @@ impl EphemeralKey {
 /// Volatile per-request state, rendered into the suffix and then dropped.
 ///
 /// Deliberately **not** [`crate::Sealable`]. See the module documentation.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Deserialisation restores the sorted, key-unique invariant: hostile input
+/// (reversed order, duplicate keys) is folded through [`EphemeralBlock::set`]
+/// rather than trusted as stored, so the binary-search-backed accessors can
+/// never miss a value that the block claims to hold.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct EphemeralBlock {
     /// Sorted by key so rendering is deterministic. Determinism here is not about
     /// caching - this content is never cached - but about making a diff between
     /// two turns' suffixes readable when debugging a cache break.
     entries: Vec<(EphemeralKey, String)>,
+}
+
+impl<'de> Deserialize<'de> for EphemeralBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let entries = Vec::<(EphemeralKey, String)>::deserialize(deserializer)?;
+        let mut block = EphemeralBlock::new();
+        for (key, value) in entries {
+            block.set(key, value);
+        }
+        Ok(block)
+    }
 }
 
 impl EphemeralBlock {
@@ -248,6 +267,20 @@ mod tests {
             rendered.lines().map(|line| line.split(':').next().unwrap_or_default()).collect();
         let expected: Vec<&str> = EphemeralKey::ALL.iter().map(|key| key.label()).collect();
         assert_eq!(labels, expected);
+    }
+
+    #[test]
+    fn deserialization_restores_the_sorted_unique_invariant() {
+        let hostile =
+            serde_json::json!([["GitBranch", "main"], ["Timestamp", "12:00"], ["GitBranch", "dev"],]);
+        let block: EphemeralBlock = serde_json::from_value(hostile).expect("hostile input folds");
+        assert_eq!(block.get(EphemeralKey::GitBranch), Some("dev"), "the last value wins");
+        assert_eq!(block.get(EphemeralKey::Timestamp), Some("12:00"));
+        assert_eq!(block.len(), 2, "duplicate keys collapse");
+        let rendered = block.render();
+        let timestamp = rendered.find("time: 12:00").expect("timestamp renders");
+        let branch = rendered.find("branch: dev").expect("branch renders");
+        assert!(timestamp < branch, "keys are sorted after deserialization");
     }
 
     #[test]

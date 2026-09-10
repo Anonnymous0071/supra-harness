@@ -17,7 +17,7 @@
 //!     Answer { agent: AgentId::generate(), text: "fix a".to_owned() },
 //!     Answer { agent: AgentId::generate(), text: "fix a".to_owned() },
 //! ];
-//! assert!(cross_check("the fix", &answers).is_empty());
+//! assert!(cross_check("the fix", &answers).expect("unique agents").is_empty());
 //! ```
 
 #![deny(missing_docs)]

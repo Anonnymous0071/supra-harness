@@ -58,9 +58,10 @@ pub const EMBEDDING_SCALAR_BYTES: usize = 4;
 pub const EMBEDDING_TO_CODE_RATIO: usize = 32;
 
 /// This crate's schema steps, in order.
-pub const MIGRATIONS: &[ComponentMigration] = &[ComponentMigration {
-    version: 1,
-    sql: "
+pub const MIGRATIONS: &[ComponentMigration] = &[
+    ComponentMigration {
+        version: 1,
+        sql: "
     -- Exactly one row, pinned by `CHECK (id = 1)`: a second configuration row would mean two
     -- answers to 'what threshold were these codes written with', and the reader would take
     -- whichever came back first.
@@ -115,7 +116,19 @@ pub const MIGRATIONS: &[ComponentMigration] = &[ComponentMigration {
         contentless_delete=1
     );
 ",
-}];
+    },
+    ComponentMigration {
+        version: 2,
+        sql: "
+    -- The cross-handle revision: every upsert and remove bumps it, and an
+    -- index handle that has resident state built from an older revision
+    -- reloads before answering a query. Two handles on one file otherwise
+    -- diverge silently - one holds codes and cached vectors the other has
+    -- already replaced.
+    ALTER TABLE vector_meta ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+",
+    },
+];
 
 /// A gap makes "apply everything above the current version" ambiguous and an out-of-order
 /// entry silently never runs. Both are compile errors rather than test failures.

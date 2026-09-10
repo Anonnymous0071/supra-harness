@@ -105,6 +105,9 @@ pub struct Position {
     /// Zero-based line.
     #[serde(rename = "line")]
     pub line: u32,
+    /// Zero-based character, in UTF-16 code units.
+    #[serde(default)]
+    pub character: u32,
 }
 
 #[cfg(test)]

@@ -176,6 +176,26 @@ pub fn component_version(connection: &Connection, component: &str) -> Result<u32
     }
 }
 
+/// The version query as [`apply_component`] needs it: `rusqlite`'s own
+/// error, because that function reports through it.
+fn component_version_raw(connection: &Connection, component: &str) -> Result<u32, rusqlite::Error> {
+    let version: Option<i64> = connection
+        .query_row(&format!("SELECT version FROM {COMPONENT_TABLE} WHERE name = ?1"), [component], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    match version {
+        None => Ok(0),
+        Some(found) => u32::try_from(found).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                format!("component {component:?} records version {found}, which is not a version").into(),
+            )
+        }),
+    }
+}
+
 /// Bring one component's tables up to the last version in `migrations`.
 ///
 /// Same semantics as [`migrate`]: forward only, a newer file is refused, and each step's DDL
@@ -197,7 +217,7 @@ pub fn migrate_component(
     component: &str,
     migrations: &[ComponentMigration],
 ) -> Result<u32, StoreError> {
-    let mut version = component_version(connection, component)?;
+    let version = component_version(connection, component)?;
     let latest = migrations.last().map_or(0, |migration| migration.version);
 
     if version > latest {
@@ -209,43 +229,48 @@ pub fn migrate_component(
         });
     }
 
+    let mut version = version;
     for migration in migrations {
-        if migration.version <= version {
-            continue;
-        }
-        apply_component(connection, component, migration).map_err(|source| StoreError::ComponentMigrate {
-            component: component.to_owned(),
-            from: version,
-            to: migration.version,
-            source,
+        version = apply_component(connection, component, migration).map_err(|source| {
+            StoreError::ComponentMigrate {
+                component: component.to_owned(),
+                from: version,
+                to: migration.version,
+                source,
+            }
         })?;
-        version = migration.version;
     }
 
     Ok(version)
 }
 
 /// Run one component migration, DDL and version row together.
+///
+/// `new_unchecked` because the connection is reached through a shared
+/// reference: the `Store` holds it behind a mutex and hands out
+/// `&Connection`. The version is re-read inside the IMMEDIATE transaction
+/// so a second opener that lost the race sees the winner's version and
+/// skips instead of re-running applied DDL.
 fn apply_component(
     connection: &Connection,
     component: &str,
     migration: &ComponentMigration,
-) -> rusqlite::Result<()> {
-    // `new_unchecked` because the connection is reached through a shared reference: the
-    // `Store` holds it behind a mutex and hands out `&Connection`. IMMEDIATE for the same
-    // reason eviction uses it - this reads the recorded version and then writes, and a
-    // deferred transaction that has already read must upgrade, which SQLite refuses rather
-    // than waiting.
+) -> Result<u32, rusqlite::Error> {
     let transaction = Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
+    let recorded = component_version_raw(&transaction, component)?;
+    if recorded >= migration.version {
+        return Ok(recorded);
+    }
     transaction.execute_batch(migration.sql)?;
     transaction.execute(
         &format!(
             "INSERT INTO {COMPONENT_TABLE} (name, version) VALUES (?1, ?2) \
-             ON CONFLICT (name) DO UPDATE SET version = excluded.version"
+             ON CONFLICT(name) DO UPDATE SET version = excluded.version"
         ),
         rusqlite::params![component, i64::from(migration.version)],
     )?;
-    transaction.commit()
+    transaction.commit()?;
+    Ok(migration.version)
 }
 
 /// Assert at compile time that a migration list is ordered and dense from 1.
@@ -284,34 +309,47 @@ pub const fn assert_dense(migrations: &[ComponentMigration]) {
 /// [`StoreError::SchemaTooNew`] when the file is ahead of this build,
 /// [`StoreError::Migrate`] when a step fails - in which case the version is unchanged.
 pub fn migrate(connection: &mut Connection, path: &std::path::Path) -> Result<u32, StoreError> {
-    let mut version = current_version(connection)?;
+    let version = current_version(connection)?;
     let latest = latest_version();
 
     if version > latest {
         return Err(StoreError::SchemaTooNew { path: path.to_path_buf(), found: version, supported: latest });
     }
 
+    let mut version = version;
     for migration in MIGRATIONS {
-        if migration.version <= version {
-            continue;
-        }
-        apply(connection, migration).map_err(|source| StoreError::Migrate {
-            from: version,
-            to: migration.version,
-            source,
-        })?;
-        version = migration.version;
+        version = apply_once(connection, migration, version)?;
     }
 
     Ok(version)
 }
 
-/// Run one migration, DDL and version bump together.
-fn apply(connection: &mut Connection, migration: &Migration) -> rusqlite::Result<()> {
-    let transaction: Transaction<'_> = connection.transaction()?;
-    transaction.execute_batch(migration.sql)?;
-    transaction.pragma_update(None, "user_version", i64::from(migration.version))?;
-    transaction.commit()
+/// Apply one migration, re-reading the recorded version under the write
+/// lock.
+///
+/// Two processes can open one file and both read `user_version` before
+/// either migrates. The re-read inside the IMMEDIATE transaction is what
+/// keeps the loser safe: it waits for the winner's commit, sees the new
+/// version, and skips - where a version read outside the transaction
+/// would have it re-run applied DDL and fail.
+fn apply_once(connection: &mut Connection, migration: &Migration, version: u32) -> Result<u32, StoreError> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|source| StoreError::Migrate { from: version, to: migration.version, source })?;
+    let recorded = current_version(&transaction)?;
+    if recorded >= migration.version {
+        return Ok(recorded);
+    }
+    transaction
+        .execute_batch(migration.sql)
+        .and_then(|()| transaction.pragma_update(None, "user_version", i64::from(migration.version)))
+        .map_err(|source| StoreError::Migrate { from: recorded, to: migration.version, source })?;
+    transaction.commit().map_err(|source| StoreError::Migrate {
+        from: recorded,
+        to: migration.version,
+        source,
+    })?;
+    Ok(migration.version)
 }
 
 #[cfg(test)]
@@ -478,7 +516,7 @@ mod tests {
         };
 
         let before = current_version(&connection).expect("read");
-        let result = apply(&mut connection, &broken);
+        let result = apply_once(&mut connection, &broken, before);
         assert!(result.is_err(), "the migration was supposed to fail");
 
         assert_eq!(current_version(&connection).expect("read"), before, "the version moved");
@@ -557,6 +595,40 @@ mod tests {
         assert_eq!(component_version(&connection, "probe").expect("read"), 2);
         assert!(table_exists(&connection, "probe_one"));
         assert!(table_exists(&connection, "probe_two"));
+    }
+
+    #[test]
+    fn two_concurrent_openers_migrate_one_file_without_conflict() {
+        let path = std::env::temp_dir().join(format!(
+            "supra-migrate-race-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos())
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let path = path.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut connection = Connection::open(&path).expect("open");
+                connection.pragma_update(None, "busy_timeout", 5_000).expect("timeout");
+                migrate(&mut connection, &path).expect("core");
+                migrate_component(&connection, &path, "race", PROBE)
+            }));
+        }
+        for join in joins {
+            let reached = join.join().expect("thread").expect("migrate");
+            assert_eq!(reached, 2, "the loser must see the winner's version, not re-run DDL");
+        }
+
+        let check = Connection::open(&path).expect("reopen");
+        assert_eq!(component_version(&check, "race").expect("read"), 2);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -232,7 +232,13 @@ impl FileStore {
     ///
     /// As [`FileStore::get`], plus [`SecretsError::Crypto`] when encryption fails.
     pub fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), SecretsError> {
-        let mut vault = self.load().unwrap_or_default();
+        let mut vault = match self.load() {
+            Ok(vault) => vault,
+            Err(SecretsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                Vault::default()
+            }
+            Err(other) => return Err(other),
+        };
         // `record.secret` is a `String` field being overwritten with another `String`.
         // `clone_from` would be the reallocation-avoiding form; the plain assignment is
         // already that, so the pedantic suggestion misfires on a field.
@@ -336,11 +342,14 @@ impl FileStore {
             .encrypt((&nonce).into(), Payload { msg: &payload, aad: MAGIC })
             .map_err(|_| SecretsError::Crypto { detail: "encryption failed".to_owned() })?;
 
-        // Write atomically: write a temp file in the same directory, fsync, rename over the
-        // target. A crash mid-write must not leave a half-vault that reads as corrupt.
         let directory = self.path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(directory)
             .map_err(|error| SecretsError::Io { path: directory.to_path_buf(), source: error })?;
+
+        let file_name = self
+            .path
+            .file_name()
+            .map_or_else(|| "secrets.enc".to_owned(), |name| name.to_string_lossy().into_owned());
 
         let mut output = Vec::with_capacity(MAGIC.len() + salt.len() + nonce.len() + ciphertext.len());
         output.extend_from_slice(MAGIC);
@@ -348,17 +357,39 @@ impl FileStore {
         output.extend_from_slice(&nonce);
         output.extend_from_slice(&ciphertext);
 
-        let temp_path = self.path.with_extension("tmp");
-        let mut file = fs::File::create(&temp_path)
-            .map_err(|error| SecretsError::Io { path: temp_path.clone(), source: error })?;
-        // Restrict before the first secret byte lands: the process umask may be permissive, and
-        // a vault that is world-readable between creation and chmod is a leak with a window.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| SecretsError::Io { path: temp_path.clone(), source: error })?;
-        }
+        let mut attempts = 0u8;
+        let (mut file, temp_path) = loop {
+            attempts += 1;
+            if attempts > 32 {
+                return Err(SecretsError::Io {
+                    path: self.path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "could not allocate a fresh temp file after 32 attempts",
+                    ),
+                });
+            }
+            let suffix: String = random_bytes(6)?.iter().fold(String::new(), |mut hex, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            });
+            let candidate = self.path.with_file_name(format!(".{file_name}.{suffix}.tmp"));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            match options.open(&candidate) {
+                Ok(file) => break (file, candidate),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(SecretsError::Io { path: candidate, source: error });
+                }
+            }
+        };
         file.write_all(&output)
             .map_err(|error| SecretsError::Io { path: temp_path.clone(), source: error })?;
         file.sync_all().map_err(|error| SecretsError::Io { path: temp_path.clone(), source: error })?;
@@ -569,6 +600,57 @@ mod tests {
             assert_eq!(store.get("openai", "secondary").expect("get"), "value-c");
             let _ = fs::remove_file(&path);
         });
+    }
+
+    #[test]
+    fn a_wrong_passphrase_refuses_a_write_instead_of_erasing_the_vault() {
+        let path = scratch_path();
+        let _ = fs::remove_file(&path);
+        with_key(
+            || {
+                let store = FileStore::new(&path);
+                store.unlock("right");
+                store.set("svc", "one", "first").expect("set one");
+                store.set("svc", "two", "second").expect("set two");
+
+                store.unlock("wrong");
+                let error = store.set("svc", "three", "third").expect_err("refused");
+                assert!(matches!(error, SecretsError::Crypto { .. }), "{error}");
+
+                store.unlock("right");
+                assert_eq!(store.get("svc", "one").expect("get"), "first");
+                assert_eq!(store.get("svc", "two").expect("get"), "second");
+                assert!(matches!(store.get("svc", "three"), Err(SecretsError::NotFound { .. })));
+            },
+            "unused",
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_at_a_guessed_temp_name_cannot_redirect_a_write() {
+        use std::os::unix::fs::symlink;
+
+        let path = scratch_path();
+        let _ = fs::remove_file(&path);
+        let victim = scratch_path().with_extension("victim");
+        let _ = fs::remove_file(&victim);
+        let guessed = path.with_extension("tmp");
+        let _ = fs::remove_file(&guessed);
+        fs::write(&victim, b"do not touch").expect("victim");
+        symlink(&victim, &guessed).expect("symlink");
+
+        with_master_key(|| {
+            let store = FileStore::new(&path);
+            store.set("svc", "one", "secret").expect("set succeeds");
+            assert_eq!(store.get("svc", "one").expect("get"), "secret");
+        });
+        assert_eq!(fs::read(&victim).expect("read"), b"do not touch", "the link target is untouched");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&victim);
+        let _ = fs::remove_file(&guessed);
     }
 
     #[test]

@@ -39,7 +39,7 @@
 //! .expect("well-formed");
 //! ledger.append(segment).expect("append");
 //!
-//! let plan: Plan = plan_breakpoints(ledger.segments());
+//! let plan: Plan = plan_breakpoints(ledger.segments())?;
 //! assert_eq!(plan.bp4_previous, 1);
 //! # Ok::<(), supra_prompt::PromptError>(())
 //! ```

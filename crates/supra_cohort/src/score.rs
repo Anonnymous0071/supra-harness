@@ -76,11 +76,17 @@ impl AreaFlags {
 
     /// Derive from task file paths. Case-insensitive, because filesystems disagree
     /// about case and an `Auth/` directory is auth whatever its capitalisation.
+    /// Matched on path components rather than the raw substring, so
+    /// `src/author.rs` is not auth.
     #[must_use]
     pub fn of_paths(paths: &[&str]) -> Self {
         let sensitive = paths.iter().any(|path| {
-            let lower = path.to_lowercase();
-            lower.contains("auth") || lower.contains("crypto") || lower.contains("migrat")
+            path.split(['/', '\\']).filter(|component| !component.is_empty()).any(|component| {
+                let lower = component.to_lowercase();
+                let stem = lower.strip_suffix(".rs").or_else(|| lower.strip_suffix(".ts")).unwrap_or(&lower);
+                let stem = stem.strip_suffix(".py").unwrap_or(stem);
+                stem == "auth" || stem == "crypto" || stem.starts_with("migrat")
+            })
         });
         Self { sensitive_area: sensitive, force_full: false }
     }
@@ -240,9 +246,10 @@ mod tests {
     fn area_matching_is_case_insensitive_and_narrow() {
         assert!(AreaFlags::of_paths(&["src/Auth/mod.rs"]).sensitive_area);
         assert!(AreaFlags::of_paths(&["src/CRYPTO/x.rs"]).sensitive_area);
-        // Narrow: "description" contains "crypt" but not "crypto" - wait, it does
-        // not contain "crypto" ("des-crypt-ion" - d-e-s-c-r-i-p... no "crypto").
-        // A path that merely rhymes must not escalate.
+        // A component that merely contains the letters must not escalate:
+        // only whole auth/crypto/migration component names do.
+        assert!(!AreaFlags::of_paths(&["src/author.rs"]).sensitive_area);
+        assert!(!AreaFlags::of_paths(&["src/authority.rs"]).sensitive_area);
         assert!(!AreaFlags::of_paths(&["src/description.rs"]).sensitive_area);
         assert!(!AreaFlags::of_paths(&["src/secret.rs"]).sensitive_area);
     }

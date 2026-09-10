@@ -5,11 +5,13 @@
 //! line, launch, read the first stop's stack trace, disconnect. The
 //! client is synchronous like T24's - the runtime owns the timing.
 
-use std::io::{BufRead, BufReader, Write};
+use std::collections::VecDeque;
+use std::io::Write;
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use supra_digest::Language;
+use supra_ffi::piped::PipedInput;
 
 use crate::adapters::Adapter;
 use crate::error::DapError;
@@ -19,9 +21,13 @@ use crate::framing::{Framed, StackFrame};
 pub struct Client {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Owns the descriptor `input` reads; dropped with the client.
+    #[allow(dead_code)]
+    stdout: ChildStdout,
+    input: PipedInput,
     next_seq: u64,
     initialized: bool,
+    events: VecDeque<serde_json::Value>,
 }
 
 /// A breakpoint the adapter confirmed.
@@ -56,24 +62,37 @@ impl Client {
         let adapter =
             Adapter::for_language(language).ok_or(DapError::Uncovered { language: language.name() })?;
         let mut command = Command::new(adapter.program());
-        command.args(adapter.args()).stdin(Stdio::piped()).stdout(Stdio::piped());
+        command.args(adapter.args());
+        Self::spawn_command(&mut command)
+    }
+
+    fn spawn_command(command: &mut Command) -> Result<Self, DapError> {
+        command.stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child = command
             .spawn()
-            .map_err(|error| DapError::Transport(format!("{}: {error}", adapter.program())))?;
+            .map_err(|error| DapError::Transport(format!("{:?}: {error}", command.get_program())))?;
         let stdin = child
             .stdin
             .take()
             .ok_or_else(|| DapError::Transport("stdin closed before the client took it".to_owned()))?;
-        let stdout = BufReader::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| DapError::Transport("stdout closed before the client took it".to_owned()))?,
-        );
-        Ok(Self { child, stdin, stdout, next_seq: 0, initialized: false })
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| DapError::Transport("stdout closed before the client took it".to_owned()))?;
+        let input = PipedInput::new(&stdout);
+        Ok(Self { child, stdin, stdout, input, next_seq: 0, initialized: false, events: VecDeque::new() })
     }
 
-    /// The initialize handshake plus the launch request.
+    /// The initialize handshake and launch, in the order the protocol
+    /// draws them.
+    ///
+    /// The DAP sequence is a request *and* an event: the adapter
+    /// answers `initialize`, then emits its `initialized` event, and
+    /// only considers configuration open once the client has seen it.
+    /// Adapters that follow the spec's own diagram withhold the
+    /// `launch` response until `configurationDone` arrives, so waiting
+    /// for launch before configuring deadlocks both sides. This sends
+    /// launch, configures, then collects the responses in order.
     ///
     /// # Errors
     ///
@@ -90,14 +109,21 @@ impl Client {
             }),
         )?;
         let _ = capabilities;
-        let launched = self.request(
+
+        let initialized = self.wait_event("initialized")?;
+        let _ = initialized;
+
+        let launch_seq = self.send(
             "launch",
             &serde_json::json!({
                 "program": program.display().to_string(),
                 "stopOnEntry": false,
             }),
         )?;
-        let _ = launched;
+        let configured_seq = self.send("configurationDone", &serde_json::json!({}))?;
+
+        self.await_response("launch", launch_seq)?;
+        self.await_response("configurationDone", configured_seq)?;
         self.initialized = true;
         Ok(())
     }
@@ -132,7 +158,11 @@ impl Client {
         })
     }
 
-    /// Read one event, skipping responses already consumed.
+    /// Read one event, from the queue first, then the stream.
+    ///
+    /// Events that arrived while a request was being answered are held
+    /// rather than discarded: a `stopped` that lands mid-request is the
+    /// stop the caller is about to ask for, not noise.
     ///
     /// # Errors
     ///
@@ -140,10 +170,17 @@ impl Client {
     /// frame does not parse.
     pub fn wait_event(&mut self, name: &str) -> Result<serde_json::Value, DapError> {
         loop {
-            let (framed, event) = self.read_one()?;
-            match framed {
-                Framed::Event { event: seen } if seen == name => return Ok(event),
-                Framed::Event { .. } | Framed::Response { .. } => {}
+            while let Some(event) = self.events.pop_front() {
+                if event.get("event").and_then(serde_json::Value::as_str) == Some(name) {
+                    return Ok(event);
+                }
+            }
+            match self.read_one()? {
+                Framed::Event { event } if event == name => {
+                    return Ok(serde_json::json!({"event": event}));
+                }
+                Framed::Event { event } => self.events.push_back(serde_json::json!({"event": event})),
+                Framed::Response { .. } => {}
                 Framed::Malformed(reason) => return Err(DapError::Protocol(reason)),
             }
         }
@@ -171,11 +208,24 @@ impl Client {
         Ok(StackTrace { frames })
     }
 
+    /// Send one request and await its response, holding every event
+    /// that arrives on the way.
+    ///
+    /// # Errors
+    ///
+    /// [`DapError::Transport`] on I/O; [`DapError::Protocol`] when the
+    /// adapter refuses the command or the answer does not parse.
     fn request(
         &mut self,
         command: &str,
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, DapError> {
+        let request_seq = self.send(command, arguments)?;
+        self.await_response(command, request_seq)
+    }
+
+    /// Write one request without waiting for its answer.
+    fn send(&mut self, command: &str, arguments: &serde_json::Value) -> Result<u64, DapError> {
         self.next_seq += 1;
         let request_seq = self.next_seq;
         let message = serde_json::json!({
@@ -185,9 +235,14 @@ impl Client {
             "arguments": arguments.clone(),
         });
         self.write_framed(&message)?;
+        Ok(request_seq)
+    }
+
+    /// Read until the response for `request_seq` arrives, queueing
+    /// events.
+    fn await_response(&mut self, command: &str, request_seq: u64) -> Result<serde_json::Value, DapError> {
         loop {
-            let (framed, _) = self.read_one()?;
-            match framed {
+            match self.read_one()? {
                 Framed::Response { request_seq: seen, success, body, .. } if seen == request_seq => {
                     if success {
                         return Ok(body);
@@ -199,29 +254,52 @@ impl Client {
                         .unwrap_or("the adapter refused");
                     return Err(DapError::Protocol(format!("{command}: {message}")));
                 }
-                Framed::Event { .. } | Framed::Response { .. } => {}
+                Framed::Event { event } => self.events.push_back(serde_json::json!({"event": event})),
+                Framed::Response { .. } => {}
                 Framed::Malformed(reason) => return Err(DapError::Protocol(reason)),
             }
         }
     }
 
-    fn read_one(&mut self) -> Result<(Framed, serde_json::Value), DapError> {
-        let mut buffer = Vec::new();
-        self.stdout.read_until(b'}', &mut buffer).map_err(|error| {
-            self.wait_inner();
-            DapError::Transport(format!("read: {error}"))
-        })?;
-        if buffer.is_empty() {
+    fn read_one(&mut self) -> Result<Framed, DapError> {
+        let body = self.read_framed_body()?;
+        if body.is_empty() {
             self.wait_inner();
             return Err(DapError::Transport("the adapter closed without answering".to_owned()));
         }
-        let (framed, _) = crate::framing::read_frame(&buffer, 0);
-        let event = if let Framed::Event { event } = &framed {
-            serde_json::json!({"event": event})
-        } else {
-            serde_json::Value::Null
-        };
-        Ok((framed, event))
+        let (framed, _) = crate::framing::read_frame(&body, 0);
+        Ok(framed)
+    }
+
+    fn read_framed_body(&mut self) -> Result<Vec<u8>, DapError> {
+        let mut header = Vec::new();
+        loop {
+            let read = self.input.read_until(b'\n', &mut header).map_err(|error| {
+                self.wait_inner();
+                DapError::Transport(format!("read: {error}"))
+            })?;
+            if read == 0 {
+                return Ok(Vec::new());
+            }
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header_text =
+            std::str::from_utf8(&header).map_err(|_| DapError::Protocol("non-UTF-8 headers".to_owned()))?;
+        let content_length = header_text
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length:"))
+            .ok_or_else(|| DapError::Protocol("no Content-Length header".to_owned()))?
+            .trim()
+            .parse::<usize>()
+            .map_err(|error| DapError::Protocol(format!("Content-Length: {error}")))?;
+        let mut message = header;
+        self.input.read_exact_to(content_length, &mut message).map_err(|error| {
+            self.wait_inner();
+            DapError::Transport(format!("read body: {error}"))
+        })?;
+        Ok(message)
     }
 
     fn write_framed(&mut self, value: &serde_json::Value) -> Result<(), DapError> {
@@ -240,8 +318,75 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        let _ = self.request("disconnect", &serde_json::json!({"terminateDebuggee": true}));
+        // Kill before any teardown request: a disconnect written to a
+        // hung adapter would block Drop for as long as the adapter
+        // stayed silent, and the process is going away regardless.
         self.wait_inner();
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+
+    const SPEC_FAITHFUL_ADAPTER: &str = r#"
+import sys, json
+
+def read_frame():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1].strip())
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    data = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(data))
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+launch_seq = None
+while True:
+    msg = read_frame()
+    if msg is None:
+        break
+    command = msg.get("command")
+    if command == "initialize":
+        send({"seq": 1, "type": "response", "request_seq": msg["seq"], "success": True,
+              "command": "initialize", "body": {}})
+        send({"seq": 2, "type": "event", "event": "initialized"})
+    elif command == "launch":
+        launch_seq = msg["seq"]
+    elif command == "configurationDone":
+        send({"seq": 3, "type": "response", "request_seq": launch_seq, "success": True,
+              "command": "launch", "body": {}})
+        send({"seq": 4, "type": "response", "request_seq": msg["seq"], "success": True,
+              "command": "configurationDone", "body": {}})
+"#;
+
+    /// The deadlock shape, stated as a test: a spec-faithful adapter
+    /// holds its `launch` response until `configurationDone` arrives,
+    /// and the client that waited for launch before configuring would
+    /// hang here for the whole read deadline.
+    #[test]
+    fn the_handshake_survives_an_adapter_that_waits_for_configuration_done() {
+        let mut command = Command::new("python3");
+        command.args(["-u", "-c", SPEC_FAITHFUL_ADAPTER]);
+        let mut client = Client::spawn_command(&mut command).expect("spawn the fake adapter");
+        client.input.set_step_timeout(std::time::Duration::from_secs(10));
+
+        let program = std::env::temp_dir().join("supra-dap-target.rs");
+        let start = std::time::Instant::now();
+        client.initialize(&program).expect("the handshake completes");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "the client configured instead of waiting on the withheld launch response"
+        );
     }
 }
 

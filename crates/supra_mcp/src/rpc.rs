@@ -49,6 +49,10 @@ impl Request<'_> {
 /// A JSON-RPC response: either a result or an error object, never both.
 #[derive(Debug, Deserialize)]
 pub struct Response {
+    /// `"2.0"`, always - checked, because a payload that does not claim
+    /// the version is not a JSON-RPC response, whatever shape it has.
+    #[serde(default)]
+    pub jsonrpc: Option<String>,
     /// Correlates with the request's `id`.
     #[serde(default)]
     pub id: Option<u64>,
@@ -112,6 +116,9 @@ pub struct RemoteTool {
 pub struct ToolsListResult {
     /// The server's tools.
     pub tools: Vec<RemoteTool>,
+    /// The cursor the next page starts at, when the list is paginated.
+    #[serde(rename = "nextCursor", default)]
+    pub next_cursor: Option<String>,
 }
 
 #[cfg(test)]

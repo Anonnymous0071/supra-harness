@@ -15,7 +15,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior};
 use supra_store::Store;
 
 use crate::cache::{CacheStats, DEFAULT_CACHE_BYTES, ExactCache};
@@ -82,6 +82,7 @@ pub struct VectorIndex {
 struct State {
     codes: CodeTable,
     cache: ExactCache,
+    revision: u64,
 }
 
 impl VectorIndex {
@@ -168,11 +169,12 @@ impl VectorIndex {
         };
 
         let codes = load_codes(&store, &meta)?;
+        let revision = read_revision(&store)?;
         Ok(Self {
             store,
             meta,
             options,
-            state: Mutex::new(State { codes, cache: ExactCache::new(options.cache_bytes) }),
+            state: Mutex::new(State { codes, cache: ExactCache::new(options.cache_bytes), revision }),
         })
     }
 
@@ -240,7 +242,7 @@ impl VectorIndex {
         let blob = codes::encode_embedding(embedding);
         let stamp = now_ms();
 
-        let slot =
+        let (slot, revision) =
             self.store.with_transaction::<_, VectorError>(TransactionBehavior::Immediate, |transaction| {
                 let slot: i64 = transaction.query_row(
                     "INSERT INTO vector_entry (locator, embedding, code, updated_at) \
@@ -262,7 +264,8 @@ impl VectorIndex {
                     "INSERT INTO vector_text (rowid, body) VALUES (?1, ?2)",
                     rusqlite::params![slot, body],
                 )?;
-                Ok(slot)
+                let revision = bump_revision(transaction)?;
+                Ok((slot, revision))
             })?;
 
         // Only after the commit. The resident tier is a cache of what is durable, and updating
@@ -270,6 +273,7 @@ impl VectorIndex {
         let mut state = self.state();
         state.codes.upsert(slot, &code);
         state.cache.invalidate(slot);
+        state.revision = revision;
         Ok(slot)
     }
 
@@ -279,7 +283,7 @@ impl VectorIndex {
     ///
     /// [`VectorError::Store`] or [`VectorError::Sqlite`] for a write failure.
     pub fn remove(&self, locator: &str) -> Result<bool, VectorError> {
-        let slot =
+        let removed =
             self.store.with_transaction::<_, VectorError>(TransactionBehavior::Immediate, |transaction| {
                 let slot: Option<i64> = transaction
                     .query_row(
@@ -288,16 +292,17 @@ impl VectorIndex {
                         |row| row.get(0),
                     )
                     .optional()?;
-                if let Some(slot) = slot {
-                    transaction.execute("DELETE FROM vector_text WHERE rowid = ?1", [slot])?;
-                }
-                Ok(slot)
+                let Some(slot) = slot else { return Ok(None) };
+                transaction.execute("DELETE FROM vector_text WHERE rowid = ?1", [slot])?;
+                let revision = bump_revision(transaction)?;
+                Ok(Some((slot, revision)))
             })?;
 
-        let Some(slot) = slot else { return Ok(false) };
+        let Some((slot, revision)) = removed else { return Ok(false) };
         let mut state = self.state();
         state.codes.remove(slot);
         state.cache.invalidate(slot);
+        state.revision = revision;
         Ok(true)
     }
 
@@ -312,6 +317,7 @@ impl VectorIndex {
     /// [`VectorError::WrongWidth`] or [`VectorError::Degenerate`] for an unusable query,
     /// [`VectorError::Malformed`] when a stored vector is not the width the schema promised.
     pub fn search_semantic(&self, query: &[f32], limit: usize) -> Result<Vec<Hit>, VectorError> {
+        self.sync_if_stale()?;
         codes::validate(query, self.meta.dims)?;
         if limit == 0 {
             return Ok(Vec::new());
@@ -506,6 +512,29 @@ impl VectorIndex {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Reload resident state when another handle has written the file.
+    ///
+    /// Two `VectorIndex` handles on one store are legal - the digest and a
+    /// sibling lane both want one - and neither can see the other's writes
+    /// through its resident tier or its exact cache. The revision the
+    /// writer bumped is the signal: when it moved, the codes are reloaded
+    /// and the cache dropped before the query reads either.
+    fn sync_if_stale(&self) -> Result<(), VectorError> {
+        let current = read_revision(&self.store)?;
+        if self.state().revision == current {
+            return Ok(());
+        }
+        let codes = load_codes(&self.store, &self.meta)?;
+        let mut state = self.state();
+        if state.revision == current {
+            return Ok(());
+        }
+        state.codes = codes;
+        state.cache = ExactCache::new(self.options.cache_bytes);
+        state.revision = current;
+        Ok(())
+    }
 }
 
 /// Lock-free, and therefore partial: reporting the resident count would take the mutex the
@@ -595,6 +624,28 @@ fn push_term(terms: &mut Vec<String>, term: &str) {
         return;
     }
     terms.push(quoted);
+}
+
+/// The store's current revision, as writers bumped it.
+fn read_revision(store: &Store) -> Result<u64, VectorError> {
+    store.with_connection(|connection| {
+        let revision: Option<i64> = connection
+            .query_row("SELECT revision FROM vector_meta WHERE id = 1", [], |row| row.get(0))
+            .optional()?;
+        Ok(u64::try_from(revision.unwrap_or(0)).unwrap_or(0))
+    })
+}
+
+/// Bump the revision inside a write transaction and return the new value.
+fn bump_revision(transaction: &Transaction<'_>) -> Result<u64, VectorError> {
+    let revision: i64 = transaction
+        .query_row(
+            "UPDATE vector_meta SET revision = revision + 1 WHERE id = 1 RETURNING revision",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(VectorError::Sqlite)?;
+    Ok(u64::try_from(revision).unwrap_or(0))
 }
 
 fn read_meta(connection: &Connection) -> Result<Option<Meta>, VectorError> {

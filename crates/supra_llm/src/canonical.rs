@@ -282,9 +282,32 @@ impl<'a> Scanner<'a> {
                         });
                     }
                     let hex = &self.text[self.position + 1..self.position + 5];
-                    let code = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
-                    text.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                    let code = u32::from_str_radix(hex, 16).map_err(|_| CanonicalError::Invalid {
+                        detail: "malformed unicode escape".to_owned(),
+                    })?;
                     self.position += 4;
+                    // A high surrogate pairs with the `\uXXXX` that follows; serde (the
+                    // parser the canonical form is checked against) resolves pairs, so
+                    // the scanner must decode the same key the parser will decode - a
+                    // lone surrogate is not a JSON string at all.
+                    if (0xD800..0xDC00).contains(&code) {
+                        if self.text[self.position + 1..].starts_with("\\u") {
+                            let low_hex = &self.text[self.position + 3..self.position + 7];
+                            let low = u32::from_str_radix(low_hex, 16).unwrap_or(0);
+                            self.position += 6;
+                            let combined = 0x1_0000 + ((code - 0xD800) << 10) + (low.saturating_sub(0xDC00));
+                            text.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
+                            self.position += 1;
+                            continue;
+                        }
+                        return Err(CanonicalError::Invalid { detail: "lone high surrogate".to_owned() });
+                    }
+                    if (0xDC00..0xE000).contains(&code) {
+                        return Err(CanonicalError::Invalid { detail: "lone low surrogate".to_owned() });
+                    }
+                    text.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                    self.position += 1;
+                    continue;
                 }
                 _ => {
                     return Err(CanonicalError::Invalid { detail: "invalid escape".to_owned() });
@@ -469,6 +492,27 @@ mod tests {
         // Source-distinct but semantically identical: {"A":1,"\u0041":2} parses to one key.
         let error = canonicalize("{\"A\":1,\"\\u0041\":2}").expect_err("escaped duplicates are refused");
         assert!(matches!(error, CanonicalError::DuplicateKey { .. }), "{error}");
+    }
+
+    #[test]
+    fn surrogate_escaped_duplicate_keys_are_refused() {
+        // Literal 𝄞 and its surrogate-pair escape decode to the same string, so serde
+        // would collapse them into one key and silently last-wins.
+        let error = canonicalize("{\"𝄞\":1,\"\\uD834\\uDD1E\":2}")
+            .expect_err("surrogate-escaped duplicates are refused");
+        assert!(matches!(error, CanonicalError::DuplicateKey { .. }), "{error}");
+    }
+
+    #[test]
+    fn lone_surrogate_escapes_are_invalid() {
+        assert!(matches!(canonicalize("{\"\\uD834\":1}"), Err(CanonicalError::Invalid { .. })));
+        assert!(matches!(canonicalize("{\"\\uDD1E\":1}"), Err(CanonicalError::Invalid { .. })));
+    }
+
+    #[test]
+    fn a_paired_surrogate_decodes_to_its_scalar() {
+        let out = canonicalize("{\"\\uD834\\uDD1E\":1}").expect("paired surrogate");
+        assert_eq!(out.as_str(), "{\"𝄞\":1}");
     }
 
     #[test]

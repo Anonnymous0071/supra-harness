@@ -42,23 +42,26 @@ pub struct EconomyReport {
 }
 
 impl EconomyReport {
-    /// Build from individual measurements.
+    /// Build from individual measurements. An empty list yields `None`:
+    /// a report with no evidence would pass vacuously, and a gate that
+    /// certifies nothing measured certifies too much.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
-    pub fn from_measurements(measurements: &[TurnMeasurement]) -> Self {
-        if measurements.is_empty() {
-            return Self { tier_accuracy: 1.0, mean_mills_per_turn: 0.0, cache_hit_rate: 0.0, turns: 0 };
+    pub fn from_measurements(measurements: &[TurnMeasurement]) -> Option<Self> {
+        let total = measurements.len();
+        if total == 0 {
+            return None;
         }
-        let total = measurements.len() as f64;
+        let total_f = total as f64;
         let hits = measurements.iter().filter(|m| m.predicted == m.admitted).count() as f64;
         let cache_hits = measurements.iter().filter(|m| m.cache_hit).count() as f64;
         let total_mills: u64 = measurements.iter().map(|m| m.cost_mills).sum();
-        Self {
-            tier_accuracy: hits / total,
-            mean_mills_per_turn: total_mills as f64 / total,
-            cache_hit_rate: cache_hits / total,
-            turns: measurements.len(),
-        }
+        Some(Self {
+            tier_accuracy: hits / total_f,
+            mean_mills_per_turn: total_mills as f64 / total_f,
+            cache_hit_rate: cache_hits / total_f,
+            turns: total,
+        })
     }
 
     /// Whether the report passes the gate: accuracy and cost within budget.
@@ -149,6 +152,25 @@ pub fn measure(
     }
 }
 
+/// Price one turn from the provider's own reported usage, falling back to
+/// the caller's estimate only where the provider said nothing. Usage the
+/// provider reports overrides the estimate in both directions.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn measure_reported(
+    predicted: &str,
+    admitted: &str,
+    completion: &supra_llm::Completion,
+    estimated_input: u32,
+) -> TurnMeasurement {
+    let input_tokens = completion
+        .usage
+        .map_or(estimated_input, |usage| u32::try_from(usage.input_tokens).unwrap_or(u32::MAX));
+    let mut measurement = measure(predicted, admitted, completion, input_tokens);
+    measurement.cache_hit = completion.usage.is_some_and(|usage| usage.cached_tokens > 0);
+    measurement
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,7 +214,7 @@ mod tests {
                 cost_mills: 30,
             },
         ];
-        let report = EconomyReport::from_measurements(&measurements);
+        let report = EconomyReport::from_measurements(&measurements).expect("two measurements aggregate");
         assert!((report.tier_accuracy - 0.5).abs() < f64::EPSILON);
         assert!((report.cache_hit_rate - 0.5).abs() < f64::EPSILON);
         assert!((report.mean_mills_per_turn - 20.0).abs() < f64::EPSILON);
@@ -204,10 +226,30 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_session_passes_vacuously() {
-        let report = EconomyReport::from_measurements(&[]);
-        assert_eq!(report.turns, 0);
-        assert!(report.passes(1.0, 0.0));
+    fn an_empty_session_yields_no_report() {
+        assert!(EconomyReport::from_measurements(&[]).is_none(), "no evidence, no certificate");
+    }
+
+    #[test]
+    fn reported_usage_overrides_the_estimate() {
+        let completion = supra_llm::Completion {
+            text: "ok".to_owned(),
+            usage: Some(supra_llm::Usage { input_tokens: 5_000, output_tokens: 40, cached_tokens: 4_000 }),
+            thinking: supra_llm::Thinking { budget_tokens: 0 },
+        };
+        let measured = measure_reported("E1", "E1", &completion, 1_000);
+        assert_eq!(measured.input_tokens, 5_000, "the provider's number wins");
+        assert_eq!(measured.output_tokens, 40);
+        assert!(measured.cache_hit);
+
+        let silent = supra_llm::Completion {
+            text: "ok".to_owned(),
+            usage: None,
+            thinking: supra_llm::Thinking { budget_tokens: 0 },
+        };
+        let estimated = measure_reported("E1", "E1", &silent, 1_000);
+        assert_eq!(estimated.input_tokens, 1_000, "no report falls back to the estimate");
+        assert!(!estimated.cache_hit, "absent usage is not a cache hit");
     }
 
     #[test]

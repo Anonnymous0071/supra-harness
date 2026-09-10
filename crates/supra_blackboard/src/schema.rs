@@ -5,6 +5,7 @@ pub const COMPONENT: &str = "blackboard";
 
 const CLAIM_TABLE: &str = "bb_claim";
 const VOTE_TABLE: &str = "bb_vote";
+const VALIDATOR_TABLE: &str = "bb_validator";
 
 /// The blackboard's schema steps, in order.
 pub const MIGRATIONS: &[ComponentMigration] = &[ComponentMigration {
@@ -42,10 +43,18 @@ pub const MIGRATIONS: &[ComponentMigration] = &[ComponentMigration {
         ) STRICT;
 
         CREATE INDEX bb_vote_claim ON bb_vote (claim_id);
+
+        CREATE TABLE bb_validator (
+            claim_id TEXT NOT NULL
+                     CHECK (length(claim_id) = 26),
+            agent    TEXT NOT NULL
+                     CHECK (length(agent) = 26),
+            PRIMARY KEY (claim_id, agent)
+        ) STRICT;
     ",
 }];
 
-/// Insert one claim row.
+/// Insert one claim row with its validator roster.
 pub(super) fn insert_claim(
     tx: &rusqlite::Transaction<'_>,
     claim: supra_types::ClaimId,
@@ -54,6 +63,7 @@ pub(super) fn insert_claim(
     body: &str,
     k: usize,
     status: &str,
+    validators: &[supra_types::AgentId],
 ) -> Result<(), supra_store::StoreError> {
     tx.prepare_cached(&format!(
         "INSERT INTO {CLAIM_TABLE} (claim_id, turn_id, proposer, body, k, created_at, status) \
@@ -68,6 +78,11 @@ pub(super) fn insert_claim(
         now_ms(),
         status
     ])?;
+    let mut insert_validator =
+        tx.prepare_cached(&format!("INSERT INTO {VALIDATOR_TABLE} (claim_id, agent) VALUES (?1, ?2)"))?;
+    for agent in validators {
+        insert_validator.execute(rusqlite::params![claim.to_string(), agent.to_string()])?;
+    }
     Ok(())
 }
 
@@ -105,6 +120,17 @@ pub(super) fn insert_vote(
     Ok(())
 }
 
+/// Remove a vote row, undoing an insert whose tally refused.
+pub(super) fn delete_vote(
+    tx: &rusqlite::Transaction<'_>,
+    claim: supra_types::ClaimId,
+    voter: supra_types::AgentId,
+) -> Result<(), supra_store::StoreError> {
+    tx.prepare_cached(&format!("DELETE FROM {VOTE_TABLE} WHERE claim_id = ?1 AND voter = ?2"))?
+        .execute(rusqlite::params![claim.to_string(), voter.to_string()])?;
+    Ok(())
+}
+
 /// One claim row as the board reads it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredClaim {
@@ -139,6 +165,83 @@ fn vote_text(vote: supra_types::Vote) -> &'static str {
         supra_types::Vote::No => "no",
         supra_types::Vote::Abstain => "abstain",
     }
+}
+
+fn vote_from_text(text: &str) -> Option<supra_types::Vote> {
+    match text {
+        "yes" => Some(supra_types::Vote::Yes),
+        "no" => Some(supra_types::Vote::No),
+        "abstain" => Some(supra_types::Vote::Abstain),
+        _ => None,
+    }
+}
+
+/// Read every stored claim with its validators and votes, in id order.
+pub(super) fn read_all(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<Vec<(StoredClaim, Vec<supra_types::AgentId>, Vec<StoredVote>)>, supra_store::StoreError> {
+    let mut statement = tx.prepare_cached(&format!(
+        "SELECT claim_id, turn_id, proposer, body, k, status FROM {CLAIM_TABLE} ORDER BY claim_id"
+    ))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut claims = Vec::with_capacity(rows.len());
+    for (claim_id, turn_id, proposer, body, k, status) in rows {
+        let claim = supra_types::ClaimId::try_from(claim_id.clone())
+            .map_err(|_| supra_store::StoreError::Malformed { detail: format!("bad claim id {claim_id}") })?;
+        let turn = supra_types::TurnId::try_from(turn_id.clone())
+            .map_err(|_| supra_store::StoreError::Malformed { detail: format!("bad turn id {turn_id}") })?;
+        let proposer = supra_types::AgentId::try_from(proposer.clone()).map_err(|_| {
+            supra_store::StoreError::Malformed { detail: format!("bad proposer id {proposer}") }
+        })?;
+
+        let mut validators_statement = tx.prepare_cached(&format!(
+            "SELECT agent FROM {VALIDATOR_TABLE} WHERE claim_id = ?1 ORDER BY agent"
+        ))?;
+        let validators = validators_statement
+            .query_map([&claim_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|agent| {
+                supra_types::AgentId::try_from(agent.clone()).map_err(|_| {
+                    supra_store::StoreError::Malformed { detail: format!("bad agent id {agent}") }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut votes_statement = tx.prepare_cached(&format!(
+            "SELECT voter, vote FROM {VOTE_TABLE} WHERE claim_id = ?1 ORDER BY voter"
+        ))?;
+        let votes = votes_statement
+            .query_map([&claim_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(voter, vote)| {
+                let voter = supra_types::AgentId::try_from(voter.clone()).map_err(|_| {
+                    supra_store::StoreError::Malformed { detail: format!("bad voter id {voter}") }
+                })?;
+                let vote = vote_from_text(&vote).ok_or_else(|| supra_store::StoreError::Malformed {
+                    detail: format!("bad vote {vote}"),
+                })?;
+                Ok(StoredVote { claim, voter, vote })
+            })
+            .collect::<Result<Vec<_>, supra_store::StoreError>>()?;
+
+        let stored = StoredClaim { claim, turn, proposer, body, k: usize::try_from(k).unwrap_or(0), status };
+        claims.push((stored, validators, votes));
+    }
+    Ok(claims)
 }
 
 fn now_ms() -> i64 {

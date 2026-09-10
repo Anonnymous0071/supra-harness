@@ -90,17 +90,30 @@ pub fn user_config_path() -> Option<PathBuf> {
 /// Walks upward and stops at the first hit, so the innermost project wins - the same
 /// rule git uses for its own configuration, and the one a reader already expects.
 /// Returns `None` when the walk reaches the filesystem root without finding one.
-#[must_use]
-pub fn project_config_path(start: &Path) -> Option<PathBuf> {
+///
+/// # Errors
+///
+/// [`ConfigError::Unreadable`] when a candidate path cannot be inspected at all:
+/// `exists` would silently turn a permission refusal into "no file here" and let an
+/// outer project's configuration win over an inner one the reader could not see.
+pub fn project_config_path(start: &Path) -> Result<Option<PathBuf>, ConfigError> {
     let mut directory = Some(start);
     while let Some(current) = directory {
         let candidate = current.join(PROJECT_DIR).join(CONFIG_FILE);
-        if candidate.exists() {
-            return Some(candidate);
+        match candidate.try_exists() {
+            Ok(true) => return Ok(Some(candidate)),
+            Ok(false) => {}
+            Err(source) => {
+                return Err(ConfigError::Unreadable {
+                    layer: ConfigSource::Project,
+                    path: candidate,
+                    source,
+                });
+            }
         }
         directory = current.parent();
     }
-    None
+    Ok(None)
 }
 
 /// Open a path that must be a regular file, without risking a block.
@@ -373,13 +386,15 @@ mod tests {
         fs::write(outer.join(PROJECT_DIR).join(CONFIG_FILE), "").expect("outer config");
 
         // From the leaf, the only file above is the outer one.
-        assert_eq!(project_config_path(&inner), Some(outer.join(PROJECT_DIR).join(CONFIG_FILE)));
+        let found = project_config_path(&inner).expect("walk").expect("a file");
+        assert_eq!(found, outer.join(PROJECT_DIR).join(CONFIG_FILE));
 
         // Add a nearer one; it must win.
         let middle = outer.join("middle");
         fs::create_dir_all(middle.join(PROJECT_DIR)).expect("middle config dir");
         fs::write(middle.join(PROJECT_DIR).join(CONFIG_FILE), "").expect("middle config");
-        assert_eq!(project_config_path(&inner), Some(middle.join(PROJECT_DIR).join(CONFIG_FILE)));
+        let found = project_config_path(&inner).expect("walk").expect("a file");
+        assert_eq!(found, middle.join(PROJECT_DIR).join(CONFIG_FILE));
     }
 
     #[test]
@@ -390,7 +405,21 @@ mod tests {
         // The walk reaches / without finding anything, unless the machine running the
         // test has a stray .supra at some ancestor - which would be a real finding
         // rather than a flaky test, so it is not defended against.
-        assert_eq!(project_config_path(&deep), None);
+        assert_eq!(project_config_path(&deep).expect("walk"), None);
+    }
+
+    #[test]
+    fn an_uninspectable_candidate_refuses_instead_of_being_skipped() {
+        // A regular file where the walk expects a directory makes every candidate
+        // below it uninspectable. `exists` would report "no file" and keep walking
+        // outward; `try_exists` refuses, so an outer config cannot silently win.
+        let scratch = Scratch::new("blocked-walk");
+        let blocker = scratch.path().join("blocker");
+        fs::write(&blocker, "not a directory").expect("blocker");
+        let start = blocker.join("child");
+
+        let error = project_config_path(&start).expect_err("uninspectable");
+        assert!(matches!(error, ConfigError::Unreadable { .. }), "{error}");
     }
 
     #[test]
@@ -401,7 +430,7 @@ mod tests {
         let project = scratch.path().join(PROJECT_DIR);
         fs::create_dir_all(project.join(CONFIG_FILE)).expect("directory shaped like a file");
 
-        let found = project_config_path(scratch.path()).expect("discovery finds it");
+        let found = project_config_path(scratch.path()).expect("walk").expect("discovery finds it");
         let error = read_shared(ConfigSource::Project, &found).expect_err("but reading refuses");
         assert!(error.to_string().contains("not a regular file"), "{error}");
     }

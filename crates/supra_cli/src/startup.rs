@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use supra_config::{Config, ConfigLayer, Loader, PermissionLayer, ThinkingLayer};
 use supra_log::{Format, LogHandle, LogOptions};
 
-use crate::args::Cli;
+use crate::args::{Cli, LogFormatArg};
 
 pub(crate) struct Startup {
     pub(crate) config: Config,
@@ -20,8 +20,8 @@ pub(crate) fn discover_resolve(cli: &Cli) -> anyhow::Result<Config> {
         loader = loader.with_project_start(PathBuf::from("/nonexistent-supra-no-project"));
     }
     let mut cli_layer = ConfigLayer::default();
-    if let Some(mode) = &cli.mode {
-        let setting = supra_config::ModeSetting::try_from(mode.clone())
+    if let Some(mode) = cli.mode {
+        let setting = supra_config::ModeSetting::try_from(mode.as_str().to_owned())
             .map_err(|detail| anyhow::anyhow!("{detail}"))?;
         cli_layer.permission.get_or_insert_with(PermissionLayer::default).mode = Some(setting);
     }
@@ -41,13 +41,11 @@ pub(crate) fn init_logging(cli: &Cli) -> anyhow::Result<Option<LogHandle>> {
     if let Some(path) = &cli.log {
         options = options.with_path(path.clone());
     }
-    if let Some(format) = &cli.log_format {
-        let parsed = match format.as_str() {
-            "json" => Format::Json,
-            "compact" => Format::Compact,
-            other => anyhow::bail!("--log-format must be json or compact, got {other:?}"),
-        };
-        options = options.with_format(parsed);
+    if let Some(format) = cli.log_format {
+        options = options.with_format(match format {
+            LogFormatArg::Json => Format::Json,
+            LogFormatArg::Compact => Format::Compact,
+        });
     }
     match supra_log::init(options) {
         Ok(handle) => Ok(Some(handle)),

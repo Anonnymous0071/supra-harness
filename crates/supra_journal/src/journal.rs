@@ -121,16 +121,21 @@ impl Journal {
     /// snapshot - an undo that "restores" nothing would report success
     /// while reverting nothing.
     ///
+    /// The stored path is absolute and symlink-resolved at snapshot time, so
+    /// an undo restores the same file whatever the working directory is by
+    /// then.
+    ///
     /// # Errors
     ///
-    /// [`JournalError::Io`] when the file cannot be read.
+    /// [`JournalError::Io`] when the file cannot be read or resolved.
     /// [`JournalError::Store`] when the snapshot row cannot be committed.
     pub fn snapshot(&self, path: impl AsRef<Path>) -> Result<SnapshotId, JournalError> {
         let path = path.as_ref();
         let bytes = std::fs::read(path)?;
+        let canonical = std::fs::canonicalize(path)?;
         let digest = snapshot_digest(&bytes);
         let id = SnapshotId::generate();
-        let path_text = path.to_string_lossy().into_owned();
+        let path_text = canonical.to_string_lossy().into_owned();
 
         self.store.with_transaction::<_, JournalError>(TransactionBehavior::Immediate, |transaction| {
             schema::insert(transaction, id, &path_text, &bytes, &digest)?;
@@ -181,12 +186,24 @@ impl Journal {
                 return Err(JournalError::Corrupt { snapshot, stored: stored_digest, computed });
             }
 
-            // Write, then flush, inside the transaction: the restore
-            // survives power loss, and the mark cannot commit without
-            // the write having happened.
-            let mut file = std::fs::File::create(Path::new(&path))?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
+            let target = std::path::PathBuf::from(&path);
+            let directory = target.parent().map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
+            let file_name = target
+                .file_name()
+                .map_or_else(|| std::ffi::OsString::from("supra-restore"), std::ffi::OsString::from);
+            let temporary = directory.join(format!(".supra-undo-{snapshot}-{}", file_name.to_string_lossy()));
+
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let mut file =
+                    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+            }
+            // A rename replaces whatever sits at the target - a symlink
+            // included - without following it, so a swapped link cannot
+            // turn the restore into a write outside the workspace.
+            std::fs::rename(&temporary, &target)?;
 
             schema::mark_undone(transaction, snapshot)?;
             Ok(())
@@ -273,6 +290,43 @@ mod tests {
 
         journal.undo(id).expect("undo");
         assert_eq!(std::fs::read(&file).expect("read"), b"fn main() {}", "the original bytes return");
+    }
+
+    #[test]
+    fn a_relative_snapshot_restores_from_any_working_directory() {
+        static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = CWD_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let (journal, dir) = journal();
+        let file = dir.join("a.rs");
+        write_file(&file, b"original");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&dir).expect("chdir");
+        let id = journal.snapshot("a.rs").expect("relative snapshot");
+        std::env::set_current_dir(&original_cwd).expect("back");
+        write_file(&file, b"edited");
+
+        journal.undo(id).expect("undo from the original cwd");
+        assert_eq!(std::fs::read(&file).expect("read"), b"original");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn undo_replaces_a_swapped_symlink_without_following_it() {
+        let (journal, dir) = journal();
+        let file = dir.join("target.rs");
+        let outside = dir.join("outside.txt");
+        let link = dir.join("link.rs");
+        write_file(&file, b"original");
+        write_file(&outside, b"do not touch");
+
+        let id = journal.snapshot(&file).expect("snapshot");
+        write_file(&file, b"edited");
+        std::os::unix::fs::symlink(&outside, &link).expect("swap in a symlink at the snapshotted path");
+
+        journal.undo(id).expect("undo");
+        assert_eq!(std::fs::read(&file).expect("read"), b"original", "the path holds the restored bytes");
+        assert_eq!(std::fs::read(&link).expect("read"), b"do not touch", "the symlink target is untouched");
     }
 
     #[test]

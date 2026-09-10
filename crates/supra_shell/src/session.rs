@@ -108,12 +108,14 @@ impl ShellSession {
     /// [`ShellError::Pty`] when the master read itself fails.
     pub fn read(&mut self, out: &mut Vec<u8>) -> Result<Option<Shaped>, ShellError> {
         let mut buffer = [0u8; 4096];
-        let count = match self.pty.master().read(&mut buffer) {
-            Ok(0) => return Ok(None),
-            Ok(count) => count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(None),
-            Err(error) if error.raw_os_error() == Some(5) => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let count = loop {
+            match self.pty.master().read(&mut buffer) {
+                Ok(0) => return Ok(None),
+                Ok(count) => break count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.raw_os_error() == Some(5) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
         };
         self.shaper.push(&buffer[..count]);
         out.extend_from_slice(&buffer[..count]);

@@ -82,6 +82,8 @@
 
 pub mod ansi;
 pub mod fd;
+pub mod piped;
+pub mod process;
 pub mod pty;
 pub mod sandbox;
 pub mod width;

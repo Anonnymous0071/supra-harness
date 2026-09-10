@@ -27,15 +27,21 @@ impl Registry {
         Self::default()
     }
 
-    /// Register a hook. Refuses points inside the prefix.
+    /// Register a hook. Refuses points inside the prefix and blank
+    /// command lines - a hook that would run nothing is a registration
+    /// error, not a silent no-op at fire time.
     ///
     /// # Errors
     ///
     /// [`HookError::NotPrefixSafe`] when the point is not one of the
-    /// four boundaries.
+    /// four boundaries; [`HookError::Command`] when the command line is
+    /// blank.
     pub fn register(&mut self, hook: Hook) -> Result<(), HookError> {
         if !hook.point.is_prefix_safe() {
             return Err(HookError::NotPrefixSafe { point: hook.point });
+        }
+        if hook.command.trim().is_empty() {
+            return Err(HookError::Command("the hook command is blank".to_owned()));
         }
         self.hooks.entry(hook.point).or_default().push(hook);
         Ok(())
@@ -79,6 +85,12 @@ impl Registry {
     /// The event travels as JSON on the hook's stdin: the hook sees
     /// what fired it, and nothing it could use to mutate the prefix.
     ///
+    /// The child runs with a minimal environment: `PATH` and `HOME`
+    /// plus the two `SUPRA_*` variables this registry sets. The host's
+    /// secrets - the vault passphrase, credentials, the marker key -
+    /// do not ride along into a command that project configuration may
+    /// have registered.
+    ///
     /// # Errors
     ///
     /// [`HookError::Command`] when a command cannot start or exits
@@ -94,21 +106,24 @@ impl Registry {
             };
             let rest = words[1..].to_vec();
             let payload = serde_json::to_string(&context.event).unwrap_or_else(|_| "{}".to_owned());
-            let run = Command::new(program)
+            let mut command = Command::new(program);
+            command
                 .args(&rest)
+                .env_clear()
                 .env("SUPRA_HOOK_POINT", point.name())
                 .env("SUPRA_TURN_COUNT", context.turn_count.to_string())
+                .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+                .env("HOME", std::env::var_os("HOME").unwrap_or_default())
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .and_then(|mut child| {
-                    use std::io::Write as _;
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(payload.as_bytes());
-                    }
-                    child.wait()
-                });
+                .stderr(std::process::Stdio::null());
+            let run = command.spawn().and_then(|mut child| {
+                use std::io::Write as _;
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(payload.as_bytes());
+                }
+                child.wait()
+            });
             match run {
                 Ok(status) if status.success() => {}
                 Ok(status) if status.code() == Some(42) => outcome = HookOutcome::Stop,
@@ -207,6 +222,23 @@ mod tests {
         assert!(matches!(error, HookError::NotPrefixSafe { .. }));
         let error = registry.register_named("not-a-point", "true").expect_err("unknown");
         assert!(matches!(error, HookError::UnknownPoint { .. }));
+    }
+
+    #[test]
+    fn a_blank_command_is_refused_at_registration() {
+        let mut registry = Registry::new();
+        let error = registry.register(Hook { point: HookPoint::TurnStart, command: "   ".to_owned() });
+        assert!(matches!(error, Err(HookError::Command(_))), "{error:?}");
+    }
+
+    #[test]
+    fn a_hook_does_not_inherit_the_host_environment() {
+        // CARGO is set in the test harness's own environment; the hook
+        // must not see it. The command exits 7 when the variable leaked.
+        let mut registry = Registry::new();
+        registry.register_named("turn-start", "sh -c 'test -z \"$CARGO\" || exit 7'").expect("register");
+        let outcome = registry.fire(HookPoint::TurnStart, &context()).expect("fire");
+        assert_eq!(outcome, HookOutcome::Continue);
     }
 
     #[test]

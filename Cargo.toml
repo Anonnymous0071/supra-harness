@@ -78,6 +78,7 @@ authors = ["supra-harness contributors"]
 supra_types = { path = "crates/supra_types", version = "0.1.0" }
 supra_config = { path = "crates/supra_config", version = "0.1.0" }
 supra_store = { path = "crates/supra_store", version = "0.1.0" }
+libc = "0.2.189"
 supra_secrets = { path = "crates/supra_secrets", version = "0.1.0" }
 supra_log = { path = "crates/supra_log", version = "0.1.0" }
 supra_guard = { path = "crates/supra_guard", version = "0.1.0" }

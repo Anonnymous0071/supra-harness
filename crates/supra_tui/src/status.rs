@@ -125,38 +125,55 @@ impl StatusLine {
     /// still does not fit alone truncates.
     #[must_use]
     pub fn render(&self, cols: usize, theme: &Theme) -> String {
+        if cols == 0 {
+            return String::new();
+        }
         let measured: Vec<(u8, usize, &StatusSegment)> = self
             .segments
             .iter()
             .map(|segment| (segment.shed_at, width_of(&segment.text, theme), segment))
             .collect();
 
-        let mut keep = measured.clone();
+        let mut keep = measured;
         loop {
-            let total: usize = keep.iter().map(|(_, cells, _)| *cells).sum();
-            if total <= cols || keep.len() <= 1 || keep.iter().all(|(shed_at, _, _)| *shed_at == NEVER_SHED) {
+            let separators = keep.len().saturating_sub(1).saturating_mul(2);
+            let total = keep.iter().fold(separators, |sum, (_, cells, _)| sum.saturating_add(*cells));
+            if total <= cols || keep.iter().all(|(shed_at, _, _)| *shed_at == NEVER_SHED) {
                 break;
             }
-            let sheddable = keep.iter().filter(|(shed_at, _, _)| *shed_at > 0);
-            let Some(highest) = sheddable.map(|(shed_at, _, _)| shed_at).max().copied() else { break };
+            let Some(highest) = keep
+                .iter()
+                .filter(|(shed_at, _, _)| *shed_at > NEVER_SHED)
+                .map(|(shed_at, _, _)| *shed_at)
+                .max()
+            else {
+                break;
+            };
             keep.retain(|(shed_at, _, _)| *shed_at != highest);
-            if keep.is_empty() {
-                break;
-            }
         }
 
         let mut out = String::new();
-        for (_, cells, segment) in &keep {
-            let text = if *cells > cols && cols > 0 {
-                let truncated = supra_ffi::width::truncate(segment.text.as_bytes(), cols, theme.ambiguous);
-                String::from_utf8_lossy(&segment.text.as_bytes()[..truncated.bytes]).into_owned()
-            } else {
-                segment.text.clone()
-            };
+        let mut remaining = cols;
+        for (_, _, segment) in keep {
+            if remaining == 0 {
+                break;
+            }
+            if !out.is_empty() {
+                if remaining <= 2 {
+                    break;
+                }
+                out.push_str("  ");
+                remaining -= 2;
+            }
+            let truncated = supra_ffi::width::truncate(segment.text.as_bytes(), remaining, theme.ambiguous);
+            let text = String::from_utf8_lossy(&segment.text.as_bytes()[..truncated.bytes]);
+            if text.is_empty() {
+                break;
+            }
             out.push_str(&theme.paint(segment.token, &text));
-            out.push_str("  ");
+            remaining = remaining.saturating_sub(truncated.cells);
         }
-        out.trim_end().to_owned()
+        out
     }
 
     /// Every segment, unshed - for tests and for the wide render.
@@ -218,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn the_five_never_shed_segments_survive_a_narrow_terminal() {
+    fn the_never_shed_segments_keep_priority_on_a_narrow_terminal() {
         let line = StatusLine::live(
             "auto",
             40,
@@ -231,11 +248,11 @@ mod tests {
             0,
         );
         let rendered = line.render(12, &theme());
-        assert!(rendered.contains("ctx 40%"), "ctx never sheds: {rendered:?}");
-        assert!(rendered.contains("cache 90%"), "cache never sheds: {rendered:?}");
-        assert!(rendered.contains("cache broke"), "cache-break never sheds: {rendered:?}");
-        assert!(rendered.contains("+$0.014~"), "spend never sheds: {rendered:?}");
-        assert!(rendered.contains("mode auto"), "mode never sheds: {rendered:?}");
+        let mut plain = Vec::new();
+        supra_ffi::ansi::strip(rendered.as_bytes(), &mut plain);
+        assert!(plain.starts_with(b"ctx 40%"), "first never-shed segment survives: {rendered:?}");
+        let cells = supra_ffi::width::width(&plain, Ambiguous::Narrow);
+        assert!(cells <= 12, "narrow status is {cells} cells: {rendered:?}");
     }
 
     #[test]
@@ -272,6 +289,36 @@ mod tests {
         let cells = supra_ffi::width::width(rendered.as_bytes(), Ambiguous::Narrow);
         assert!(cells <= 4, "truncated to {rendered:?} is {cells} cells");
         assert_eq!(rendered.chars().count(), 4, "truncated text length");
+    }
+
+    #[test]
+    fn every_status_fits_the_global_width_budget() {
+        let segments = vec![
+            StatusSegment { shed_at: NEVER_SHED, text: "abcde".to_owned(), token: Token::Plain },
+            StatusSegment { shed_at: NEVER_SHED, text: "fghij".to_owned(), token: Token::Plain },
+            StatusSegment { shed_at: FIRST_SHED, text: "optional".to_owned(), token: Token::Plain },
+        ];
+        for cols in 0..=20 {
+            for ambiguous in [Ambiguous::Narrow, Ambiguous::Wide] {
+                let th = Theme::new(
+                    "probe",
+                    ambiguous,
+                    [
+                        (Token::Plain, &[]),
+                        (Token::Input, &[]),
+                        (Token::Answer, &[]),
+                        (Token::Thinking, &[]),
+                        (Token::Tool, &[]),
+                        (Token::Error, &[]),
+                        (Token::Muted, &[]),
+                        (Token::Accent, &[]),
+                    ],
+                );
+                let rendered = StatusLine::new(segments.clone()).render(cols, &th);
+                let cells = supra_ffi::width::width(rendered.as_bytes(), ambiguous);
+                assert!(cells <= cols, "cols {cols} amb {ambiguous:?}: {rendered:?} is {cells}");
+            }
+        }
     }
 
     #[test]

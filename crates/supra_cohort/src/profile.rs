@@ -40,9 +40,29 @@ pub struct TaskShape {
 
 impl TaskShape {
     /// The shape key: stable across runs, human-readable in the session file.
+    ///
+    /// Encoded length-first so delimiters inside a field cannot alias two
+    /// distinct shapes onto one key: `["a,b"]` and `["a","b"]` produce
+    /// different keys, and so do permutations, because every field is
+    /// sorted before encoding.
     #[must_use]
     pub fn key(&self) -> String {
-        format!("{}|{}|{}", self.tool_classes.join(","), self.areas.join(","), self.reversibility)
+        fn encode(values: &[String]) -> String {
+            let mut encoded = String::new();
+            for value in values {
+                encoded.push_str(&value.chars().count().to_string());
+                encoded.push(':');
+                encoded.push_str(value);
+                encoded.push(',');
+            }
+            encoded
+        }
+        format!(
+            "{}|{}|{}",
+            encode(&self.tool_classes),
+            encode(&self.areas),
+            encode(std::slice::from_ref(&self.reversibility))
+        )
     }
 }
 
@@ -111,7 +131,20 @@ mod tests {
             areas: vec!["general".to_owned()],
             reversibility: "R1".to_owned(),
         };
-        assert_eq!(shape.key(), "read|general|R1");
+        assert_eq!(shape.key(), "4:read,|7:general,|2:R1,");
         assert_eq!(shape.key(), shape.clone().key());
+    }
+
+    #[test]
+    fn delimiter_ambiguity_cannot_collapse_two_shapes() {
+        let joined =
+            TaskShape { tool_classes: vec!["a,b".to_owned()], areas: vec![], reversibility: "R1".to_owned() };
+        let separate = TaskShape {
+            tool_classes: vec!["a".to_owned(), "b".to_owned()],
+            areas: vec![],
+            reversibility: "R1".to_owned(),
+        };
+        assert_ne!(joined.key(), separate.key());
+        assert_ne!(joined.key(), TaskShape { areas: vec!["a|b|x".to_owned()], ..joined.clone() }.key());
     }
 }

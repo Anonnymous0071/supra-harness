@@ -20,7 +20,7 @@
 //! let mut counters = Counters::default();
 //! counters.turn();
 //! let report = counters.report(supra_types::Tier::E1);
-//! assert_eq!(report.turns, 1);
+//! assert_eq!(report.turns(), 1);
 //! ```
 
 #![deny(missing_docs)]

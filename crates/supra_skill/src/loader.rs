@@ -194,6 +194,13 @@ impl Skills {
     /// Whatever re-parsing or re-resolving refuses; the set is unchanged
     /// on refusal.
     pub fn apply_event(&mut self, event: &Event) -> Result<Vec<String>, SkillError> {
+        let mut candidate = self.clone();
+        let changed = candidate.apply_event_in_place(event)?;
+        *self = candidate;
+        Ok(changed)
+    }
+
+    fn apply_event_in_place(&mut self, event: &Event) -> Result<Vec<String>, SkillError> {
         let mut changed: BTreeSet<String> = BTreeSet::new();
 
         for path in &event.paths {
@@ -271,10 +278,7 @@ impl Skills {
     ///
     /// Whatever the inner apply refuses; the receiver is untouched.
     pub fn reload_from(&mut self, event: &Event) -> Result<Vec<String>, SkillError> {
-        let mut candidate = self.clone();
-        let changed = candidate.apply_event(event)?;
-        *self = candidate;
-        Ok(changed)
+        self.apply_event(event)
     }
 }
 
@@ -470,7 +474,7 @@ mod tests {
 
         std::fs::write(&base_path, skill_text("base", "d", "dependent")).expect("cycle");
         let error = skills
-            .reload_from(&event(notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)), &base_path))
+            .apply_event(&event(notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)), &base_path))
             .expect_err("cycle through reload");
         assert!(matches!(error, SkillError::Cycle { .. }), "{error:?}");
         // The previous state stands: base requires nothing, dependent

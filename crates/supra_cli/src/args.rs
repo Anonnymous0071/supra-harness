@@ -3,50 +3,86 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
-#[command(name = "supra", version, about = "supra-harness T30")]
+#[command(name = "supra", version, about = "Peer-validated coding-agent harness")]
 pub struct Cli {
-    #[arg(long)]
+    #[arg(long, help = "Skip project-local configuration; requires --yes")]
     pub ignore_project_config: bool,
 
-    #[arg(long)]
+    #[arg(long, help = "Confirm security-sensitive command-line overrides")]
     pub yes: bool,
 
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help = "Use PATH as the encrypted secrets store")]
     pub secrets_file: Option<PathBuf>,
 
-    #[arg(long, value_name = "MODE")]
-    pub mode: Option<String>,
+    #[arg(long, value_enum, help = "Override the permission mode")]
+    pub mode: Option<ModeArg>,
 
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", help = "Set the reasoning token budget")]
     pub think: Option<u32>,
 
-    #[arg(long, value_name = "ON|OFF", default_value = "on")]
-    pub sandbox: String,
+    #[arg(long, value_enum, default_value_t = SandboxArg::On, help = "Enable or disable sandboxing; off requires --yes")]
+    pub sandbox: SandboxArg,
 
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help = "Write structured logs to PATH")]
     pub log: Option<PathBuf>,
 
-    #[arg(long, value_name = "FORMAT")]
-    pub log_format: Option<String>,
+    #[arg(long, value_enum, help = "Select the structured log format")]
+    pub log_format: Option<LogFormatArg>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ModeArg {
+    Plan,
+    Ask,
+    Auto,
+    Yolo,
+}
+
+impl ModeArg {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Ask => "ask",
+            Self::Auto => "auto",
+            Self::Yolo => "yolo",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum SandboxArg {
+    #[default]
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum LogFormatArg {
+    Json,
+    Compact,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[command(about = "Start an interactive supra session")]
     Run,
+    #[command(about = "Run the offline evaluation suite")]
     Eval {
-        #[arg(long)]
+        #[arg(long, help = "Also run the provider-backed evaluation probe")]
         live: bool,
     },
+    #[command(about = "Check or apply signed supra updates")]
     Update {
         #[command(subcommand)]
         action: UpdateAction,
     },
+    #[command(about = "Inspect resolved configuration")]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -55,12 +91,15 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum UpdateAction {
+    #[command(about = "Check whether a signed update is available")]
     Check,
+    #[command(about = "Apply an update after signature verification")]
     Apply,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigAction {
+    #[command(about = "Show each setting and its winning source")]
     Show,
 }
 
@@ -69,22 +108,8 @@ impl Cli {
         if self.ignore_project_config && !self.yes {
             anyhow::bail!("--ignore-project-config requires --yes to confirm");
         }
-        if self.sandbox.eq_ignore_ascii_case("off") && !self.yes {
+        if self.sandbox == SandboxArg::Off && !self.yes {
             anyhow::bail!("--sandbox off requires --yes to confirm");
-        }
-        if !self.sandbox.eq_ignore_ascii_case("on") && !self.sandbox.eq_ignore_ascii_case("off") {
-            anyhow::bail!("--sandbox must be on or off");
-        }
-        if let Some(mode) = &self.mode {
-            let ok = ["plan", "ask", "auto", "yolo"].contains(&mode.as_str());
-            if !ok {
-                anyhow::bail!("--mode must be one of plan, ask, auto, yolo");
-            }
-        }
-        if let Some(fmt) = &self.log_format {
-            if fmt != "json" && fmt != "compact" {
-                anyhow::bail!("--log-format must be json or compact");
-            }
         }
         Ok(())
     }
@@ -103,7 +128,7 @@ mod tests {
         let cli = base();
         assert!(!cli.ignore_project_config);
         assert!(!cli.yes);
-        assert_eq!(cli.sandbox, "on");
+        assert_eq!(cli.sandbox, SandboxArg::On);
         cli.validate().expect("defaults are valid");
     }
 
@@ -119,46 +144,35 @@ mod tests {
     #[test]
     fn turning_the_sandbox_off_requires_confirmation() {
         let mut cli = base();
-        cli.sandbox = "off".to_owned();
+        cli.sandbox = SandboxArg::Off;
         assert!(cli.validate().is_err(), "without --yes");
         cli.yes = true;
         cli.validate().expect("with --yes");
     }
 
     #[test]
-    fn the_sandbox_flag_only_names_on_or_off() {
-        let mut cli = base();
-        cli.sandbox = "sometimes".to_owned();
-        assert!(cli.validate().is_err());
-        for spelling in ["on", "ON", "off", "OFF"] {
-            let mut cli = base();
-            cli.sandbox = spelling.to_owned();
-            cli.yes = true;
-            cli.validate().unwrap_or_else(|error| panic!("{spelling} is valid: {error}"));
+    fn clap_rejects_unknown_enum_values() {
+        for args in [
+            ["supra", "--sandbox", "sometimes"],
+            ["supra", "--mode", "reckless"],
+            ["supra", "--log-format", "xml"],
+        ] {
+            assert!(<Cli as clap::Parser>::try_parse_from(args).is_err(), "{args:?}");
         }
     }
 
     #[test]
-    fn the_mode_flag_only_names_a_real_mode() {
-        for mode in ["plan", "ask", "auto", "yolo"] {
-            let mut cli = base();
-            cli.mode = Some(mode.to_owned());
-            cli.validate().unwrap_or_else(|error| panic!("{mode} is valid: {error}"));
-        }
-        let mut cli = base();
-        cli.mode = Some("reckless".to_owned());
-        assert!(cli.validate().is_err());
-    }
+    fn help_describes_security_flags_and_commands() {
+        use clap::CommandFactory as _;
 
-    #[test]
-    fn the_log_format_only_names_json_or_compact() {
-        for format in ["json", "compact"] {
-            let mut cli = base();
-            cli.log_format = Some(format.to_owned());
-            cli.validate().unwrap_or_else(|error| panic!("{format} is valid: {error}"));
-        }
-        let mut cli = base();
-        cli.log_format = Some("xml".to_owned());
-        assert!(cli.validate().is_err());
+        let mut top = Cli::command();
+        let top_help = top.render_long_help().to_string();
+        assert!(top_help.contains("Confirm security-sensitive"), "{top_help}");
+        assert!(top_help.contains("Enable or disable sandboxing"), "{top_help}");
+        assert!(top_help.contains("Start an interactive supra session"), "{top_help}");
+
+        let mut update = Cli::command().find_subcommand_mut("update").expect("update command").clone();
+        let update_help = update.render_long_help().to_string();
+        assert!(update_help.contains("Apply an update after signature verification"), "{update_help}");
     }
 }

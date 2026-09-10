@@ -169,6 +169,9 @@ pub fn spawn(
     request: &SpawnRequest<'_>,
     tree: &TreeBudget,
 ) -> Result<Process, SandboxError> {
+    let Some(program) = request.argv.first().copied() else {
+        return Err(SandboxError::Ffi("argv is empty; there is no program to spawn".to_owned()));
+    };
     audit_descriptors(policy)?;
 
     let identity = supra_guard::current().ok_or_else(|| {
@@ -199,7 +202,7 @@ pub fn spawn(
     }
     let _ = identity;
 
-    let mut command = sandbox::Command::new(request.argv[0]).map_err(|error| map_ffi(&error))?;
+    let mut command = sandbox::Command::new(program).map_err(|error| map_ffi(&error))?;
     for arg in &request.argv[1..] {
         command.arg(arg).map_err(|error| map_ffi(&error))?;
     }
@@ -447,6 +450,28 @@ mod tests {
                 assert_eq!(leaked_fd, fd, "the refused fd is the one the audit found");
             }
             other => panic!("the audit must refuse; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_argv_is_refused_not_panicked() {
+        let policy = SandboxPolicy::new();
+        let tree = TreeBudget::new(8);
+        let request = SpawnRequest {
+            argv: &[],
+            env: &[],
+            working_dir: None,
+            reversibility: Reversibility::R0,
+            mode: Mode::Auto,
+            marker: None,
+            lineage: None,
+            child: None,
+            claim_vote: None,
+            stdio: Stdio::null(),
+        };
+        match spawn(&policy, &request, &tree) {
+            Err(SandboxError::Ffi(message)) => assert!(message.contains("empty"), "{message}"),
+            other => panic!("empty argv must refuse, got {other:?}"),
         }
     }
 

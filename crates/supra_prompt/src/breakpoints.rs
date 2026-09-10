@@ -56,14 +56,19 @@ impl Plan {
 /// Walks the segments once, in order: trailing `ToolManifest` segments end at BP1,
 /// trailing `SystemContract` at BP2, trailing `MemoryIndex` at BP3, and everything
 /// through the end of turn n-1 is BP4. Regions must appear in prefix order
-/// (`tools`, `system`, index, turns) - a turn segment before the tool manifest is a
-/// ledger defect, not a layout to accommodate.
+/// (`tools`, `system`, index, turns) - a region that appears after one it must
+/// precede is a ledger defect, refused rather than clamped, because a clamped
+/// offset silently moves a cache boundary onto the wrong segment.
 ///
 /// BP4 defaults to the full length: with no turn boundary information the only honest
 /// position is "everything so far". T23 narrows it to turn n-1 once the turn loop
 /// owns turn tracking; the plan never guesses a boundary it was not given.
-#[must_use]
-pub fn plan_breakpoints(segments: &[Sealed<Segment>]) -> Plan {
+///
+/// # Errors
+///
+/// [`crate::error::PromptError::RegionOrder`] when the regions do not appear
+/// in prefix order.
+pub fn plan_breakpoints(segments: &[Sealed<Segment>]) -> Result<Plan, crate::error::PromptError> {
     use supra_types::SegmentKind;
 
     let mut bp1_tools = 0;
@@ -73,9 +78,18 @@ pub fn plan_breakpoints(segments: &[Sealed<Segment>]) -> Plan {
     for (index, entry) in segments.iter().enumerate() {
         match entry.kind() {
             SegmentKind::ToolManifest => {
+                if bp2_system > 0 {
+                    return Err(region_order("tools", "system"));
+                }
+                if bp3_memory > 0 {
+                    return Err(region_order("tools", "memory"));
+                }
                 bp1_tools = index + 1;
             }
             SegmentKind::SystemContract => {
+                if bp3_memory > 0 {
+                    return Err(region_order("system", "memory"));
+                }
                 bp2_system = index + 1;
             }
             SegmentKind::MemoryIndex(_) => {
@@ -85,14 +99,11 @@ pub fn plan_breakpoints(segments: &[Sealed<Segment>]) -> Plan {
         }
     }
 
-    // Monotonicity is structural: each region's end is at or past the previous
-    // region's end only when the ledger holds regions in prefix order. A ledger that
-    // interleaves them (a turn before the manifest) yields a plan whose offsets run
-    // backwards - which the check below refuses rather than transmitting.
-    let bp2_system = bp2_system.max(bp1_tools);
-    let bp3_memory = bp3_memory.max(bp2_system);
+    Ok(Plan { bp1_tools, bp2_system, bp3_memory, bp4_previous: segments.len() })
+}
 
-    Plan { bp1_tools, bp2_system, bp3_memory, bp4_previous: segments.len() }
+fn region_order(earlier: &'static str, later: &'static str) -> crate::error::PromptError {
+    crate::error::PromptError::RegionOrder { earlier, later }
 }
 
 /// Check a plan against the lookback window.
@@ -240,24 +251,35 @@ mod tests {
     #[test]
     fn regions_in_order_yield_ordered_offsets() {
         let segments = vec![manifest(), system(), index_entry("t"), turn("a"), turn("b")];
-        let plan = plan_breakpoints(&segments);
+        let plan = plan_breakpoints(&segments).expect("ordered ledger");
         assert_eq!((plan.bp1_tools, plan.bp2_system, plan.bp3_memory, plan.bp4_previous), (1, 2, 3, 5));
         assert!(find_reversal(&plan).is_none());
         assert!(validate(&plan, &segments).is_ok());
     }
 
     #[test]
-    fn a_manifest_after_system_still_orders_bp1_before_bp2() {
-        // The M4 gap: no fixture ever interleaved regions, so deleting the monotonic
-        // clamp changed nothing observable. A manifest segment after the system
-        // contract is a ledger defect - but the plan must still transmit offsets in
-        // prefix order, because a backwards plan bills writes for entries that read
-        // as a reversal. The clamp keeps a defective ledger from producing a
-        // defective plan; the defect surfaces at the ledger, not as a cache break.
+    fn a_manifest_after_system_is_refused_rather_than_clamped() {
+        // The M4 gap: no fixture ever interleaved regions, so the clamp's removal
+        // changed nothing observable. A manifest segment after the system contract
+        // is a ledger defect, and the plan refuses it - a clamped offset would
+        // silently move a cache boundary onto the wrong segment.
         let segments = vec![system(), manifest(), turn("a")];
-        let plan = plan_breakpoints(&segments);
-        assert!(plan.bp1_tools <= plan.bp2_system, "clamp removed: {plan:?}");
-        assert!(plan.bp2_system <= plan.bp3_memory, "clamp removed: {plan:?}");
+        let error = plan_breakpoints(&segments).expect_err("regions out of order");
+        assert!(matches!(error, crate::error::PromptError::RegionOrder { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_manifest_after_the_memory_index_is_refused() {
+        let segments = vec![system(), index_entry("t"), manifest()];
+        let error = plan_breakpoints(&segments).expect_err("regions out of order");
+        assert!(matches!(error, crate::error::PromptError::RegionOrder { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_system_after_the_memory_index_is_refused() {
+        let segments = vec![manifest(), index_entry("t"), system()];
+        let error = plan_breakpoints(&segments).expect_err("regions out of order");
+        assert!(matches!(error, crate::error::PromptError::RegionOrder { .. }), "{error}");
     }
 
     #[test]
@@ -275,7 +297,7 @@ mod tests {
         for index in 0..21 {
             segments.push(turn(&format!("turn {index}")));
         }
-        let plan = plan_breakpoints(&segments);
+        let plan = plan_breakpoints(&segments).expect("ordered ledger");
         assert_eq!(check_lookback(&plan, &segments), Err(Breakpoint::Bp1Tools));
     }
 
@@ -302,7 +324,7 @@ mod tests {
             use supra_types::{Sealed, SeqNo};
             segments.push(Sealed::seal(SeqNo::ZERO, tool.clone()));
         }
-        let plan = plan_breakpoints(&segments);
+        let plan = plan_breakpoints(&segments).expect("ordered ledger");
         assert!(check_lookback(&plan, &segments).is_ok());
     }
 }

@@ -49,12 +49,66 @@ impl Outcome {
 impl Blackboard {
     /// Open the board on a migrated store.
     ///
+    /// Every stored claim is hydrated with its validator roster and the
+    /// votes it has already collected, so a restart resumes the tally
+    /// instead of forgetting the claim.
+    ///
     /// # Errors
     ///
-    /// [`BlackboardError::Store`] when the component migration fails.
+    /// [`BlackboardError::Store`] when the component migration fails or
+    /// the stored rows do not parse.
     pub fn open(store: Arc<Store>) -> Result<Self, BlackboardError> {
         store.migrate_component(COMPONENT, MIGRATIONS)?;
-        Ok(Self { store, claims: BTreeMap::new() })
+        let mut claims = BTreeMap::new();
+        store.with_transaction::<_, BlackboardError>(TransactionBehavior::Deferred, |tx| {
+            for (stored, validators, votes) in schema::read_all(tx)? {
+                let k = stored.k.max(1);
+                let mut tally = QuorumTally::new(k);
+                let mut state = ClaimState {
+                    turn: stored.turn,
+                    proposer: stored.proposer,
+                    body: stored.body,
+                    k,
+                    tally,
+                    status: QuorumStatus::Open,
+                    validators: validators.iter().copied().map(|id| (id, None)).collect(),
+                };
+                let mut inconsistent = false;
+                for vote in votes {
+                    match state.validators.get_mut(&vote.voter) {
+                        Some(slot) if slot.is_none() => {
+                            *slot = Some(vote.vote);
+                            if tally.record(vote.vote).is_err() {
+                                inconsistent = true;
+                            }
+                        }
+                        _ => inconsistent = true,
+                    }
+                }
+                if inconsistent {
+                    return Err(BlackboardError::Store(supra_store::StoreError::Malformed {
+                        detail: format!(
+                            "claim {} has a roster or tally the store cannot reproduce",
+                            stored.claim
+                        ),
+                    }));
+                }
+                state.status = match stored.status.as_str() {
+                    "open" => tally.status(),
+                    "reached" => QuorumStatus::Reached,
+                    "unreachable" => QuorumStatus::Unreachable,
+                    other => {
+                        return Err(BlackboardError::Store(supra_store::StoreError::Malformed {
+                            detail: format!("claim {} has unknown status {other:?}", stored.claim),
+                        }));
+                    }
+                };
+                state.tally = tally;
+                claims.insert(stored.claim, state);
+            }
+            Ok(())
+        })?;
+        Ok(Self { store, claims })
     }
 
     /// Publish a claim and return its id.
@@ -81,7 +135,7 @@ impl Blackboard {
         }
         let claim = ClaimId::generate();
         self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
-            schema::insert_claim(tx, claim, turn, proposer, body, k, "open")?;
+            schema::insert_claim(tx, claim, turn, proposer, body, k, "open", validators)?;
             Ok(())
         })?;
         self.claims.insert(
@@ -128,18 +182,34 @@ impl Blackboard {
             return Err(BlackboardError::DuplicateVote { agent: voter, claim });
         }
 
+        // Persist first: if the store refuses the vote, memory must look
+        // as though the vote never happened, or a retry would read
+        // DuplicateVote while the store holds nothing.
         let vote = verdict.vote();
-        let outcome = state.tally.record(vote).map_err(BlackboardError::Tally)?;
+        self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
+            schema::insert_vote(tx, claim, voter, verdict)?;
+            Ok(())
+        })?;
+
+        let outcome = match state.tally.record(vote) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
+                    schema::delete_vote(tx, claim, voter)?;
+                    Ok(())
+                })?;
+                return Err(BlackboardError::Tally(error));
+            }
+        };
         *slot = Some(vote);
         state.status = outcome;
 
-        self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
-            schema::insert_vote(tx, claim, voter, verdict)?;
-            if outcome != QuorumStatus::Open {
+        if outcome != QuorumStatus::Open {
+            self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
                 let _ = schema::update_status(tx, claim, status_text(outcome))?;
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
+        }
 
         let state = &self.claims[&claim];
         Ok(Outcome { claim, status: outcome, tally: state.tally })
@@ -201,6 +271,12 @@ impl Blackboard {
     pub fn reachable(&self, claim: ClaimId) -> Option<bool> {
         self.claims.get(&claim).map(|state| state.status != QuorumStatus::Unreachable)
     }
+
+    /// Every claim id the board holds, in id order.
+    #[must_use]
+    pub fn all_claims(&self) -> Vec<ClaimId> {
+        self.claims.keys().copied().collect()
+    }
 }
 
 fn status_text(status: QuorumStatus) -> &'static str {
@@ -231,6 +307,44 @@ mod tests {
 
     fn verdict(vote: Vote) -> Verdict {
         Verdict::new(vote, Confidence::High, "checked", Some("tests/x.rs:1".to_owned())).expect("verdict")
+    }
+
+    fn store_path() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "supra-bb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir.join("bb.db")
+    }
+
+    #[test]
+    fn a_reopened_board_hydrates_claims_validators_and_votes() {
+        let path = store_path();
+        let proposer = AgentId::generate();
+        let validators = ids(2);
+
+        {
+            let store = Store::open(&path).expect("store");
+            let mut board = Blackboard::open(Arc::new(store)).expect("board");
+            let claim =
+                board.publish(TurnId::generate(), proposer, &validators, "the task").expect("publish");
+            board.vote(claim, validators[0], &verdict(Vote::Yes)).expect("vote");
+        }
+
+        let store = Store::open(&path).expect("reopen");
+        let mut board = Blackboard::open(Arc::new(store)).expect("hydrate");
+        let claims: Vec<_> = board.all_claims();
+        assert_eq!(claims.len(), 1, "the claim survives the restart");
+        let claim = claims[0];
+        assert_eq!(board.claim(claim).expect("stored").body, "the task");
+        assert_eq!(board.votes(claim).expect("votes").len(), 1, "the vote survives");
+        assert!(board.reachable(claim).expect("reachable"), "an open claim with one yes is still live");
+        board.vote(claim, validators[1], &verdict(Vote::Yes)).expect("the roster survived too");
+        assert!(board.outcome(claim).expect("outcome").is_reached(), "quorum across the restart");
     }
 
     fn ids(n: usize) -> Vec<AgentId> {

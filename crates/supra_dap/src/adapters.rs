@@ -30,9 +30,7 @@ impl Adapter {
     #[must_use]
     pub const fn args(self) -> &'static [&'static str] {
         match self {
-            Self::CodeLldb => &["--port", "0"],
-            Self::Delve => &["dap"],
-            Self::DebugPy => &[],
+            Self::CodeLldb | Self::Delve | Self::DebugPy => &[],
         }
     }
 
@@ -74,7 +72,8 @@ mod tests {
         assert_eq!(Adapter::CodeLldb.program(), "codelldb");
         assert_eq!(Adapter::DebugPy.program(), "debugpy-adapter");
         assert_eq!(Adapter::Delve.program(), "dlv");
-        assert_eq!(Adapter::Delve.args(), &["dap"]);
+        assert_eq!(Adapter::Delve.args().len(), 0);
+        assert_eq!(Adapter::CodeLldb.args().len(), 0);
         assert_eq!(Adapter::DebugPy.args().len(), 0);
     }
 }

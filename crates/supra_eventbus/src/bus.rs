@@ -116,10 +116,6 @@ pub enum RecvError {
 struct Queue {
     ring: VecDeque<Delivery>,
     capacity: usize,
-    /// Events dropped since the last delivery handed out.
-    pending_missed: u64,
-    /// Events dropped over the subscription's whole life.
-    missed_total: u64,
     closed: bool,
 }
 
@@ -128,21 +124,37 @@ struct Slot {
     topics: TopicSet,
     queue: Mutex<Queue>,
     ready: Condvar,
+    /// Events dropped since the last delivery handed out. Atomic rather
+    /// than inside the queue: a publisher that cannot take the queue
+    /// lock must still be able to record the loss.
+    pending_missed: AtomicU64,
+    /// Events dropped over the subscription's whole life.
+    missed_total: AtomicU64,
 }
 
 impl Slot {
     /// Offer an event. Never blocks and never fails.
+    ///
+    /// The queue lock is taken with `try_lock`: a consumer that dies or
+    /// stalls while holding it must not be able to stall the turn loop.
+    /// The cost of a contended lock is one counted loss - the same price
+    /// a full ring already pays - rather than a blocked publisher.
     fn offer(&self, seq: EventSeq, event: &Arc<Event>) {
-        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        let Ok(mut queue) = self.queue.try_lock() else {
+            self.pending_missed.fetch_add(1, Ordering::AcqRel);
+            self.missed_total.fetch_add(1, Ordering::AcqRel);
+            return;
+        };
 
         // A zero-capacity subscription is a valid way to say "count these but keep
         // none"; dropping immediately keeps the accounting honest.
         if queue.capacity == 0 {
-            queue.pending_missed += 1;
-            queue.missed_total += 1;
+            self.pending_missed.fetch_add(1, Ordering::AcqRel);
+            self.missed_total.fetch_add(1, Ordering::AcqRel);
             return;
         }
 
+        let mut loss = 0u64;
         while queue.ring.len() >= queue.capacity {
             // Drop the oldest. The newest is what a stalled consumer most needs when it
             // wakes, and the loop rather than a single pop keeps this correct if the
@@ -154,14 +166,22 @@ impl Slot {
                 // while `missed_total` would be right. Two sources of truth that differ
                 // are worse than one that is approximate, so the count is carried
                 // forward onto whichever delivery survives.
-                queue.pending_missed += dropped.missed_before + 1;
+                loss += dropped.missed_before + 1;
                 // Only the event itself is a *new* loss; the gap it carried was already
                 // counted when those events were dropped.
-                queue.missed_total += 1;
+                self.missed_total.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        if loss > 0 {
+            match queue.ring.front_mut() {
+                Some(front) => front.missed_before += loss,
+                None => {
+                    self.pending_missed.fetch_add(loss, Ordering::AcqRel);
+                }
             }
         }
 
-        let missed_before = core::mem::take(&mut queue.pending_missed);
+        let missed_before = self.pending_missed.swap(0, Ordering::AcqRel);
         queue.ring.push_back(Delivery { seq, event: Arc::clone(event), missed_before });
         drop(queue);
         self.ready.notify_all();
@@ -207,14 +227,10 @@ impl Bus {
     pub fn subscribe_with_capacity(&self, topics: TopicSet, capacity: usize) -> Subscription {
         let slot = Arc::new(Slot {
             topics,
-            queue: Mutex::new(Queue {
-                ring: VecDeque::new(),
-                capacity,
-                pending_missed: 0,
-                missed_total: 0,
-                closed: false,
-            }),
+            queue: Mutex::new(Queue { ring: VecDeque::new(), capacity, closed: false }),
             ready: Condvar::new(),
+            pending_missed: AtomicU64::new(0),
+            missed_total: AtomicU64::new(0),
         });
 
         let mut subscriptions = self.subscriptions.lock().unwrap_or_else(PoisonError::into_inner);
@@ -231,12 +247,16 @@ impl Bus {
     ///
     /// Never blocks on a consumer and never fails. Returns the sequence number assigned,
     /// so a caller can correlate what it sent with what a subscriber reports.
+    ///
+    /// The sequence is assigned under the registry lock: assignment and
+    /// fan-out share one serialization point, so a subscriber can never
+    /// see a later sequence delivered before an earlier one, whatever
+    /// two concurrent publishers' scheduling did.
     pub fn publish(&self, event: Event) -> EventSeq {
+        let mut subscriptions = self.subscriptions.lock().unwrap_or_else(PoisonError::into_inner);
         let seq = EventSeq(self.next_seq.fetch_add(1, Ordering::Relaxed));
         let topic = event.topic();
         let shared = Arc::new(event);
-
-        let mut subscriptions = self.subscriptions.lock().unwrap_or_else(PoisonError::into_inner);
 
         // Prune dead subscriptions in the same pass that delivers, so a long-lived bus
         // does not grow a list of nothing.
@@ -353,7 +373,7 @@ impl Subscription {
     /// a health check - that wants to report loss rather than react to it.
     #[must_use]
     pub fn missed_total(&self) -> u64 {
-        self.locked().missed_total
+        self.slot.missed_total.load(Ordering::Acquire)
     }
 
     /// Whether the bus has been dropped.
@@ -419,7 +439,7 @@ impl Subscription {
     /// Events dropped since the last delivery handed out, for the invariant test.
     #[cfg(test)]
     fn pending_missed(&self) -> u64 {
-        self.locked().pending_missed
+        self.slot.pending_missed.load(Ordering::Acquire)
     }
 
     fn locked(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -578,11 +598,32 @@ mod tests {
         let drained = small.drain();
         assert_eq!(drained.len(), 2);
         // Three were dropped (sequences 0, 1, 2) to make room for the two that remain.
-        // The gap is split across the survivors because it accumulated as each was
-        // pushed - what matters is that the total is preserved, which the invariant test
-        // below states directly.
-        assert_eq!(drained[0].missed_before + drained[1].missed_before, 3, "{drained:?}");
+        // The whole count attaches to the first surviving delivery, so the consumer
+        // hears about the gap on the next thing it receives.
+        assert_eq!(drained[0].missed_before, 3, "{drained:?}");
+        assert_eq!(drained[1].missed_before, 0, "{drained:?}");
         assert_eq!(small.missed_total(), 3);
+    }
+
+    #[test]
+    fn the_loss_lands_on_the_surviving_front_not_the_pushing_event() {
+        let bus = Bus::new();
+        let small = bus.subscribe_with_capacity(TopicSet::all(), 2);
+        bus.publish(cache_event());
+        bus.publish(cache_event());
+        drop(small.drain());
+
+        bus.publish(cache_event());
+        bus.publish(cache_event());
+        bus.publish(cache_event());
+
+        let drained = small.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].seq.0, 3, "{drained:?}");
+        assert_eq!(drained[0].missed_before, 1, "the evicted sequence 2 is reported here");
+        assert_eq!(drained[1].seq.0, 4);
+        assert_eq!(drained[1].missed_before, 0);
+        assert_eq!(small.missed_total(), 1);
     }
 
     #[test]
@@ -834,13 +875,32 @@ mod tests {
         }
 
         assert_eq!(bus.published(), 4_000);
-        let mut seqs: Vec<u64> = all.drain().into_iter().map(|d| d.seq.get()).collect();
+        let seqs: Vec<u64> = all.drain().into_iter().map(|d| d.seq.get()).collect();
         assert_eq!(seqs.len(), 4_000, "nothing was dropped at this capacity");
-        seqs.sort_unstable();
-        seqs.dedup();
-        assert_eq!(seqs.len(), 4_000, "a sequence number was reused");
-        assert_eq!(seqs.first().copied(), Some(0));
-        assert_eq!(seqs.last().copied(), Some(3_999));
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 4_000, "a sequence number was reused");
+        assert_eq!(sorted.first().copied(), Some(0));
+        assert_eq!(sorted.last().copied(), Some(3_999));
+        assert_eq!(seqs, sorted, "deliveries arrive in sequence order, unsorted");
+    }
+
+    #[test]
+    fn a_publish_while_the_queue_lock_is_held_does_not_stall() {
+        let bus = Bus::new();
+        let sub = bus.subscribe(TopicSet::all());
+        {
+            let _held = sub.slot.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            let start = std::time::Instant::now();
+            bus.publish(cache_event());
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "publish returned while a consumer held the queue lock"
+            );
+        }
+        assert!(sub.is_empty(), "the contended event was not enqueued");
+        assert_eq!(sub.missed_total(), 1, "the contention is a counted loss");
     }
 
     #[test]

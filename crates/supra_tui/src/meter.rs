@@ -31,8 +31,11 @@ impl Meter {
         let Some(non_zero) = std::num::NonZeroUsize::new(whole) else {
             return gauge.render(0, slots);
         };
-        #[allow(clippy::manual_checked_ops)]
-        let on = (part.min(whole) * slots) / non_zero.get();
+        let part = part.min(whole);
+        let whole = non_zero.get();
+        let quotient = slots / whole;
+        let remainder = slots % whole;
+        let on = part.saturating_mul(quotient).saturating_add(part.saturating_mul(remainder) / whole);
         let off = slots.saturating_sub(on);
         gauge.render(on, off)
     }
@@ -69,6 +72,19 @@ mod tests {
         let meter = Meter::new(10, Ambiguous::Narrow);
         assert_eq!(meter.render(15, 10).chars().count(), 10);
         assert_eq!(meter.render(100, 7).chars().count(), 10);
+    }
+
+    #[test]
+    fn maximum_inputs_do_not_overflow() {
+        let gauge = gauge_for(Ambiguous::Narrow);
+        let (filled_cells, empty_cells) = gauge.cells(Ambiguous::Narrow);
+        let slots = usize::MAX / filled_cells.max(empty_cells).max(1);
+        let whole = usize::MAX;
+        let part = usize::MAX - 1;
+        let quotient = slots / whole;
+        let remainder = slots % whole;
+        let on = part.saturating_mul(quotient).saturating_add(part.saturating_mul(remainder) / whole);
+        assert!(on <= slots);
     }
 
     #[test]

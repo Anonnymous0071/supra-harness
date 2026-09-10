@@ -154,7 +154,7 @@ fn opening_creates_the_schema_and_freezes_the_configuration() {
     assert_eq!(index.meta().dims, DIMS);
     assert_eq!(index.meta().model, MODEL);
     assert_eq!(index.meta().threshold, vec![0.0; DIMS]);
-    assert_eq!(store.component_version(supra_vector::COMPONENT).expect("version"), 1);
+    assert_eq!(store.component_version(supra_vector::COMPONENT).expect("version"), 2);
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn the_component_ledger_records_the_version_rather_than_the_files_user_version()
     let _index = index(Arc::clone(&store));
 
     assert_eq!(store.schema_version().expect("core version"), core_before);
-    assert_eq!(store.component_version(supra_vector::COMPONENT).expect("version"), 1);
+    assert_eq!(store.component_version(supra_vector::COMPONENT).expect("version"), 2);
 }
 
 #[test]
@@ -181,6 +181,46 @@ fn reopening_reads_the_stored_configuration() {
     assert_eq!(reopened.meta().dims, created.dims);
     assert_eq!(reopened.meta().model, created.model);
     assert_eq!(reopened.meta().threshold, created.threshold);
+}
+
+#[test]
+fn a_second_handle_sees_the_firsts_writes_and_removals() {
+    let scratch = Scratch::new("cross-handle-writes");
+    let store = scratch.store();
+    let writer = index(Arc::clone(&store));
+    let reader = index(Arc::clone(&store));
+
+    let query = simple(0);
+    writer.upsert("writer::alpha", "alpha body", &simple(1)).expect("insert");
+    let hits = reader.search_semantic(&query, 4).expect("search after insert");
+    assert!(hits.iter().any(|hit| hit.locator == "writer::alpha"), "{hits:?}");
+
+    assert!(writer.remove("writer::alpha").expect("remove"));
+    let hits = reader.search_semantic(&query, 4).expect("search after remove");
+    assert!(!hits.iter().any(|hit| hit.locator == "writer::alpha"), "{hits:?}");
+}
+
+#[test]
+fn a_second_handle_does_not_rank_a_stale_cached_vector() {
+    let scratch = Scratch::new("stale-cache");
+    let store = scratch.store();
+    let writer = index(Arc::clone(&store));
+    let reader = index(Arc::clone(&store));
+
+    let query = simple(0);
+    writer.upsert("shared::entry", "body", &simple(1)).expect("insert opposite");
+    let before = reader.search_semantic(&query, 4).expect("warm the cache");
+    assert_eq!(before.len(), 1);
+
+    writer.upsert("shared::entry", "body", &simple(0)).expect("rewrite aligned");
+    let after = reader.search_semantic(&query, 4).expect("search again");
+    let similarity = after
+        .iter()
+        .find(|hit| hit.locator == "shared::entry")
+        .expect("still present")
+        .similarity
+        .expect("semantic lane scores");
+    assert!(similarity > 0.99, "the rerank used the fresh vector, not the stale cache: {similarity}");
 }
 
 #[test]

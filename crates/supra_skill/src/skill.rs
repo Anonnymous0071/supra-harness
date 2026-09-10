@@ -134,24 +134,38 @@ fn nonblank(path: String, field: &'static str, value: &str) -> Result<String, Sk
 /// forgot to fence is a bug the error names, not a skill with no name.
 fn split_fences<'a>(path: &str, text: &'a str) -> Result<(&'a str, &'a str), SkillError> {
     let trimmed_start = text.trim_start_matches('\n');
-    let Some(after_open) = trimmed_start.strip_prefix("---\n") else {
+    let Some(after_open) =
+        trimmed_start.strip_prefix("---\n").or_else(|| trimmed_start.strip_prefix("---\r\n"))
+    else {
         return Err(SkillError::Parse {
             path: path.to_owned(),
             detail: "the file must open with a `---` fence before the front matter".to_owned(),
         });
     };
     // The closing fence may be `---` at line start (the common form) or
-    // the last line without a trailing newline.
+    // the last line without a trailing newline. Anything else on the fence
+    // line (`---oops`, `----`) is not a fence: the suffix would otherwise
+    // become body content.
     let Some(offset) = after_open.find("\n---") else {
         return Err(SkillError::Parse {
             path: path.to_owned(),
             detail: "the front matter is never closed; add a `---` fence after it".to_owned(),
         });
     };
+    let fence_end = offset + "\n---".len();
+    let rest_of_line = &after_open[fence_end..];
+    let line_end = rest_of_line.find('\n').unwrap_or(rest_of_line.len());
+    let trailer = &rest_of_line[..line_end];
+    if !trailer.is_empty() && trailer != "\r" {
+        return Err(SkillError::Parse {
+            path: path.to_owned(),
+            detail: "the closing fence must be exactly `---` on its own line".to_owned(),
+        });
+    }
     let front = &after_open[..offset];
-    let after_close = &after_open[offset + "\n---".len()..];
-    // Drop the rest of the closing fence line: `\n---` may be followed by
-    // nothing (end of line) - the newline before the body is the body's.
+    let after_close = &after_open[fence_end + line_end..];
+    // Drop the rest of the closing fence line: the newline before the body
+    // is the body's.
     let body = after_close.strip_prefix('\n').unwrap_or(after_close);
     Ok((front, body))
 }
@@ -169,6 +183,26 @@ mod tests {
         assert_eq!(skill.description, "A test skill.");
         assert!(skill.requires.is_empty(), "no requires field, no requires");
         assert_eq!(skill.body, "Body text.\n");
+    }
+
+    #[test]
+    fn a_suffixed_closing_fence_is_refused() {
+        for text in [
+            "---\nname: test\ndescription: d.\n---oops\nBody.\n",
+            "---\nname: test\ndescription: d.\n----\nBody.\n",
+            "---\nname: test\ndescription: d.\n--- trailing\nBody.\n",
+        ] {
+            let error = Skill::parse_str("SKILL.md".to_owned(), text).expect_err("not a fence");
+            assert!(error.to_string().contains("exactly `---`"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_crlf_closing_fence_parses() {
+        let text = "---\r\nname: test\r\ndescription: d.\r\n---\r\nBody.\r\n";
+        let skill = Skill::parse_str("SKILL.md".to_owned(), text).expect("crlf parses");
+        assert_eq!(skill.name, "test");
+        assert_eq!(skill.body, "Body.\r\n");
     }
 
     #[test]

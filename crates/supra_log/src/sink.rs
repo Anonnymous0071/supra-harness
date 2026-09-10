@@ -34,7 +34,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::redact;
 
@@ -105,7 +105,7 @@ struct Open {
 pub struct Sink {
     config: SinkConfig,
     open: Mutex<Option<Open>>,
-    stderr_suppressed: AtomicBool,
+    stderr_suppressed: AtomicUsize,
     dropped: AtomicU64,
 }
 
@@ -121,7 +121,7 @@ impl Sink {
         let sink = Self {
             config,
             open: Mutex::new(None),
-            stderr_suppressed: AtomicBool::new(false),
+            stderr_suppressed: AtomicUsize::new(0),
             dropped: AtomicU64::new(0),
         };
         // Open eagerly so a bad path is a startup error rather than a silent
@@ -152,14 +152,14 @@ impl Sink {
     /// Held by the TUI for as long as it owns the terminal.
     #[must_use]
     pub fn suppress_stderr(&self) -> StderrGuard<'_> {
-        self.stderr_suppressed.store(true, Ordering::Release);
+        self.stderr_suppressed.fetch_add(1, Ordering::AcqRel);
         StderrGuard { sink: self }
     }
 
     /// Whether a line would currently be mirrored to stderr.
     #[must_use]
     pub fn mirrors_to_stderr(&self) -> bool {
-        self.config.stderr && !self.stderr_suppressed.load(Ordering::Acquire)
+        self.config.stderr && self.stderr_suppressed.load(Ordering::Acquire) == 0
     }
 
     /// Redact `line`, then write it as one line to the file and possibly to stderr.
@@ -203,26 +203,46 @@ impl Sink {
     fn write_to_file(&self, payload: &[u8]) -> io::Result<()> {
         let mut guard = self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Reopen if a previous write failed and left the slot empty.
+        // Two processes can write one log. The in-process mutex above
+        // serialises this one; the lock file beside the log serialises
+        // everyone. And the descriptor must be taken fresh under the
+        // lock every time a rotation is even possible, because a handle
+        // opened before another process's rotation still points at the
+        // renamed file - its lines would land in a generation the next
+        // rotation deletes. Opening per write costs one `openat` on a
+        // hot path that is already a filesystem write; keeping the
+        // handle costs the data.
+        // A character device (`/dev/null`, `/dev/full`) has no rotation
+        // to serialise and often no directory to lock in; it keeps the
+        // long-lived handle and no lock.
+        let is_regular = std::fs::metadata(&self.config.path).map_or(true, |meta| meta.file_type().is_file());
+
+        if is_regular {
+            let _interprocess = FileLock::acquire(&self.config.path)?;
+            let length = std::fs::metadata(&self.config.path).map_or(0, |meta| meta.len());
+            if length.saturating_add(payload.len() as u64) > self.config.max_bytes {
+                // A rotation failure - a read-only directory, a permission change -
+                // is tolerated rather than propagated: an oversized log is a smaller
+                // problem than no log, and the reopen below is the same either way.
+                let _ = rotate(&self.config.path, self.config.keep);
+            }
+            let mut file = OpenOptions::new().create(true).append(true).open(&self.config.path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let metadata = file.metadata()?;
+                if metadata.file_type().is_file() {
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
+            }
+            let result = file.write_all(payload).and_then(|()| file.flush());
+            *guard = None;
+            return result;
+        }
+
         if guard.is_none() {
             *guard = Some(open_append(&self.config.path)?);
         }
-
-        let needs_rotation = guard
-            .as_ref()
-            .is_some_and(|open| open.written.saturating_add(payload.len() as u64) > self.config.max_bytes);
-
-        if needs_rotation {
-            // Close before renaming: on Windows an open handle blocks the rename, and
-            // on Unix keeping it open would append to the rotated file instead.
-            *guard = None;
-            // A rotation failure - a read-only directory, a permission change - is
-            // tolerated rather than propagated: an oversized log is a smaller problem
-            // than no log, and the reopen below is the same either way.
-            let _ = rotate(&self.config.path, self.config.keep);
-            *guard = Some(open_append(&self.config.path)?);
-        }
-
         let open = guard.as_mut().ok_or_else(|| io::Error::other("log file is not open"))?;
         match open.file.write_all(payload) {
             Ok(()) => {
@@ -230,9 +250,6 @@ impl Sink {
                 Ok(())
             }
             Err(error) => {
-                // Drop the handle so the next line reopens rather than retrying a
-                // descriptor that may be gone - a rotation by an outside process, a
-                // deleted file.
                 *guard = None;
                 Err(error)
             }
@@ -247,7 +264,7 @@ pub struct StderrGuard<'a> {
 
 impl Drop for StderrGuard<'_> {
     fn drop(&mut self) {
-        self.sink.stderr_suppressed.store(false, Ordering::Release);
+        self.sink.stderr_suppressed.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -298,12 +315,29 @@ fn open_append(path: &Path) -> io::Result<Open> {
     }
 
     let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let metadata = file.metadata()?;
+        if metadata.file_type().is_file() {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
     // A just-opened handle essentially cannot fail to stat. Treating an unknown length as
     // zero errs toward continuing to log rather than rotating on every open, which is the
     // right direction when the alternative is losing diagnostics.
     let written = file.metadata().map_or(0, |meta| meta.len());
     Ok(Open { file, written })
 }
+
+/// An advisory lock file that serialises rotation across processes.
+///
+/// One log, one lock file beside it: `.<name>.lock`. The lock is held
+/// for the stat-decide-rotate-reopen-write span only - long enough that
+/// two writers cannot interleave a rename between each other's write,
+/// short enough that a stalled writer cannot wedge the other process's
+/// logging for longer than one write.
+use supra_ffi::process::FileLock;
 
 /// Refuse a target whose `open` would block for ever.
 ///
@@ -461,6 +495,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn an_existing_log_is_restricted_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = Scratch::new("existing-mode");
+        fs::write(scratch.log(), "existing\n").expect("seed");
+        fs::set_permissions(scratch.log(), fs::Permissions::from_mode(0o644)).expect("chmod");
+        let _sink = sink(&scratch);
+        let mode = fs::metadata(scratch.log()).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode {mode:04o}");
+    }
+
+    #[test]
     fn a_secret_is_redacted_on_its_way_to_the_file() {
         // Redaction is the sink's job, not the call site's, so this is the property
         // that matters: nothing a caller does puts a credential on disk.
@@ -472,6 +519,40 @@ mod tests {
         assert!(!written.contains("hunter2"), "{written}");
         assert!(!written.contains("ABCDEFGHIJKLMNOPQRSTUVWX"), "{written}");
         assert!(written.contains("note"), "structure must survive: {written}");
+    }
+
+    #[test]
+    fn two_independent_writers_rotate_one_log_without_losing_lines() {
+        // Two `Sink`s on one path are the same shape as two processes:
+        // neither shares the other's in-process mutex or byte count, so
+        // without the lock file both would cross the threshold and
+        // rotate independently - one writer's handle still pointing at
+        // the file the other had just renamed, its lines landing in a
+        // generation the next rotation deletes. The lock plus the fresh
+        // open per write serialises the pair; with retention high
+        // enough to delete nothing, every line written must survive in
+        // exactly one generation.
+        let scratch = Scratch::new("two-writers");
+        let config = SinkConfig::new(scratch.log()).with_stderr(false).with_max_bytes(8).with_keep(10);
+        let first = Sink::open(config.clone()).expect("first sink");
+        let second = Sink::open(config).expect("second sink");
+
+        for round in 0..6 {
+            first.write_line(&format!("a{round}"));
+            second.write_line(&format!("b{round}"));
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        for suffix in ["", ".1", ".2", ".3", ".4", ".5", ".6"] {
+            for line in scratch.read(suffix).lines() {
+                assert_eq!(line.len(), 2, "every line is whole: {line:?}");
+                assert!(seen.insert(line.to_owned()), "{line} landed in two generations");
+            }
+        }
+        for round in 0..6 {
+            assert!(seen.contains(&format!("a{round}")), "a{round} is gone: {seen:?}");
+            assert!(seen.contains(&format!("b{round}")), "b{round} is gone: {seen:?}");
+        }
     }
 
     #[test]
@@ -589,6 +670,18 @@ mod tests {
             assert!(!sink.mirrors_to_stderr(), "the TUI owns the terminal");
         }
         assert!(sink.mirrors_to_stderr(), "and gets it back on drop");
+    }
+
+    #[test]
+    fn nested_guards_hold_suppression_until_the_last_drop() {
+        let scratch = Scratch::new("nested-guards");
+        let sink = Sink::open(SinkConfig::new(scratch.log()).with_stderr(true)).expect("open");
+        let first = sink.suppress_stderr();
+        let second = sink.suppress_stderr();
+        drop(first);
+        assert!(!sink.mirrors_to_stderr());
+        drop(second);
+        assert!(sink.mirrors_to_stderr());
     }
 
     #[test]

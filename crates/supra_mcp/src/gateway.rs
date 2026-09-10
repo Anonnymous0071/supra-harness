@@ -50,6 +50,14 @@ use crate::transport::{Endpoint, Transport};
 /// How many tools one server may contribute before the budget refuses.
 pub const TOOLS_PER_SERVER: usize = 256;
 
+/// How many `tools/list` pages one probe follows before it decides the
+/// server's cursor never settles.
+///
+/// A server that paginates forever is a server whose manifest cannot be
+/// cached; the cap turns that into a named refusal rather than a probe
+/// that never returns.
+pub const MAX_LIST_PAGES: usize = 32;
+
 /// One configured server: the name the gateway namespaces with, and where
 /// it lives.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,29 +135,49 @@ impl Gateway {
             });
         }
 
-        // The `notifications/initialized` notification the protocol
-        // expects. A notification has no id and expects no answer; stdio
-        // servers that answer it would desynchronise the line framing, so
-        // it is sent as a raw line on stdio and skipped on HTTP.
-        if let Transport::Stdio { stdin, .. } = &mut transport {
-            use std::io::Write as _;
-            let _ = writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#);
-        }
+        // The `notifications/initialized` notification the protocol expects.
+        // A notification has no id and expects no answer; the transport
+        // sends it as a raw line on stdio and a discarded POST on HTTP.
+        transport.notify("notifications/initialized").await?;
 
-        // List tools, enforce the budget, append to the cache.
-        let listed = transport.call("tools/list", serde_json::json!({})).await?;
-        let listed: ToolsListResult = serde_json::from_value(listed)
-            .map_err(|error| McpError::Protocol(format!("tools/list result: {error}")))?;
-        if listed.tools.len() > TOOLS_PER_SERVER {
+        // List tools, following the cursor until the list settles. The
+        // budget counts every page, not the first: a server that fits
+        // under it only a page at a time is over it.
+        let mut remote_tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_LIST_PAGES {
+            let mut params = serde_json::json!({});
+            if let Some(page) = &cursor {
+                params["cursor"] = serde_json::Value::String(page.clone());
+            }
+            let listed = transport.call("tools/list", params).await?;
+            let listed: ToolsListResult = serde_json::from_value(listed)
+                .map_err(|error| McpError::Protocol(format!("tools/list result: {error}")))?;
+            remote_tools.extend(listed.tools);
+            cursor = listed.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        if cursor.is_some() {
+            return Err(McpError::Protocol(format!(
+                "tools/list did not settle within {MAX_LIST_PAGES} pages"
+            )));
+        }
+        if remote_tools.len() > TOOLS_PER_SERVER {
             return Err(McpError::TooManyTools {
                 server: config.name.clone(),
-                count: listed.tools.len(),
+                count: remote_tools.len(),
                 budget: TOOLS_PER_SERVER,
             });
         }
 
-        for remote in &listed.tools {
-            let cached = CachedTool {
+        // Build every row before writing any: a name that cannot survive
+        // namespacing refuses the whole probe, and the cache never holds
+        // half a manifest for a server the probe then abandoned.
+        let mut rows = Vec::with_capacity(remote_tools.len());
+        for remote in &remote_tools {
+            rows.push(CachedTool {
                 tool: namespaced(&config.name, &remote.name)?,
                 server: config.name.clone(),
                 local_name: remote.name.clone(),
@@ -157,13 +185,16 @@ impl Gateway {
                 input_schema: serde_json::to_string(&remote.input_schema)
                     .map_err(|error| McpError::Protocol(format!("input schema: {error}")))?,
                 live: true,
-            };
-            store
-                .with_transaction::<_, supra_store::StoreError>(TransactionBehavior::Immediate, |tx| {
-                    cache::append(tx, &cached)
-                })
-                .map_err(McpError::Cache)?;
+            });
         }
+        store
+            .with_transaction::<_, supra_store::StoreError>(TransactionBehavior::Immediate, |tx| {
+                for row in &rows {
+                    cache::append(tx, row)?;
+                }
+                Ok(())
+            })
+            .map_err(McpError::Cache)?;
 
         Ok(transport)
     }
@@ -394,6 +425,104 @@ while True:
         std::fs::create_dir_all(&dir).expect("dir");
         let db = dir.join("mcp.db");
         std::sync::Arc::new(Store::open(&db).expect("store"))
+    }
+
+    /// A server that paginates: page one holds `alpha`, the second page
+    /// holds `beta`, and the cursor settles after it.
+    fn paginated_endpoint() -> Endpoint {
+        let script = r#"
+import sys, json
+def respond(request):
+    method = request.get("method")
+    if method == "initialize":
+        return {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "pages"}}
+    if method == "tools/list":
+        cursor = request["params"].get("cursor")
+        if cursor is None:
+            return {"tools": [{"name": "alpha", "description": "First page.",
+                              "inputSchema": {"type": "object", "properties": {}}}],
+                    "nextCursor": "page-2"}
+        return {"tools": [{"name": "beta", "description": "Second page.",
+                           "inputSchema": {"type": "object", "properties": {}}}]}
+    return {"error": {"code": -32601, "message": "no such method"}}
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    request = json.loads(line)
+    if "id" in request:
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": respond(request)}))
+"#;
+        Endpoint::Stdio {
+            argv: vec!["python3".to_owned(), "-u".to_owned(), "-c".to_owned(), script.to_owned()],
+            env: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+        }
+    }
+
+    /// A server whose second page holds a name that cannot survive
+    /// namespacing: the first page's tool parses, the second's cannot.
+    /// The cache must hold neither.
+    fn half_manifest_endpoint() -> Endpoint {
+        let script = r#"
+import sys, json
+def respond(request):
+    method = request.get("method")
+    if method == "initialize":
+        return {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "half"}}
+    if method == "tools/list":
+        cursor = request["params"].get("cursor")
+        if cursor is None:
+            return {"tools": [{"name": "good", "description": "Parses.",
+                              "inputSchema": {"type": "object", "properties": {}}}],
+                    "nextCursor": "page-2"}
+        return {"tools": [{"name": "bad tool", "description": "Names cannot carry spaces.",
+                           "inputSchema": {"type": "object", "properties": {}}}]}
+    return {"error": {"code": -32601, "message": "no such method"}}
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    request = json.loads(line)
+    if "id" in request:
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": respond(request)}))
+"#;
+        Endpoint::Stdio {
+            argv: vec!["python3".to_owned(), "-u".to_owned(), "-c".to_owned(), script.to_owned()],
+            env: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paginated_server_contributes_every_page() {
+        let store = store();
+        let (gateway, refusals) = Gateway::probe(
+            store,
+            vec![ServerConfig { name: "pages".to_owned(), endpoint: paginated_endpoint() }],
+        )
+        .await;
+        assert!(refusals.is_empty(), "{refusals:?}");
+
+        let cached = gateway.cached_tools().expect("cache");
+        let names: Vec<&str> = cached.iter().map(|row| row.tool.as_str()).collect();
+        assert_eq!(names, vec!["pages__alpha", "pages__beta"], "both pages landed");
+    }
+
+    #[tokio::test]
+    async fn a_refused_page_leaves_no_partial_manifest_behind() {
+        let store = store();
+        let (gateway, refusals) = Gateway::probe(
+            std::sync::Arc::clone(&store),
+            vec![ServerConfig { name: "half".to_owned(), endpoint: half_manifest_endpoint() }],
+        )
+        .await;
+        assert_eq!(refusals.len(), 1, "the probe refused the bad page");
+        assert_eq!(refusals[0].0, "half");
+
+        let cached = gateway.cached_tools().expect("cache");
+        assert!(
+            cached.iter().all(|row| !row.tool.starts_with("half__")),
+            "no row from the refused server survived: {cached:?}"
+        );
     }
 
     #[tokio::test]

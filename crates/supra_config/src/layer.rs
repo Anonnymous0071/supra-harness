@@ -435,6 +435,9 @@ fn check_endpoint(layer: ConfigSource, setting: &str, value: &str) -> Result<(),
 fn authority_host(rest: &str) -> &str {
     // The authority ends at the first path, query, or fragment delimiter.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return "";
+    }
 
     if let Some(after_bracket) = authority.strip_prefix('[') {
         let Some(close) = after_bracket.find(']') else {
@@ -487,19 +490,44 @@ fn is_loopback_authority(host: &str) -> bool {
 /// So the location and the cause are reported, and the content is not. The reader
 /// opens the file at the line; the log holds a description.
 ///
-/// One residual is worth naming rather than glossing: for a *mistyped scalar* the
-/// parser's own cause text includes the value, as in `invalid type: string "four",
-/// expected usize`. That surface is small - it needs a value in a field of the wrong
-/// type - and losing it would leave "expected usize" with nothing to compare against.
-/// The large, unconditional surface was the source excerpt, and that is gone.
+/// A mistyped scalar's parser cause text includes the value (`invalid type:
+/// string "four", expected usize`); that value is redacted so a credential
+/// parked in the wrong field cannot ride out in the message.
 fn describe_toml_error(text: &str, error: &toml::de::Error) -> String {
+    let message = strip_deserialized_value(error.message());
     let Some(span) = error.span() else {
-        return error.message().to_owned();
+        return message;
     };
     let Some((line, column)) = line_and_column(text, span.start) else {
-        return error.message().to_owned();
+        return message;
     };
-    format!("line {line}, column {column}: {}", error.message())
+    format!("line {line}, column {column}: {message}")
+}
+
+/// Remove the value from a wrong-type deserialisation message.
+///
+/// The shape is `invalid type: string "value", expected usize`: the first
+/// double-quoted segment after `invalid type:` is the value the reader
+/// supplied, and a credential parked in the wrong field would ride out in
+/// the message. Only that segment is stripped; every other quoted span -
+/// accepted mode spellings, field names - survives.
+fn strip_deserialized_value(message: &str) -> String {
+    let Some(marker) = message.find("invalid type:") else {
+        return message.to_owned();
+    };
+    let after = &message[marker..];
+    let Some(open) = after.find('"') else {
+        return message.to_owned();
+    };
+    let value_end = &after[open + 1..];
+    let Some(close) = value_end.find('"') else {
+        return message.to_owned();
+    };
+    let mut stripped = String::with_capacity(message.len());
+    stripped.push_str(&message[..marker]);
+    stripped.push_str("invalid type: <redacted>");
+    stripped.push_str(&value_end[close + 1..]);
+    stripped
 }
 
 /// One-based line and column of a byte offset.
@@ -822,6 +850,15 @@ mod tests {
     }
 
     #[test]
+    fn a_wrong_type_error_never_echoes_the_value() {
+        let secret = "sk-super-secret-value";
+        let text = format!("[cohort]\nlimit = \"{secret}\"\n");
+        let message = parse(&text).expect_err("wrong type").to_string();
+        assert!(!message.contains(secret), "the value leaked: {message}");
+        assert!(message.contains("expected usize"), "the cause must survive: {message}");
+    }
+
+    #[test]
     fn a_location_is_reported_for_every_parse_failure() {
         // The reported line is the *first* failure, which is why each fixture keeps
         // everything before the offending line valid.
@@ -896,6 +933,7 @@ mod tests {
             "http://[::1",
             "http://[::1]:evil",
             "http://user@127.0.0.1",
+            "http://localhost:80@evil.example/v1",
         ] {
             let text = format!("[providers.p]\nendpoint = \"{endpoint}\"\n");
             assert!(
@@ -921,6 +959,7 @@ mod tests {
         assert_eq!(authority_host("[::1].evil.example"), "", "trailing junk after `]`");
         assert_eq!(authority_host("[::1]:evil"), "", "a non-numeric port");
         assert_eq!(authority_host("[::1]:"), "", "an empty port");
+        assert_eq!(authority_host("localhost:80@evil.example"), "", "userinfo is unsupported");
     }
 
     #[test]

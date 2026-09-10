@@ -22,7 +22,14 @@ pub fn save(directory: &Path, session: SessionId, turns: &[(TurnId, String)]) ->
     let document =
         serde_json::to_vec(&(session, turns)).map_err(|error| SessionError::Malformed(error.to_string()))?;
     let path = file_path(directory, session);
-    std::fs::write(&path, document)?;
+    let temporary = directory.join(format!("{FILE_PREFIX}{session}{FILE_SUFFIX}.tmp"));
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(&document)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temporary, &path)?;
     Ok(())
 }
 
@@ -63,8 +70,12 @@ pub fn list(directory: &Path) -> Result<Vec<SessionId>, SessionError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(sessions),
         Err(error) => return Err(error.into()),
     };
-    let mut names: Vec<String> =
-        entries.filter_map(Result::ok).filter_map(|entry| entry.file_name().into_string().ok()).collect();
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let name = entry?;
+        let Ok(text) = name.file_name().into_string() else { continue };
+        names.push(text);
+    }
     names.sort();
     for name in names {
         let Some(stem) = name.strip_prefix(FILE_PREFIX) else { continue };
