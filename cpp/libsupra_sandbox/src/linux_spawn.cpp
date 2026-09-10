@@ -76,6 +76,11 @@ bool writeProcFile(const char* path, const char* value) {
 /// namespace the sandbox then cannot use. Child-side code is raw syscalls
 /// only - async-signal-safe in the forked child, no stdio, no allocation.
 bool userNamespacesAvailable() {
+    // Captured before the fork: after unshare(CLONE_NEWUSER) the child is
+    // nobody (65534) until the map is written, so reading the ids inside the
+    // child maps 65534-to-65534, which the kernel refuses. The spawn path
+    // below makes the same capture for host_uid/host_gid.
+    const auto host_uid = static_cast<unsigned>(::getuid());
     const pid_t pid = ::fork();
     if (pid < 0) {
         return false;
@@ -96,19 +101,18 @@ bool userNamespacesAvailable() {
         if (map_fd < 0) {
             ::_exit(2);
         }
-        // "<uid> <uid> 1": the only mapping an unprivileged process may write.
+        // "0 <uid> 1": the stock mapping unshare(1) writes, which an
+        // unprivileged process may always install for its own uid.
         char digits[10];
         std::size_t count = 0;
-        unsigned uid = static_cast<unsigned>(::getuid());
+        unsigned uid = host_uid;
         do {
             digits[count++] = static_cast<char>('0' + uid % 10);
             uid /= 10;
         } while (uid != 0);
         char map[32];
         std::size_t used = 0;
-        for (std::size_t i = count; i > 0; --i) {
-            map[used++] = digits[i - 1];
-        }
+        map[used++] = '0';
         map[used++] = ' ';
         for (std::size_t i = count; i > 0; --i) {
             map[used++] = digits[i - 1];
