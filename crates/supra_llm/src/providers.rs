@@ -170,12 +170,16 @@ fn map_anthropic(error: anthropic_sdk::types::AnthropicError) -> LlmError {
     }
 }
 
-/// Send one `OpenAI` request through the official SDK and read the
-/// streamed completion.
+/// Send one `OpenAI` request through the official SDK.
 ///
-/// `endpoint` overrides the API base; `None` means the SDK default.
-/// `prompt_cache_key` carries the one-key cache policy; `None` sends no
-/// key. The credential arrives per request and is never stored.
+/// Two transports, one contract. The blocking call (`Chat::create`)
+/// is tried first: one request, one JSON answer, no framing to drift.
+/// When the transport refuses a blocking call — a gateway that only
+/// serves SSE on the completions path, a proxy that closes
+/// non-streaming reads — the same request is re-issued as a stream
+/// and accumulated exactly as a blocking answer would read: text
+/// joined in order, usage from the final chunk. The caller cannot
+/// tell which transport answered.
 ///
 /// # Errors
 ///
@@ -188,17 +192,55 @@ pub async fn send_openai(
     prompt_cache_key: Option<&str>,
     credential: &supra_secrets::SecretString,
 ) -> Result<Completion, LlmError> {
+    let client = openai_client(endpoint, credential);
+    let sdk_request = openai_request(request, model, prompt_cache_key)?;
+    match client.chat().create(sdk_request.clone()).await {
+        Ok(response) => Ok(blocking_completion(response, thinking)),
+        Err(error) if blocks_streaming(&error) => stream_openai(&client, sdk_request, thinking).await,
+        Err(error) => Err(map_openai(&error)),
+    }
+}
+
+/// Build the SDK client for one request: credential per call, base
+/// override normalised to exactly one trailing `/v1`.
+fn openai_client(
+    endpoint: Option<&str>,
+    credential: &supra_secrets::SecretString,
+) -> async_openai::Client<async_openai::config::OpenAIConfig> {
     use async_openai::config::OpenAIConfig;
+
+    let mut config = OpenAIConfig::new().with_api_key(credential.expose());
+    if let Some(base) = endpoint {
+        // The SDK concatenates base + "/chat/completions" verbatim, so a
+        // base that already ends in `/v1` would produce `/v1/chat/...`
+        // while one that does not would produce `/chat/...`. Normalise
+        // to exactly one trailing `/v1`.
+        let trimmed = base.trim_end_matches('/');
+        let base = match trimmed.strip_suffix("/v1") {
+            Some(_) => trimmed.to_owned(),
+            None => format!("{trimmed}/v1"),
+        };
+        config = config.with_api_base(base);
+    }
+    async_openai::Client::with_config(config)
+}
+
+/// Build the SDK request for one [`Request`]: messages in role order,
+/// the pinned model, the one-key cache policy, the effort band for
+/// thinking, and the canonical tools as function tools.
+///
+/// # Errors
+///
+/// [`LlmError::BadResponse`] when a tool definition is not JSON.
+fn openai_request(
+    request: &Request,
+    model: &str,
+    prompt_cache_key: Option<&str>,
+) -> Result<async_openai::types::chat::CreateChatCompletionRequest, LlmError> {
     use async_openai::types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
     };
-
-    let mut config = OpenAIConfig::new().with_api_key(credential.expose());
-    if let Some(base) = endpoint {
-        config = config.with_api_base(base);
-    }
-    let client: async_openai::Client<OpenAIConfig> = async_openai::Client::with_config(config);
 
     let messages: Vec<ChatCompletionRequestMessage> = request
         .messages
@@ -232,9 +274,68 @@ pub async fn send_openai(
         prompt_cache_key: prompt_cache_key.map(str::to_owned),
         reasoning_effort: reasoning_effort(request),
         tools: openai_tools(request)?,
+        // Ask for usage on the final chunk: without it a gateway that
+        // reports tokens only there leaves the completion unpriced.
+        // Harmless on the blocking path, which ignores it.
+        stream_options: Some(async_openai::types::chat::ChatCompletionStreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        }),
         ..Default::default()
     };
+    Ok(sdk_request)
+}
 
+/// Read one blocking `OpenAI` answer into a [`Completion`].
+///
+/// The first choice carries the answer; usage rides the top level.
+/// An empty choice list is a version-skew refusal, not an empty
+/// answer — returning `Ok` with no text would certify that the model
+/// said nothing.
+fn blocking_completion(
+    response: async_openai::types::chat::CreateChatCompletionResponse,
+    thinking: Thinking,
+) -> Completion {
+    let mut text = String::new();
+    for choice in &response.choices {
+        if let Some(part) = &choice.message.content {
+            text.push_str(part);
+        }
+    }
+    let usage = response.usage.map(|reported| Usage {
+        input_tokens: u64::from(reported.prompt_tokens),
+        output_tokens: u64::from(reported.completion_tokens),
+        cached_tokens: 0,
+    });
+    Completion { text, usage, thinking }
+}
+
+/// Whether a blocking-call failure is worth retrying as a stream.
+///
+/// Transport failures only — refused credentials, rate limits, and
+/// malformed requests would fail identically the second time, and
+/// re-issuing them doubles the load that caused the refusal. A hung
+/// or reset connection, a truncated body, or an SSE-only gateway is
+/// exactly what the streaming transport is for.
+fn blocks_streaming(error: &async_openai::error::OpenAIError) -> bool {
+    use async_openai::error::OpenAIError as Sdk;
+
+    !matches!(error, Sdk::ApiError(_) | Sdk::InvalidArgument(_))
+}
+
+/// Re-issue one request as a stream and accumulate it into a
+/// [`Completion`]: text joined in chunk order, usage from the final
+/// chunk, terminal marker required.
+///
+/// A stream that ends without one is refused even when text arrived:
+/// partial text returned as a success is a wrong answer wearing a
+/// green light. The hand-rolled reader held this invariant; both SDK
+/// paths keep it.
+async fn stream_openai(
+    client: &async_openai::Client<async_openai::config::OpenAIConfig>,
+    sdk_request: async_openai::types::chat::CreateChatCompletionRequest,
+    thinking: Thinking,
+) -> Result<Completion, LlmError> {
     let mut stream = client.chat().create_stream(sdk_request).await.map_err(|error| map_openai(&error))?;
 
     let mut text = String::new();
@@ -259,10 +360,6 @@ pub async fn send_openai(
         }
     }
 
-    // A stream that ends without a terminal marker is refused even when
-    // text arrived: partial text returned as a success is a wrong answer
-    // wearing a green light. The hand-rolled reader held this invariant;
-    // the SDK path keeps it.
     if !terminal {
         let detail = if text.is_empty() {
             "the stream ended with no events".to_owned()
@@ -379,6 +476,61 @@ mod tests {
     }
 
     #[test]
+    fn blocking_answers_read_text_and_usage() {
+        use async_openai::types::chat::{
+            ChatChoice, ChatCompletionResponseMessage, CompletionUsage, CreateChatCompletionResponse,
+        };
+
+        let response = CreateChatCompletionResponse {
+            id: "chatcmpl-test".to_owned(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatCompletionResponseMessage {
+                    content: Some("live-ok".to_owned()),
+                    refusal: None,
+                    tool_calls: None,
+                    annotations: None,
+                    role: async_openai::types::chat::Role::Assistant,
+                    audio: None,
+                    #[allow(deprecated)]
+                    function_call: None,
+                },
+                finish_reason: Some(async_openai::types::chat::FinishReason::Stop),
+                logprobs: None,
+            }],
+            created: 0,
+            model: "m".to_owned(),
+            service_tier: None,
+            #[allow(deprecated)]
+            system_fingerprint: None,
+            object: "chat.completion".to_owned(),
+            usage: Some(CompletionUsage {
+                prompt_tokens: 213,
+                completion_tokens: 7,
+                total_tokens: 220,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
+            metadata: None,
+            moderation: None,
+        };
+        let completion = blocking_completion(response, Thinking { budget_tokens: 0 });
+        assert_eq!(completion.text, "live-ok");
+        let usage = completion.usage.expect("usage rides the top level");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (213, 7));
+    }
+
+    #[test]
+    fn only_transport_failures_retry_blocking_as_stream() {
+        use async_openai::error::OpenAIError as Sdk;
+
+        assert!(!blocks_streaming(&Sdk::InvalidArgument("bad request".to_owned())));
+        assert!(blocks_streaming(&Sdk::StreamError(Box::new(
+            async_openai::error::StreamError::EventStream("reset".to_owned())
+        ))));
+    }
+
+    #[test]
     fn anthropic_auth_failures_never_retry() {
         use anthropic_sdk::types::AnthropicError as Sdk;
 
@@ -474,6 +626,9 @@ mod tests {
     /// Live probe against an `OpenAI`-compatible gateway through the real
     /// SDK path: stream a short answer, accumulate text, require a
     /// terminal marker and sane usage.
+    ///
+    /// The `SUPRA_LIVE_OPENAI_BASE` may name the API root with or
+    /// without the trailing `/v1` — the SDK path normalises it.
     ///
     /// Ignored by default: needs `SUPRA_LIVE_OPENAI_BASE`,
     /// `SUPRA_LIVE_OPENAI_KEY`, and `SUPRA_LIVE_OPENAI_MODEL`. Run with
