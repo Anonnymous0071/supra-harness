@@ -108,8 +108,10 @@ const TIOCGWINSZ: core::ffi::c_ulong = 0x4008_7466;
 
 // A third pty-capable kernel would need its own flag and ioctl values;
 // failing the build here is cheaper than failing a spawn at runtime on a
-// platform nobody validated.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+// platform nobody validated. The whole module is Unix-only, so the gate
+// reads `unix and not linux/macos`: a `not(any(linux, macos))` would
+// misfire on Windows, which compiles the crate but not this module.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 compile_error!("supra_ffi::pty pins Linux and macOS constants; add this platform before building it");
 
 /// A master/slave pty pair.

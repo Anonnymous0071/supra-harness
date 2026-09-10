@@ -84,6 +84,12 @@ pub mod ansi;
 pub mod fd;
 pub mod piped;
 pub mod process;
+// Pseudo-terminals are a Unix facility; the module's `posix_openpt`,
+// `grantpt`, and `ioctl` constants are pinned to Linux and macOS kernels,
+// and a `compile_error!` inside guards any other Unix. Windows has no pty
+// API here yet, so the module does not exist there at all - callers gate
+// on `cfg(unix)`, never on "is it linked".
+#[cfg(unix)]
 pub mod pty;
 pub mod sandbox;
 pub mod width;
