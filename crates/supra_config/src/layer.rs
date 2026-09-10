@@ -158,8 +158,15 @@ pub struct PromptLayer {
 #[serde(deny_unknown_fields)]
 pub struct ProviderLayer {
     /// Base URL. Must be `https`, except on a loopback host.
+    ///
+    /// For an SDK-wired provider this overrides the SDK's default base:
+    /// a custom gateway or an OpenAI-compatible proxy. Leave it unset
+    /// for the provider's own API.
     pub endpoint: Option<String>,
     /// Model identifier to send.
+    ///
+    /// Leave it unset for the provider's current cheapest default; pin
+    /// it for a fixed model.
     pub model: Option<String>,
     /// **Name** of an environment variable holding the credential.
     pub api_key_env: Option<String>,

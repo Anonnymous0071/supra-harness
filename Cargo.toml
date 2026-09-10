@@ -102,6 +102,12 @@ supra_core = { path = "crates/supra_core", version = "0.1.0" }
 supra_lsp = { path = "crates/supra_lsp", version = "0.1.0" }
 supra_dap = { path = "crates/supra_dap", version = "0.1.0" }
 supra_session = { path = "crates/supra_session", version = "0.1.0" }
+# provider SDKs (T13): official OpenAI client; Anthropic Messages client.
+# Only the chat-completion surface is enabled, so the 50+ unrelated
+# async-openai features (audio, realtime, vectorstores, admin) never
+# enter the build. `anthropic-sdk-rust` ships as `anthropic_sdk`.
+async-openai = { version = "0.42.0", default-features = false, features = ["chat-completion", "rustls"] }
+anthropic_sdk = { version = "0.1.1", package = "anthropic-sdk-rust" }
 supra_hook = { path = "crates/supra_hook", version = "0.1.0" }
 supra_telemetry = { path = "crates/supra_telemetry", version = "0.1.0" }
 supra_command = { path = "crates/supra_command", version = "0.1.0" }

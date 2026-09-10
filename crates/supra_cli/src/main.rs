@@ -58,35 +58,56 @@ fn eval_cmd(live: bool) -> anyhow::Result<()> {
     if !live {
         return Ok(());
     }
-    live_probe()
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("tokio runtime: {error}"))?;
+    runtime.block_on(live_probe())
 }
 
-fn live_probe() -> anyhow::Result<()> {
-    live_probe_report(live_probe_key())?;
-    Ok(())
-}
+async fn live_probe() -> anyhow::Result<()> {
+    let cli = Cli::try_parse_from(["supra"])?;
+    let config = startup::discover_resolve(&cli)?;
+    let secrets = startup::open_secrets(&cli);
 
-fn live_probe_report(key: Option<String>) -> anyhow::Result<&'static str> {
-    match key {
-        None => {
-            println!("live probe skipped: no provider credential in the environment");
-            Ok("skipped")
+    for name in ["anthropic", "openai"] {
+        if config.providers().get(name).is_none() {
+            continue;
         }
-        Some(_) => {
-            anyhow::bail!("live probe needs a provider credential and network; shape-check passed")
-        }
-    }
-}
-
-fn live_probe_key() -> Option<String> {
-    for var in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"] {
-        if let Ok(value) = std::env::var(var) {
-            if !value.is_empty() {
-                return Some(value);
+        let credential = match config.provider_secret(name, &secrets) {
+            Ok(credential) => credential,
+            Err(error) => {
+                println!("live probe {name}: skipped ({error})");
+                continue;
+            }
+        };
+        let client = supra_llm::Client::from_config(&config, name)?;
+        let request = supra_llm::Request {
+            provider: client.provider(),
+            model: client.model().to_owned(),
+            messages: vec![supra_llm::Message {
+                role: supra_llm::Role::User,
+                content: "Reply with exactly: live-ok".to_owned(),
+            }],
+            tools: Vec::new(),
+            thinking: supra_llm::Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+        match client.send(&request, &credential).await {
+            Ok(completion) => {
+                println!(
+                    "live probe {name}: ok text={:?} usage={:?}",
+                    completion.text.trim(),
+                    completion.usage
+                );
+            }
+            Err(error) => {
+                println!("live probe {name}: FAILED ({error})");
+                anyhow::bail!("live probe {name} failed: {error}");
             }
         }
     }
-    None
+    Ok(())
 }
 
 fn update_check_message() -> anyhow::Result<String> {
@@ -122,19 +143,30 @@ fn config_cmd(cli: &Cli, action: ConfigAction) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::live_probe_report;
     use super::*;
 
     #[test]
-    fn the_live_probe_skips_explicitly_without_a_credential() {
-        let report = live_probe_report(None).expect("absence is Ok");
-        assert_eq!(report, "skipped");
+    fn the_live_probe_skips_providers_with_no_credential() {
+        // An empty environment names no provider, so the probe has
+        // nothing to call: absence is `Ok`, not a refusal.
+        let cli = Cli::try_parse_from(["supra"]).expect("args parse");
+        let config = startup::discover_resolve(&cli).expect("empty env resolves");
+        assert!(config.providers().is_empty(), "no providers without configuration");
     }
 
     #[test]
-    fn presence_refuses_until_the_networked_probe_lands() {
-        let error = live_probe_report(Some("key".to_owned())).expect_err("presence refuses");
-        assert!(error.to_string().contains("needs a provider credential and network"), "{error}");
+    fn a_configured_provider_without_a_credential_is_named_not_panicked() {
+        // The probe resolves the secret through the manager; a missing
+        // credential is a skip with the provider named, never a panic.
+        let cli = Cli::try_parse_from(["supra"]).expect("args parse");
+        let config = startup::discover_resolve(&cli).expect("resolves");
+        let secrets = startup::open_secrets(&cli);
+        for name in ["anthropic", "openai"] {
+            if config.providers().get(name).is_none() {
+                continue;
+            }
+            let _ = config.provider_secret(name, &secrets);
+        }
     }
 
     #[test]

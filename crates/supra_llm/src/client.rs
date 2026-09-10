@@ -192,6 +192,17 @@ impl Client {
     /// first request, or this setting stops being fail-fast"), and this constructor is
     /// where that check lives.
     ///
+    /// An empty `model` selects the provider's current cheapest default
+    /// ([`DEFAULT_OPENAI_MODEL`](crate::providers::DEFAULT_OPENAI_MODEL) /
+    /// [`DEFAULT_ANTHROPIC_MODEL`](crate::providers::DEFAULT_ANTHROPIC_MODEL));
+    /// a pinned model is sent as-is. An empty `endpoint` keeps the SDK's
+    /// own default base; a pinned endpoint overrides it (custom gateway).
+    ///
+    /// Use [`Client::from_config`] when the endpoint, model, and budget
+    /// come from a resolved [`Config`](supra_config::Config) instead of
+    /// literals: it reads all three from the provider entry, so a
+    /// `[providers.<name>]` table fully drives the client it names.
+    ///
     /// # Errors
     ///
     /// [`LlmError::UnknownProvider`] for an unrecognised provider name,
@@ -212,6 +223,15 @@ impl Client {
                 minimum: policy.min_thinking_tokens,
             });
         }
+        let model = if model.trim().is_empty() {
+            match kind {
+                ProviderKind::Anthropic => crate::providers::DEFAULT_ANTHROPIC_MODEL.to_owned(),
+                ProviderKind::OpenAI => crate::providers::DEFAULT_OPENAI_MODEL.to_owned(),
+                ProviderKind::Google => model,
+            }
+        } else {
+            model
+        };
         Ok(Self {
             policy,
             endpoint,
@@ -219,6 +239,65 @@ impl Client {
             thinking: Thinking { budget_tokens: thinking_budget },
             http: reqwest::Client::new(),
         })
+    }
+
+    /// Build a client for one provider named in a resolved configuration.
+    ///
+    /// Endpoint, model, and thinking budget come from the provider entry
+    /// and the resolved scalars; the credential stays out — it resolves
+    /// per request through
+    /// [`Config::provider_secret`](supra_config::Config::provider_secret),
+    /// exactly as [`Client::send`] already does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::new`].
+    pub fn from_config(config: &supra_config::Config, provider_name: &str) -> Result<Self, LlmError> {
+        ProviderKind::parse(provider_name)
+            .ok_or_else(|| LlmError::UnknownProvider { name: provider_name.to_owned() })?;
+        let providers = config.providers();
+        let entry = providers.get(provider_name);
+        Self::new(
+            provider_name,
+            entry.and_then(|provider| provider.endpoint.clone()).unwrap_or_default(),
+            entry.and_then(|provider| provider.model.clone()).unwrap_or_default(),
+            config.thinking_budget(),
+        )
+    }
+
+    /// Send one request through the client, resolving the credential
+    /// from the configuration on the way.
+    ///
+    /// This is the one-call path a turn drives: provider entry for the
+    /// request's kind, secret from the named source, SDK transport
+    /// underneath. The request's own provider field selects the entry;
+    /// the client's policy still gates thinking and breakpoints.
+    ///
+    /// # Errors
+    ///
+    /// [`LlmError::Credential`] when the named source has nothing to
+    /// give; otherwise as [`Client::send`].
+    pub async fn send_with_config(
+        &self,
+        config: &supra_config::Config,
+        manager: &supra_secrets::SecretManager,
+        request: &Request,
+    ) -> Result<Completion, LlmError> {
+        let credential =
+            config.provider_secret(request.provider.name(), manager).map_err(LlmError::Credential)?;
+        self.send(request, &credential).await
+    }
+
+    /// The model identifier this client sends.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The configured endpoint override, if any.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Which provider this client talks to.
@@ -375,6 +454,11 @@ impl Client {
 
     /// Send one request and read the completion.
     ///
+    /// Anthropic and `OpenAI` travel through their official SDKs; Google
+    /// keeps the hand-rolled transport (no official Rust SDK exists),
+    /// with the same body rendering, status mapping, and SSE reading as
+    /// before. The error contract is identical on every path.
+    ///
     /// # Errors
     ///
     /// [`LlmError::Unauthorized`] (never retried), [`LlmError::RateLimited`] (retryable
@@ -386,6 +470,38 @@ impl Client {
         credential: &supra_secrets::SecretString,
     ) -> Result<Completion, LlmError> {
         request.check()?;
+        match self.policy.kind {
+            ProviderKind::Anthropic => {
+                crate::providers::send_anthropic(
+                    request,
+                    sdk_endpoint(&self.endpoint),
+                    &self.model,
+                    request.thinking,
+                    credential,
+                )
+                .await
+            }
+            ProviderKind::OpenAI => {
+                crate::providers::send_openai(
+                    request,
+                    sdk_endpoint(&self.endpoint),
+                    &self.model,
+                    request.thinking,
+                    Some("supra-prefix"),
+                    credential,
+                )
+                .await
+            }
+            ProviderKind::Google => self.send_legacy(request, credential).await,
+        }
+    }
+
+    /// The hand-rolled transport, now Google-only.
+    async fn send_legacy(
+        &self,
+        request: &Request,
+        credential: &supra_secrets::SecretString,
+    ) -> Result<Completion, LlmError> {
         let body = self.render_body(request).map_err(|error| LlmError::BadResponse {
             provider: self.policy.kind.name().to_owned(),
             detail: format!("request body is not canonical: {error}"),
@@ -427,6 +543,14 @@ impl Client {
 
         read_sse(response, request.thinking).await
     }
+}
+
+/// The endpoint as an SDK base override: `None` when the configuration
+/// pins nothing (the SDK default applies), otherwise the configured
+/// base. An empty string pins nothing too — it is the absence of a
+/// value, not a base URL.
+fn sdk_endpoint(endpoint: &str) -> Option<&str> {
+    (!endpoint.trim().is_empty()).then_some(endpoint)
 }
 
 /// The auth headers each provider expects: Anthropic wants `x-api-key` plus its version

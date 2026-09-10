@@ -61,6 +61,11 @@ pub enum Endpoint {
 /// The enum, not a trait object: the two transports have nothing to share
 /// but `call`, and a trait would only re-abstract what this switch states
 /// in one place each.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the stdio side owns a child process and its pipes; boxing the child alone would not \
+              change the variant order and would only hide the cost, not remove it"
+)]
 pub enum Transport {
     /// A child process speaking newline-delimited JSON on stdio.
     Stdio {
