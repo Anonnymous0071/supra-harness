@@ -257,19 +257,40 @@ mod tests {
 
     fn journal() -> (Journal, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("supra-journal-{}", scratch_tag()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        if std::fs::create_dir_all(&dir).is_err() {
+            // Another test process claimed this tag first (a stale dir left
+            // by a killed run keeps the name taken). Retry once with a fresh
+            // tag rather than sharing a database file with a stranger.
+            let dir = std::env::temp_dir().join(format!("supra-journal-{}", scratch_tag()));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let store = Store::open(dir.join("journal.db")).expect("store");
+            let journal = Journal::open(std::sync::Arc::new(store)).expect("journal");
+            return (journal, dir);
+        }
         let store = Store::open(dir.join("journal.db")).expect("store");
         let journal = Journal::open(std::sync::Arc::new(store)).expect("journal");
         (journal, dir)
     }
 
     /// Unique-enough scratch names without a new dependency: the pid breaks
-    /// up concurrent test binaries, a counter breaks up the tests inside
-    /// one.
+    /// up concurrent test binaries, a random suffix breaks up the tests
+    /// inside one. A bare counter is process-ordered but not
+    /// process-unique: two test binaries started in the same millisecond
+    /// share pid-adjacent values (cargo reuses pids fast) and can claim the
+    /// same tag, so each tag carries fresh entropy instead.
     fn scratch_tag() -> String {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        format!("{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed))
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash as _, Hasher as _};
+        use std::time::SystemTime;
+        let mut hasher = DefaultHasher::new();
+        std::process::id().hash(&mut hasher);
+        std::thread::current().id().hash(&mut hasher);
+        SystemTime::now().hash(&mut hasher);
+        // Pointer entropy: two calls in the same nanosecond still differ,
+        // because each formats a different stack slot.
+        let slot = 0u8;
+        std::ptr::from_ref(&slot).hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
     }
 
     fn write_file(path: &Path, contents: &[u8]) {
