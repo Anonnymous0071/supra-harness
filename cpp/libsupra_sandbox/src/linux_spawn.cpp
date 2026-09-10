@@ -70,13 +70,55 @@ bool writeProcFile(const char* path, const char* value) {
 ///
 /// Tested by actually creating one in a forked child. The sysctls that gate this
 /// vary between distributions, so reading them is less reliable than trying.
+/// The canary must mirror the spawn path, not just its first step: Ubuntu
+/// 24.04's AppArmor restriction allows `unshare(CLONE_NEWUSER)` and then denies
+/// the `uid_map` write, so a canary that stopped at unshare would report a
+/// namespace the sandbox then cannot use. Child-side code is raw syscalls
+/// only - async-signal-safe in the forked child, no stdio, no allocation.
 bool userNamespacesAvailable() {
     const pid_t pid = ::fork();
     if (pid < 0) {
         return false;
     }
     if (pid == 0) {
-        ::_exit(::unshare(CLONE_NEWUSER) == 0 ? 0 : 1);
+        if (::unshare(CLONE_NEWUSER) != 0) {
+            ::_exit(1);
+        }
+        // Best-effort, matching the spawn path: pre-3.19 kernels have no
+        // setgroups file and allow the map write without the deny.
+        const int groups_fd = ::open("/proc/self/setgroups", O_WRONLY);
+        if (groups_fd >= 0) {
+            const ssize_t denied = ::write(groups_fd, "deny", 4);
+            static_cast<void>(denied);
+            ::close(groups_fd);
+        }
+        const int map_fd = ::open("/proc/self/uid_map", O_WRONLY);
+        if (map_fd < 0) {
+            ::_exit(2);
+        }
+        // "<uid> <uid> 1": the only mapping an unprivileged process may write.
+        char digits[10];
+        std::size_t count = 0;
+        unsigned uid = static_cast<unsigned>(::getuid());
+        do {
+            digits[count++] = static_cast<char>('0' + uid % 10);
+            uid /= 10;
+        } while (uid != 0);
+        char map[32];
+        std::size_t used = 0;
+        for (std::size_t i = count; i > 0; --i) {
+            map[used++] = digits[i - 1];
+        }
+        map[used++] = ' ';
+        for (std::size_t i = count; i > 0; --i) {
+            map[used++] = digits[i - 1];
+        }
+        map[used++] = ' ';
+        map[used++] = '1';
+        map[used++] = '\n';
+        const ssize_t written = ::write(map_fd, map, used);
+        ::close(map_fd);
+        ::_exit(written == static_cast<ssize_t>(used) ? 0 : 3);
     }
     int status = 0;
     if (::waitpid(pid, &status, 0) < 0) {

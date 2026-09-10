@@ -59,13 +59,20 @@ function(supra_declare_library target)
     # `lib<name>.a`. The CMake targets are already called `libsupra_*`, so the
     # default prefix would produce `liblibsupra_width.a` and force callers to
     # link `-l libsupra_width`. Stripping the redundant prefix from OUTPUT_NAME
-    # yields `libsupra_width.a` and the natural `-l supra_width`.
+    # yields `libsupra_width.a` and the natural `-l supra_width`. MSVC is the
+    # exception: its linker expects `<name>.lib` with no prefix.
     string(REGEX REPLACE "^lib" "" supra_archive_name "${target}")
+
+    if(MSVC)
+        set(SUPRA_ARCHIVE_PREFIX "")
+    else()
+        set(SUPRA_ARCHIVE_PREFIX "lib")
+    endif()
 
     set_target_properties(
         ${target}
         PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-                   PREFIX "lib"
+                   PREFIX "${SUPRA_ARCHIVE_PREFIX}"
                    OUTPUT_NAME "${supra_archive_name}"
     )
 endfunction()

@@ -61,15 +61,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang clang-tidy ninja-build
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      # --config is a no-op on single-config generators (Linux, macOS) and the
+      # required spelling on Visual Studio multi-config ones: without it the
+      # build and ctest pick different configuration directories and every
+      # test reports "Not Run".
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel --config Release
       # --no-tests=error once libraries exist; before T2 an empty suite is the
       # expected state and must not fail the pipeline.
       - name: Test
         shell: bash
         run: |
           if compgen -G "cpp/libsupra_*/CMakeLists.txt" >/dev/null; then
-            ctest --test-dir build --output-on-failure --no-tests=error
+            ctest --test-dir build -C Release --output-on-failure --no-tests=error
           else
             echo "no C++ libraries yet (T2-T4)"
           fi

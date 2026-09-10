@@ -61,12 +61,22 @@ fn main() {
         None => build_with_cmake(&workspace_root),
     };
 
+    // One search directory per distinct archive parent: single-config
+    // generators put everything in `lib`, multi-config ones append the
+    // configuration directory. `locate_archive` names the canonical expected
+    // path when nothing matches, so the assert fires with a real path.
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
     for library in LIBRARIES {
-        let archive = lib_dir.join(format!("lib{library}.a"));
+        let archive = locate_archive(&lib_dir, library);
         assert!(archive.is_file(), "expected archive {} was not produced", archive.display());
+        let dir = archive.parent().expect("an archive under lib always has a parent").to_path_buf();
+        if !search_dirs.contains(&dir) {
+            search_dirs.push(dir);
+        }
     }
-
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    for dir in &search_dirs {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
 
     // Reverse dependency order: a static linker resolves left to right, so a
     // library must appear before the one it depends on. libsupra_ansi calls into
@@ -104,19 +114,65 @@ fn build_with_cmake(workspace_root: &Path) -> PathBuf {
 
     // clang is the pinned compiler for this tree, matching `just build-cpp`, so
     // the archives Cargo links are built by the same frontend that the C++ suites
-    // were verified with. Overridable for a deliberate experiment.
+    // were verified with. Overridable for a deliberate experiment. MSVC is the
+    // exception: the Visual Studio generator pairs with cl, and the Windows
+    // C++ suites are built with it too - pinning clang++ there fights the
+    // generator.
+    let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if let Some(cxx) = env::var_os("SUPRA_CXX") {
         config.define("CMAKE_CXX_COMPILER", cxx);
-    } else {
+    } else if !msvc {
         config.define("CMAKE_CXX_COMPILER", "clang++");
     }
 
-    // `cmake --build --target all` would also build nothing extra now that tests
-    // are off, but naming the targets keeps the intent explicit.
-    config.build_target("all");
+    // No default build target: the cmake crate's default is `install`, and
+    // this tree defines no install rules. The everything-target is spelled
+    // `all` on Makefiles/Ninja and `ALL_BUILD` on the Visual Studio
+    // generators; with tests off either is exactly the three archives.
+    if msvc {
+        config.build_target("ALL_BUILD");
+    } else {
+        config.build_target("all");
+    }
 
     let dst = config.build();
     dst.join("build").join("lib")
+}
+
+/// Find one library's archive under `lib_dir`.
+///
+/// Unix keeps `lib<name>.a`, which `-l <name>` resolves. MSVC archives are
+/// `<name>.lib`, and multi-config generators append the configuration
+/// directory to the output path, so the search walks one level down as well.
+/// When nothing matches, the canonical expected path is returned so the
+/// caller's existence assert names it.
+fn locate_archive(lib_dir: &Path, library: &str) -> PathBuf {
+    let unix_archive = lib_dir.join(format!("lib{library}.a"));
+    if unix_archive.is_file() {
+        return unix_archive;
+    }
+
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        for name in [format!("{library}.lib"), format!("lib{library}.lib")] {
+            let direct = lib_dir.join(&name);
+            if direct.is_file() {
+                return direct;
+            }
+            if let Ok(entries) = std::fs::read_dir(lib_dir) {
+                let mut subdirs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+                subdirs.sort();
+                for dir in subdirs {
+                    let nested = dir.join(&name);
+                    if nested.is_file() {
+                        return nested;
+                    }
+                }
+            }
+        }
+        return lib_dir.join(format!("{library}.lib"));
+    }
+
+    unix_archive
 }
 
 /// Link the C++ standard library.
