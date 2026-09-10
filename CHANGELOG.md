@@ -9,6 +9,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Official provider SDKs (`supra_llm::providers`): `OpenAI` travels
+  through `async-openai` (chat-completion surface only), `Anthropic`
+  through `anthropic-sdk-rust` Messages streaming. Policy, canonical
+  rendering, and the `LlmError` recoverability contract are unchanged;
+  `Google` keeps the hand-rolled transport.
+- `Client::from_config` / `Client::send_with_config`: endpoint, model,
+  and budget from `[providers.<name>]`; empty model selects the cheapest
+  default (`gpt-4o-mini` / `claude-3-5-haiku-20241022`); credential
+  resolves per request and is never stored.
+- `supra eval --live` probes every configured SDK provider through
+  `Client` instead of refusing.
+- Ignored live-probe tests for both SDK paths
+  (`SUPRA_LIVE_{ANTHROPIC,OPENAI}_{BASE,KEY,MODEL}`), validated against
+  live gateways.
+
+### Fixed
+
+- Full-repo audit (62 verified bugs with regression tests): CLI
+  help/enums, turn lifecycle, LSP/DAP framing, journal/session
+  persistence, config, log, skills, TUI, money, secrets vault, hooks,
+  eventbus, vector revisions, update manifest binding, MCP transport
+  and pagination, log rotation locking.
+- Portable build: multi-config `--config Release` in CI, MSVC archive
+  prefix, faithful user-namespace canary, multi-config link search.
+
+### Added
+
 - **T30** `crates/supra_cli`, `crates/supra_update`,
   `crates/supra_eval`: the single binary, the updater, the economy
   gate - Layer G, closing the 37-stage sequence.
