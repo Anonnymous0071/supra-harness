@@ -7,7 +7,7 @@
 //! never counts toward its own claim (T12.5 L7), and proposer roles
 //! attach per claim and rotate within a turn.
 //!
-//! Every vote updates an incremental [`QuorumTally`] and returns the
+//! Every vote updates an incremental quorum tally and returns the
 //! claim's new status, so the turn loop (T23) evaluates after every vote:
 //! reached aborts in-flight peers, unreachable escalates without waiting
 //! for a timeout. Claims and votes persist to SQLite through

@@ -183,7 +183,7 @@ pub fn find_reversal(plan: &Plan) -> Option<(Breakpoint, Breakpoint)> {
 ///
 /// # Errors
 ///
-/// [`PromptError`] is not used here: a bad plan is a ledger defect with a specific
+/// [`crate::PromptError`] is not used here: a bad plan is a ledger defect with a specific
 /// breakpoint attached, and the caller needs the breakpoint, not the error enum.
 /// The two failure modes return the offending breakpoint directly.
 pub fn validate(plan: &Plan, segments: &[Sealed<Segment>]) -> Result<(), Breakpoint> {

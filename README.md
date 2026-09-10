@@ -93,7 +93,7 @@ decisions and mutation tables: each `crates/supra_*/README.md`.
 
 ## Install
 
-Requirements: Rust 1.85+, CMake 3.24+, clang++ with C++20, git. Optional:
+Requirements: Rust 1.86+, CMake 3.24+, clang++ with C++20, git. Optional:
 `bubblewrap` (Linux sandbox), `clang-tidy`, `cargo-deny`, `ninja`, `just`.
 
 ### Option A — one line (release binary)

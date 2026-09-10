@@ -20,7 +20,7 @@
 //!
 //! # The layout ratchet
 //!
-//! The `extern` declarations in [`sys`] are hand-written, not generated. The ABI
+//! The `extern` declarations in the private `sys` module are hand-written, not generated. The ABI
 //! is small, stable, and authored in this repository, so a code generator would
 //! add a build dependency for no benefit - but hand-writing carries a real risk:
 //! a field added to a C++ header without a matching Rust change produces a layout
@@ -31,7 +31,7 @@
 //!
 //! - `build.rs` feeds every size and alignment to `abi_check.cpp`, where a
 //!   `static_assert` compares it against the real C++ `sizeof`.
-//! - [`sys`] asserts the same constants against Rust's `size_of` and `align_of`.
+//! - the private `sys` module asserts the same constants against Rust's `size_of` and `align_of`.
 //!
 //! A divergence fails to build on one side or the other, and neither check needs
 //! to run - which also keeps them valid when cross-compiling.

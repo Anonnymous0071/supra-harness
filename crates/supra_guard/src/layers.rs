@@ -11,7 +11,7 @@
 //! | ----- | ------- | --------- |
 //! | L1 | no identity established | [`crate::identity::is_established`] |
 //! | L2 | no marker key generated | [`crate::marker::has_key`] |
-//! | L3 | the command names this binary | argv[0], path, and resolved file name |
+//! | L3 | the command names this binary | `argv[0]`, path, and resolved file name |
 //! | L4 | the command *is* this binary | (device, inode) via `supra_ffi` |
 //! | L5 | the marker does not authenticate | HMAC-SHA256 over `version:nonce` |
 //! | L6 | the lineage would cycle or nest | [`supra_types::Lineage::child`] |
@@ -62,7 +62,7 @@ pub struct Verdict {
 impl Verdict {
     /// Whether every layer passed.
     ///
-    /// Not `const`: `Vec::is_empty` is not const on the pinned MSRV (1.85).
+    /// Not `const`: `Vec::is_empty` is not const on the pinned MSRV.
     #[must_use]
     pub fn allowed(&self) -> bool {
         self.refusals.is_empty()

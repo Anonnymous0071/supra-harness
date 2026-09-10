@@ -15,8 +15,8 @@
 //!
 //! # Hot reload, the T15 shape
 //!
-//! [`Loader::apply_event`] takes a `notify::Event` the caller (T23's
-//! turn loop) forwards - exactly [`supra_digest::Digest::apply_event`]'s
+//! [`Skills::apply_event`] takes a `notify::Event` the caller (T23's
+//! turn loop) forwards - the same contract as the repository digest's event
 //! contract, for the same reason: the harness owns the watcher and its
 //! timing; the loader owns what one event means. A changed SKILL.md
 //! reloads that skill; a removed one drops it; a skill whose *name*

@@ -47,6 +47,22 @@ jobs:
           command: check
           arguments: --all-features
 
+  repository-contracts:
+    name: invariants, docs, and MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned development toolchain
+        run: rustup show
+      - name: Install Rust 1.86 MSRV
+        run: rustup toolchain install 1.86.0 --profile minimal
+      - name: Install just
+        uses: extractions/setup-just@v3
+      - uses: Swatinem/rust-cache@v2
+      - run: just invariants
+      - run: just docs-check
+      - run: just msrv
+
   cpp:
     name: cpp (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -109,8 +125,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Add targets
-        run: rustup target add wasm32-wasip2 wasm32-wasip1
+      - name: Add component target
+        run: rustup target add wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/build-wasm.sh wasm32-wasip2
 

@@ -34,8 +34,10 @@ System packages (clang, cmake, bubblewrap) install per-distribution;
 
 ## Gates
 
-`just ci` runs: `fmt-check`, `clippy -D warnings`, `deny`, `test-cpp`,
-`build-wasm`, `test-rust`. It must pass before you push.
+`just ci` runs: `fmt-check`, `clippy -D warnings`, `deny`, structural
+`invariants`, strict rustdoc via `docs-check`, the Rust 1.86 `msrv` check,
+`test-cpp`, the built-component `build-wasm` execution check, and `test-rust`.
+It must pass before you push.
 
 Recipes that have nothing to do yet say so and exit 0. `test-cpp` switches to
 `--no-tests=error` the moment a `cpp/libsupra_*` directory exists, so an empty

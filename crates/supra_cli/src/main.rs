@@ -70,10 +70,12 @@ async fn live_probe() -> anyhow::Result<()> {
     let config = startup::discover_resolve(&cli)?;
     let secrets = startup::open_secrets(&cli);
 
+    let mut configured = 0usize;
     for name in ["anthropic", "openai"] {
         if config.providers().get(name).is_none() {
             continue;
         }
+        configured += 1;
         let credential = match config.provider_secret(name, &secrets) {
             Ok(credential) => credential,
             Err(error) => {
@@ -106,6 +108,9 @@ async fn live_probe() -> anyhow::Result<()> {
                 anyhow::bail!("live probe {name} failed: {error}");
             }
         }
+    }
+    if configured == 0 {
+        println!("live probe: skipped (no configured providers)");
     }
     Ok(())
 }

@@ -6,8 +6,8 @@ build_dir=${1:-build}
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 if ! command -v clang-tidy >/dev/null 2>&1; then
-    echo "clang-tidy not installed; skipping C++ lint (see: just doctor)" >&2
-    exit 0
+    echo "clang-tidy not installed; refusing to skip required C++ lint (see: just doctor)" >&2
+    exit 1
 fi
 
 if [[ ! -f "$build_dir/compile_commands.json" ]]; then

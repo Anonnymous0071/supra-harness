@@ -27,7 +27,7 @@
 //!
 //! Argument text goes through [`supra_llm::canonicalize`] exactly once -
 //! the strict, duplicate-refusing serialiser that is the only sanctioned
-//! producer of [`CanonicalJson`] (T13). The invocation carries the
+//! producer of [`supra_types::CanonicalJson`] (T13). The invocation carries the
 //! canonical bytes to the ledger unchanged, so what was hashed is what
 //! reaches the wire. This crate never parses JSON outside that path;
 //! re-serialising a parsed value on the way out is how invisible cache
@@ -36,7 +36,7 @@
 //! # Registry vs gate vs executor
 //!
 //! The registry validates and resolves; it does not decide or run. The
-//! resolved effect ([`Effect`], T16.7's catalogue) travels with the
+//! resolved effect ([`supra_permission::Effect`], T16.7's catalogue) travels with the
 //! invocation to the permission gate, which the turn loop (T23) owns -
 //! classification runs on the resolved effect, never the tool name, and
 //! the registry is the layer that knows the arguments. Execution dispatch

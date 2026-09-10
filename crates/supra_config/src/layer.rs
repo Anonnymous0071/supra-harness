@@ -141,7 +141,7 @@ pub struct PermissionLayer {
     /// One of `plan`, `ask`, `auto`, `yolo`.
     ///
     /// From the project layer this may only make the session **stricter**; see
-    /// [`crate::resolve`].
+    /// [`crate::resolve()`].
     pub mode: Option<ModeSetting>,
 }
 
@@ -204,8 +204,8 @@ impl ConfigLayer {
     /// # Errors
     ///
     /// [`ConfigError::Invalid`], carrying the parser's cause and the line and column
-    /// it occurred at - but **not** the source line itself. See
-    /// [`describe_toml_error`] for why that omission is deliberate.
+    /// the parser's diagnostic excludes it; that omission is deliberate to avoid exposing
+    /// secrets embedded in a malformed line.
     pub fn parse(text: &str, layer: ConfigSource, path: std::path::PathBuf) -> Result<Self, ConfigError> {
         toml::from_str(text).map_err(|error| ConfigError::Invalid {
             layer,
@@ -217,7 +217,7 @@ impl ConfigLayer {
     /// Check everything about this layer that does not depend on other layers.
     ///
     /// Running this before resolution is what makes resolution **infallible**: a
-    /// layer that reaches [`crate::resolve`] has already had every bound, every
+    /// layer that reaches [`crate::resolve()`] has already had every bound, every
     /// value shape, and every per-layer permission checked.
     ///
     /// # Errors

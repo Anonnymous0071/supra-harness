@@ -9,7 +9,7 @@
 //! the cache fields the policy names, they do not decide them.
 //!
 //! What the SDKs do *not* own: credential storage, retry policy, or the
-//! conversion from [`LlmError`](crate::LlmError) recoverability classes.
+//! conversion from [`LlmError`] recoverability classes.
 //! An SDK error is mapped at the boundary into the variant the caller
 //! already matches on — [`Unauthorized`](crate::LlmError::Unauthorized),
 //! [`RateLimited`](crate::LlmError::RateLimited),

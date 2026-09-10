@@ -173,6 +173,39 @@ has_sql() {
     printf '%s\n' "$body" | grep -qF "$needle"
 }
 
+# A populated workspace is no longer optional. If Cargo metadata cannot be read, or if
+# either package list is empty, every downstream Rust gate would otherwise certify nothing.
+if ! metadata=$(cargo metadata --locked --no-deps --format-version 1 2>&1); then
+    fail "cargo metadata failed; Rust validation cannot determine its scope" "$metadata"
+else
+    metadata_counts=$(printf '%s' "$metadata" | python3 -c \
+        'import json, sys; data=json.load(sys.stdin); print(len(data["packages"]), len(data["workspace_members"]))' \
+        2>&1) || {
+        fail "cargo metadata returned unreadable JSON" "$metadata_counts"
+        metadata_counts="0 0"
+    }
+    read -r package_count member_count <<<"$metadata_counts"
+    if [ "${package_count:-0}" -eq 0 ] || [ "${member_count:-0}" -eq 0 ]; then
+        fail "the Rust workspace is empty" \
+            "packages=${package_count:-unknown} workspace_members=${member_count:-unknown}" \
+            "an empty workspace makes build, test, lint, and dependency checks vacuous"
+    fi
+fi
+
+# The package MSRV and Clippy policy are one compatibility claim. The pinned default
+# toolchain is deliberately independent: contributors may use a newer compiler while CI
+# still proves that every package builds on the minimum version advertised to users.
+workspace_msrv=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml |
+    sed -n 's/^rust-version = "\(.*\)"/\1/p' | head -1)
+clippy_msrv=$(sed -n 's/^msrv = "\(.*\)"/\1/p' clippy.toml | head -1)
+if [ -z "$workspace_msrv" ] || [ -z "$clippy_msrv" ]; then
+    fail "could not read the workspace and Clippy MSRV declarations"
+elif [ "$workspace_msrv" != "$clippy_msrv" ]; then
+    fail "the Rust compatibility declarations disagree" \
+        "Cargo.toml=$workspace_msrv clippy.toml=$clippy_msrv" \
+        "Clippy must evaluate APIs against the version the packages advertise"
+fi
+
 crate=crates/supra_types/src
 
 # ---------------------------------------------------------------------------
@@ -650,16 +683,19 @@ if [ -d "$vector" ]; then
             "a failed write would leave the tier describing a row that does not exist"
     fi
 
-    # The binarisation threshold is frozen. If it moves, every code written before the move
-    # answers a different question from every code written after, and the scan ranks them
-    # against each other without failing.
-    hits=$(scan_sql "$vector/index.rs" 'UPDATE vector_meta')
+    # The binarisation threshold, dimensions, model, and creation time are frozen. The
+    # revision is deliberately mutable: it is the cache-invalidation clock and not part of
+    # the encoding configuration. Refuse assignments to every frozen column while allowing
+    # `revision = revision + 1`.
+    hits=$(scan_sql "$vector/index.rs" 'UPDATE vector_meta.*SET[^";]*(dims|model|threshold|created_at)[[:space:]]*=')
     if [ -n "$hits" ]; then
         fail "the frozen index configuration is being updated in place" "$hits" \
-            "moving the threshold silently invalidates every code already written"
+            "moving the encoding parameters silently invalidates every code already written"
     fi
-    if ! printf '%s' "$(sed -n '/pub fn open(/,/^    }/p' "$vector/index.rs")" |
-        grep -q 'FrozenThresholdMismatch'; then
+    threshold_error=$(scan "$vector/index.rs" 'VectorError::FrozenThresholdMismatch')
+    threshold_compare=$(scan "$vector/index.rs" \
+        'codes::encode_embedding\(&found\.threshold\) != codes::encode_embedding\(threshold\)')
+    if [ -z "$threshold_error" ] || [ -z "$threshold_compare" ]; then
         fail "open no longer refuses a changed threshold" \
             "silently keeping the stored one leaves the caller wrong about its own encoding"
     fi
@@ -793,24 +829,20 @@ if [ -d "$secrets" ]; then
             "a floor that disagrees with the constant it guards is worse than no floor"
     fi
 
-    # The vault file must be 0600 before the first secret byte lands, not after. A chmod
-    # after the write leaves a window where the file is world-readable; the temp file must
-    # also carry the mode, because rename preserves it.
-    #
-    # Two `set_permissions` calls exist (temp file before the write, destination after the
-    # rename), so the check extracts only the segment between `File::create` and the first
-    # `write_all`: exactly the region where ordering matters. A probe that deleted the
-    # first chmod while leaving the second must fail - the second covers the destination,
-    # not the window.
+    # The temporary vault file is born 0600 before it is opened. `OpenOptionsExt::mode`
+    # applies the creation mode atomically, avoiding the world-readable window that a
+    # create-then-chmod sequence introduces. The destination is re-asserted after rename.
     segment=$(sed -n '/fn save(/,/^    }/p' "$secrets/file_store.rs" |
-        sed -n '/File::create/,/write_all/p')
-    if ! printf '%s\n' "$segment" | grep -q 'set_permissions'; then
-        fail "the vault file is not restricted before the first write" "$segment" \
-            "chmod must precede write_all, or the secret has a world-readable window"
+        sed -n '/let mut options = fs::OpenOptions::new/,/write_all/p')
+    if ! printf '%s\n' "$segment" | grep -q 'create_new(true)'; then
+        fail "the vault temp file is no longer created exclusively" "$segment" \
+            "an attacker-controlled pre-existing temp path must never be opened"
     fi
-    if ! printf '%s\n' "$segment" | grep -q 'from_mode(0o600)'; then
-        fail "the pre-write restriction is not 0600" "$segment" \
-            "the mode is the guarantee, not just the presence of a chmod call"
+    mode_at=$(printf '%s\n' "$segment" | grep -n 'mode(0o600)' | head -1 | cut -d: -f1)
+    open_at=$(printf '%s\n' "$segment" | grep -n 'options.open' | head -1 | cut -d: -f1)
+    if [ -z "$mode_at" ] || [ -z "$open_at" ] || [ "$mode_at" -ge "$open_at" ]; then
+        fail "the vault temp file is not born with mode 0600" "$segment" \
+            "the creation mode must be set before open, not after the first secret byte lands"
     fi
 
     # The passphrase must never come from an interactive prompt inside the library. A
@@ -1684,8 +1716,9 @@ if [ -d "$mcpsrc" ]; then
             "the host env holds secrets no third-party server needs"
     fi
 
-    # The budget is consulted at probe, before anything is cached.
-    budgeted=$(scan "$mcpsrc/gateway.rs" 'listed\.tools\.len\(\) > TOOLS_PER_SERVER')
+    # The aggregate budget is consulted after every tools/list page settles and before
+    # rows are built or cached. A per-page check can be bypassed by pagination.
+    budgeted=$(scan "$mcpsrc/gateway.rs" 'remote_tools\.len\(\) > TOOLS_PER_SERVER')
     if [ -z "$budgeted" ]; then
         fail "the per-server discovery budget is no longer enforced" \
             "crates/supra_mcp/src/gateway.rs" \
@@ -1911,7 +1944,7 @@ if [ -d "$lspsrc" ]; then
             "the AST ships semantic false; the server's answer is the one place that flips it"
     fi
 
-    restarted=$(scan "$lspsrc/client.rs" 'spawn_child\(\)\?;')
+    restarted=$(scan "$lspsrc/client.rs" 'self\.spawn_child\(server\)\?;')
     if [ -z "$restarted" ]; then
         fail "a crashed server no longer restarts" \
             "crates/supra_lsp/src/client.rs" \
@@ -2050,7 +2083,7 @@ fi
 telsrc="crates/supra_telemetry/src"
 
 if [ -d "$telsrc" ]; then
-    per_report=$(scan "$telsrc/report.rs" 'report: supra_types::SessionId::generate\(\)')
+    per_report=$(scan "$telsrc/report.rs" 'identity: ReportId\(supra_types::SessionId::generate\(\)\)')
     if [ -z "$per_report" ]; then
         fail "the report id is no longer random per report" \
             "crates/supra_telemetry/src/report.rs" \
@@ -2178,9 +2211,9 @@ if [ -d "$clisrc" ]; then
             "a tightening escape hatch without confirmation is a bypass with a flag"
     fi
 
-    # No `"off"` in the pattern: literals are blanked, so match the shape -
-    # a case-insensitive sandbox comparison gated on `!self.yes`.
-    if ! scan "$clisrc/args.rs" 'sandbox\.eq_ignore_ascii_case.*&& !self\.yes' | grep -q .; then
+    # `SandboxArg` is parsed by clap, so this is a typed equality rather than a string
+    # comparison. The confirmation still has to be in the same predicate.
+    if ! scan "$clisrc/args.rs" 'self\.sandbox == SandboxArg::Off && !self\.yes' | grep -q .; then
         fail "the --sandbox off confirmation is gone" \
             "crates/supra_cli/src/args.rs" \
             "disabling the sandbox is a separate flag with its own confirmation, per section 6"
@@ -2192,9 +2225,7 @@ if [ -d "$clisrc" ]; then
             "the shape-check is what always runs in CI; live is the exception, not the rule"
     fi
 
-    # `scan_sql`: `"skipped"` is a literal, blanked by plain `scan` - same
-    # lesson, third restatement.
-    if ! scan_sql "$clisrc/main.rs" 'Ok\("skipped"\)' | grep -q .; then
+    if ! scan_sql "$clisrc/main.rs" 'live probe: skipped \(no configured providers\)' | grep -q .; then
         fail "the live-probe skip is no longer explicit" \
             "crates/supra_cli/src/main.rs" \
             "a probe that cannot run must say so; silence reads as a pass"

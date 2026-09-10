@@ -93,7 +93,7 @@ impl TaskProfile {
     /// Record a failure: failures saturate at 2, tier updates.
     #[must_use]
     pub const fn failed(mut self, tier: supra_types::Tier) -> Self {
-        // `u32::min` is not const-stable on the pinned MSRV (1.85); the branch
+        // `u32::min` is not const-stable on the pinned MSRV; the branch
         // is the same saturation with no trait bound involved.
         self.repeat_failures = if self.repeat_failures >= 2 { 2 } else { self.repeat_failures + 1 };
         self.last_tier = tier;

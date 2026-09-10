@@ -2,7 +2,7 @@
 //!
 //! # What the ledger owns
 //!
-//! The ordered sequence of [`Sealed`](supra_types::Sealed) segments that is the prompt
+//! The ordered sequence of [`Sealed`] segments that is the prompt
 //! prefix, the sequence numbers on them, and the prefix hash over the sequence. Appending
 //! is the only mutation; there is no edit, no remove, no reorder. A generation seal
 //! freezes the sequence into a [`Generation`] whose hash can be re-proven later.

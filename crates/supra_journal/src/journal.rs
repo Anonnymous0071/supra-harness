@@ -238,7 +238,7 @@ impl Journal {
     ///
     /// A budget the operator can watch: an unbounded stack is a disk cost
     /// nobody asked for, and later stages prune on this number. Resolved
-    /// like [`newest_for_path`] for the same reason.
+    /// like [`Journal::newest_for_path`] for the same reason.
     ///
     /// # Errors
     ///

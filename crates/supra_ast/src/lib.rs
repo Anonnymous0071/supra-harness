@@ -20,7 +20,7 @@
 //! |---|
 //! | [`splice`] | byte-range splice with the reparse gate |
 //! | [`query`] | outline rendering plus reference search through imports |
-//! | [`rename`] | multi-file syntactic rename, atomic, shadow-checked |
+//! | [`rename()`] | multi-file syntactic rename, atomic, shadow-checked |
 //! | [`error`] | failures split by who must act |
 //!
 //! # Reuse, not duplication

@@ -38,7 +38,7 @@
 //!
 //! # Adding one
 //!
-//! Append to [`MIGRATIONS`], or to the component's own list. Never edit an entry that has
+//! Append to the migration list below, or to the component's own list. Never edit an entry that has
 //! shipped: a store in the field is already at that version and will not re-run it, so an
 //! edit changes what new stores get and leaves old ones different for ever.
 

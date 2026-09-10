@@ -26,6 +26,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Validation now enforces structural invariants, warning-free rustdoc, and the
+  Rust 1.86 MSRV in hosted CI; the authoritative `just ci` gate also builds,
+  links, and executes a real WASI component contract. Removed the unimplemented
+  `wasm32-wasip1` fallback claim so setup names only the exercised target.
 - Full-repo audit (62 verified bugs with regression tests): CLI
   help/enums, turn lifecycle, LSP/DAP framing, journal/session
   persistence, config, log, skills, TUI, money, secrets vault, hooks,

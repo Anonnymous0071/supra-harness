@@ -5,7 +5,7 @@
 //! Provider documentation names unstable `tool_use` key ordering as a cache breaker: two
 //! requests with the same tool calls in different key orders are different prefixes, so
 //! the second pays a full cache write for bytes that are semantically identical. T6 holds
-//! the canonical *text* ([`CanonicalJson`]) but cannot verify canonicity - doing so would
+//! the canonical *text* ([`supra_types::CanonicalJson`]) but cannot verify canonicity - doing so would
 //! mean parsing JSON there, duplicating this serialiser, and giving I7 two
 //! implementations that can disagree. This module is the single implementation.
 //!

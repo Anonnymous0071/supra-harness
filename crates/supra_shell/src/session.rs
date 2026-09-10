@@ -5,7 +5,7 @@
 //!
 //! 1. [`supra_ffi::pty::Pty::open`] allocates the pair - master for the
 //!    harness, slave for the child - with both ends CLOEXEC from birth.
-//! 2. [`supra_sandbox::spawn`] runs the child with the slave fd as all three
+//! 2. [`supra_sandbox::spawn()`] runs the child with the slave fd as all three
 //!    standard streams, an explicit environment, and the full audit before
 //!    exec. The sandbox is not an option here: the child gets the workspace
 //!    policy or it does not run. `yolo` does not skip this; there is no
@@ -50,7 +50,7 @@ impl ShellSession {
     ///
     /// `request` carries the command, the explicit environment, the mode and
     /// reversibility the permission gate sees, and the guard's marker - all
-    /// of it forwarded verbatim to [`supra_sandbox::spawn`]. Only `stdio`
+    /// of it forwarded verbatim to [`supra_sandbox::spawn()`]. Only `stdio`
     /// is overridden here: this session is the pty, so the child's streams
     /// come from the slave fd regardless of what the request said. The
     /// caller's `stdio` is deliberately ignored, because a session whose

@@ -52,6 +52,7 @@ secrets.toml
 
 # Agent scratch (transcripts, planner state) — never committed
 .qwen/
+.claude/
 
 # ASan build tree
 /build-asan/

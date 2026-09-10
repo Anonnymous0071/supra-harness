@@ -1,20 +1,20 @@
 package supra:plugin@0.1.0;
 
 world agent {
-    import supra:plugin/agent-tools;
+    import agent-tools;
     export run: func(arguments: string) -> string;
 }
 
 world host {
-    import supra:plugin/agent-tools;
-    import supra:plugin/host-tools;
+    import agent-tools;
+    import host-tools;
     export run: func(arguments: string) -> string;
 }
 
 world user {
-    import supra:plugin/agent-tools;
-    import supra:plugin/host-tools;
-    import supra:plugin/user-tools;
+    import agent-tools;
+    import host-tools;
+    import user-tools;
     export run: func(arguments: string) -> string;
 }
 

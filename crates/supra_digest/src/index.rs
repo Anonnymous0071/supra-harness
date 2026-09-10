@@ -7,7 +7,7 @@
 //! of that text. Persisting a derivative beside its source creates the
 //! invalidation problem twice: once for the vectors (solved by the watcher
 //! re-upserting on change) and once for the symbols. So the index lives in
-//! memory, rebuilt by [`Digest::scan`] and patched by [`Digest::apply_event`].
+//! memory, rebuilt by [`crate::Digest::open`] and patched by [`crate::Digest::apply_event`].
 //! A restart rescans; a rescan is a cold start under 10 seconds for 5k files
 //! (the budget), not a migration.
 //!
@@ -48,7 +48,7 @@ pub struct SymbolIndex {
 }
 
 impl SymbolIndex {
-    /// An empty index over `root`. Reads nothing; [`Self::scan`] fills it.
+    /// An empty index over `root`. Reads nothing; [`crate::Digest::open`] fills it.
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
         Self { root, files: HashMap::new() }

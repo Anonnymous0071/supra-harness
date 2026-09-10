@@ -48,7 +48,7 @@ opt cargo-nextest "faster test runs"
 
 echo
 echo "rustup targets"
-for target in wasm32-wasip2 wasm32-wasip1; do
+for target in wasm32-wasip2; do
     if rustup target list --installed 2>/dev/null | grep -qx "$target"; then
         printf '  \033[32m ok \033[0m %s\n' "$target"
     else

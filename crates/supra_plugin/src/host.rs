@@ -76,31 +76,48 @@ impl Host {
             [supra_types::ToolClass::Agent, supra_types::ToolClass::Host, supra_types::ToolClass::User]
         {
             let mut linker = Linker::new(&engine);
-            for (interface, function) in imports_for(class) {
-                let path = format!("{interface}#{function}");
-                let stub = {
-                    let path = path.clone();
-                    move |mut store: wasmtime::StoreContextMut<'_, HostState>, (argument,): (String,)| {
-                        let state = store.data_mut();
-                        state.calls.push((path.clone(), argument.clone()));
-                        // The stub answer: the dispatch (T23) answers
-                        // for real; the host's contract today is that
-                        // the call happened, was logged, and returned
-                        // a string the guest can continue from.
-                        Ok((format!("host:{path}"),))
+            let allowed = imports_for(class);
+            for interface in
+                allowed.iter().map(|(interface, _)| *interface).collect::<std::collections::BTreeSet<_>>()
+            {
+                for instance_name in [interface.to_string(), format!("{interface}@0.1.0")] {
+                    let mut instance =
+                        linker.instance(&instance_name).map_err(|error| PluginError::MissingHostImport {
+                            import: format!("registering {instance_name}: {error}"),
+                        })?;
+                    for (_, function) in allowed.iter().filter(|(candidate, _)| *candidate == interface) {
+                        let path = format!("{interface}#{function}");
+                        let stub = {
+                            let path = path.clone();
+                            move |mut store: wasmtime::StoreContextMut<'_, HostState>,
+                                  (argument,): (String,)| {
+                                let state = store.data_mut();
+                                state.calls.push((path.clone(), argument.clone()));
+                                // The stub answer: the dispatch (T23) answers
+                                // for real; the host's contract today is that
+                                // the call happened, was logged, and returned
+                                // a string the guest can continue from.
+                                Ok((format!("host:{path}"),))
+                            }
+                        };
+                        instance.func_wrap(function, stub).map_err(|error| {
+                            PluginError::MissingHostImport {
+                                import: format!("registering {instance_name}#{function}: {error}"),
+                            }
+                        })?;
                     }
+                }
+            }
+            for (interface, function) in allowed {
+                let path = format!("{interface}#{function}");
+                let stub = move |mut store: wasmtime::StoreContextMut<'_, HostState>,
+                                 (argument,): (String,)| {
+                    let state = store.data_mut();
+                    state.calls.push((path.clone(), argument.clone()));
+                    Ok((format!("host:{path}"),))
                 };
-                linker.root().func_wrap(&path, stub.clone()).map_err(|error| {
-                    PluginError::MissingHostImport { import: format!("registering {path}: {error}") }
-                })?;
-                // Register under the plain function name as well: WIT
-                // worlds name imports both ways (`interface#func` in the
-                // text format, `(instance, func)` after resolution), and a
-                // component may declare either. One registration, both
-                // spellings - the alternative is a component that links on
-                // one toolchain and refuses on another. The stub is
-                // Clone (a move closure over an owned String clones
-                // cheaply), so both registrations share one answer.
+                // Keep the lowered root spelling for hand-authored components that import a
+                // function directly rather than through a WIT interface instance.
                 linker.root().func_wrap(function, stub).map_err(|error| PluginError::MissingHostImport {
                     import: format!("registering {function}: {error}"),
                 })?;
@@ -311,8 +328,10 @@ fn import_in_set(import: &str, allowed: &[(&str, &str)]) -> bool {
             return true;
         }
     }
-    // The bare interface spelling: the class owns the whole namespace.
-    if allowed.iter().any(|(interface, _)| import == *interface) {
+    // The bare interface spelling, with or without the package version emitted by wit-bindgen.
+    if allowed.iter().any(|(interface, _)| {
+        import == *interface || import.strip_prefix(*interface).is_some_and(|suffix| suffix.starts_with('@'))
+    }) {
         return true;
     }
     // The bare function spelling: the name without its namespace, after
@@ -368,6 +387,24 @@ mod tests {
 
     fn host() -> Host {
         Host::new().expect("host")
+    }
+
+    #[test]
+    #[ignore = "requires SUPRA_COMPONENT_ARTIFACT from scripts/build-wasm.sh"]
+    fn component_contract_accepts() {
+        const SENTINEL: &str = "supra-component-contract-smoke";
+
+        let path = std::env::var_os("SUPRA_COMPONENT_ARTIFACT")
+            .map(std::path::PathBuf::from)
+            .expect("SUPRA_COMPONENT_ARTIFACT names the built component");
+        let name = path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("component");
+        let host = host();
+        let component = Plugin::load_file(&host, &path).expect("component artifact loads");
+        let mut plugin = host
+            .instantiate(name, &component, supra_types::ToolClass::Agent)
+            .expect("component links and exports run(string) -> string");
+        let answer = plugin.call(SENTINEL).expect("component run export executes");
+        assert_eq!(answer, SENTINEL, "contract-smoke must echo the sentinel unchanged");
     }
 
     #[test]

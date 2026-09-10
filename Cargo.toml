@@ -37,6 +37,7 @@ members = [
     "crates/supra_cli",
     "crates/supra_update",
     "crates/supra_eval",
+    "agents/contract-smoke",
 ]
 
 # ---------------------------------------------------------------------------
@@ -46,7 +47,7 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Anonnymous0071/supra-harness"
 authors = ["supra-harness contributors"]
@@ -120,6 +121,7 @@ supra_eval = { path = "crates/supra_eval", version = "0.2.0" }
 supra_cli = { path = "crates/supra_cli", version = "0.2.0" }
 supra_eventbus = { path = "crates/supra_eventbus", version = "0.2.0" }
 supra_vector = { path = "crates/supra_vector", version = "0.2.0" }
+wit-bindgen = "0.57.1"
 
 # async runtime + streams
 tokio = { version = "1.53.1", default-features = false }
@@ -152,8 +154,17 @@ smallvec = "1.16.0"
 # storage (T10, T11)
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
-# secrets (T12)
-keyring = "4.2.0"
+# secrets (T12). keyring 3.6.3 is the newest line supporting the workspace's Rust 1.86
+# floor. Its defaults are empty, so name each native backend explicitly. The
+# pure-Rust D-Bus client avoids a system libdbus build dependency; keyring calls
+# remain isolated from async runtimes because its public API is synchronous.
+keyring = { version = "3.6.3", default-features = false, features = [
+    "async-secret-service",
+    "async-io",
+    "crypto-rust",
+    "apple-native",
+    "windows-native",
+] }
 aes-gcm = "0.11.1"
 pbkdf2 = "0.13.0"
 sha2 = "0.11.0"
@@ -170,11 +181,21 @@ reqwest = { version = "0.13.4", default-features = false, features = [
     "stream",
 ] }
 
-# wasm host (T20)
-wasmtime = "48.0.1"
+# wasm host (T20). 36.0.14 is the first maintained release line containing all
+# published component-runtime and Cranelift sandbox fixes as of 2026-09-10.
+# Keep the feature set to the component runtime and Cranelift compiler used by
+# supra_plugin; profiling/cache/WASI/Winch are not part of this host.
+wasmtime = { version = "36.0.14", default-features = false, features = [
+    "component-model",
+    "cranelift",
+    "runtime",
+    "std",
+    "wat",
+] }
 
-# code intelligence (T15, T15.7)
-tree-sitter = "0.27.0"
+# code intelligence (T15, T15.7). 0.26.7 retains the current language API while
+# supporting Rust 1.86; the lock file pins tree-sitter-language to 0.1.7 for the same reason.
+tree-sitter = "0.26.7"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-python = "0.25.0"
@@ -215,6 +236,10 @@ print_stdout = "warn"          # stdout belongs to the protocol channel.
 print_stderr = "warn"          # diagnostics go through T8 supra_log.
 # Non-determinism is a cache-correctness bug here, not a style question.
 mutable_key_type = "deny"
+# Rust 1.96 promoted this readability preference into the pedantic set. Keep nested
+# conditions explicit where each layer represents a distinct validation or I/O boundary;
+# it is not a correctness gate and rewriting the workspace would obscure those boundaries.
+collapsible_if = "allow"
 
 [profile.dev]
 opt-level = 0

@@ -24,7 +24,7 @@
 //! # The budget
 //!
 //! A server that advertises thousands of tools would spend the session's
-//! manifest budget on one remote. [`DiscoveryBudget`] refuses at probe
+//! manifest budget on one remote. [`TOOLS_PER_SERVER`] refuses at probe
 //! time - the same shape T15's index budget takes, stated before any
 //! bytes reach the model.
 //!

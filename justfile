@@ -53,29 +53,14 @@ build-wasm:
 
 # Debug build of the host workspace.
 build: build-cpp
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
-        echo "build: no Rust members yet (crates land from T5)"; exit 0
-    fi
     cargo build --workspace --locked --all-targets
 
 # Release build: single static binary, size- and startup-optimised.
 release: build-cpp
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
-        echo "release: no Rust members yet (crates land from T5)"; exit 0
-    fi
     cargo build --workspace --locked --release
 
 # Development loop: fast rebuild plus the host binary.
 dev:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
-        echo "dev: no Rust members yet (crates land from T5)"; exit 0
-    fi
     cargo build --locked
 
 # ---------------------------------------------------------------------------
@@ -97,60 +82,34 @@ test-cpp: build-cpp
 
 # Rust unit + integration tests.
 test-rust:
+    cargo test --workspace --locked --all-targets --all-features
+    cargo test --workspace --locked --doc --all-features
+
+# Build every declared package with the workspace MSRV, not only the newer pinned default.
+msrv:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
-        echo "test-rust: no Rust members yet (crates land from T5)"; exit 0
-    fi
-    cargo test --workspace --locked --all-targets
-    cargo test --workspace --locked --doc
+    msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    [[ -n "$msrv" ]] || { echo "msrv: Cargo.toml does not declare rust-version" >&2; exit 1; }
+    cargo +"$msrv" check --workspace --locked --all-targets --all-features
 
 test: test-cpp test-rust
 
 # ---------------------------------------------------------------------------
 # Quality gates
-#
-# The workspace has no Rust members until T5. Cargo's fmt/clippy/metadata
-# front-ends error on a virtual manifest with no members, so each gate reports
-# that it is out of scope rather than failing on tool misuse. Once T5 lands,
-# every gate engages with no justfile change.
 # ---------------------------------------------------------------------------
 
-[private]
-rust-members:
-    @bash scripts/rust-members.sh
-
 fmt:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
-        echo "fmt: no Rust members yet (crates land from T5)"; exit 0
-    fi
     cargo fmt --all
 
 fmt-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
-        echo "fmt-check: no Rust members yet (crates land from T5)"; exit 0
-    fi
     cargo fmt --all -- --check
 
 clippy:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
-        echo "clippy: no Rust members yet (crates land from T5)"; exit 0
-    fi
-    cargo clippy --workspace --locked --all-targets -- -D warnings
+    cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 
 # Supply chain: advisories, licences, banned crates, source allowlist.
 deny:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ "$(bash scripts/rust-members.sh)" == "0" ]]; then
-        echo "deny: no dependency graph yet (crates land from T5)"; exit 0
-    fi
     cargo deny --all-features check
 
 # clang-tidy over the C++20 sources. Requires build-cpp first for
@@ -164,10 +123,14 @@ tidy: build-cpp
 invariants:
     @bash scripts/check-invariants.sh
 
-lint: fmt-check clippy deny invariants
+# Build API documentation with every warning promoted to an error.
+docs-check:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps --all-features
+
+lint: fmt-check clippy deny invariants docs-check
 
 # What CI runs. Ordered cheapest-first so failures surface fast.
-ci: lint test-cpp build-wasm test-rust
+ci: lint msrv test-cpp build-wasm test-rust
 
 # ---------------------------------------------------------------------------
 # Measurement
@@ -182,7 +145,7 @@ eval *args:
     cargo run --locked -p supra_cli -- eval {{args}}
 
 docs:
-    cargo doc --workspace --locked --no-deps
+    cargo doc --workspace --locked --no-deps --all-features
 
 # ---------------------------------------------------------------------------
 # Distribution

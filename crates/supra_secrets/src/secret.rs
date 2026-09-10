@@ -42,7 +42,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 /// A value that must not be printed, logged, or serialised.
 ///
 /// The inner value is accessible read-only through [`Deref`]. It is wiped on drop, and its
-/// [`Debug`] and [`Display`] output is a fixed placeholder - so a diagnostic can show the shape
+/// [`Debug`](fmt::Debug) and [`Display`](fmt::Display) output is a fixed placeholder - so a diagnostic can show the shape
 /// of what was handled without ever showing the contents.
 pub struct Secret<T: Zeroize> {
     value: T,

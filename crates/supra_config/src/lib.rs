@@ -46,7 +46,7 @@
 //! `.supra/config.toml` may not name a provider, an endpoint, or a credential
 //! source, and its permission mode may only make the session **stricter**. Under
 //! plain precedence a repository could ship `mode = "yolo"` and get it. See
-//! [`resolve`] for the asymmetry and its cost.
+//! [`resolve()`] for the asymmetry and its cost.
 //!
 //! # Usage
 //!

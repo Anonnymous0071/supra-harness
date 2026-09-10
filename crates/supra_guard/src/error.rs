@@ -26,7 +26,7 @@ pub enum Refusal {
         detail: String,
     },
 
-    /// The command names this binary by path, argv[0], or resolved identity.
+    /// The command names this binary by path, `argv[0]`, or resolved identity.
     #[error("L3: the command names this binary ({detail})")]
     OwnBinary {
         /// Which spelling matched, for the message.

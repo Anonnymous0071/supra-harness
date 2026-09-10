@@ -11,7 +11,7 @@
 //! could hold a credential from the configuration schema, and a test still found a leak:
 //! the error *refusing* a pasted credential quoted it. The lesson was that secrets arrive
 //! through paths nobody enumerated, so the net goes at the last moment before bytes become
-//! durable. See [`redact`] for what is caught, and for the two things that must survive it.
+//! durable. See [`redact()`] for what is caught, and for the two things that must survive it.
 //!
 //! **The log is bounded.** Size-based rotation with a fixed number of kept files, so a
 //! harness running for days cannot fill a disk. See [`sink`].

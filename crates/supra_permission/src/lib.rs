@@ -6,7 +6,7 @@
 //! | Axis | Question | Owned by | User-relaxable |
 //! | ---- | -------- | -------- | -------------- |
 //! | `ToolClass` | *who* may invoke | `supra_types` (T6), enforced by T20's WASM imports | never |
-//! | Consent | does this need the user's yes | this crate's [`gate`], via `Mode` | yes - that is what modes are for |
+//! | Consent | does this need the user's yes | this crate's [`gate()`], via `Mode` | yes - that is what modes are for |
 //!
 //! What T16.7 adds on top of T6's shapes:
 //!
@@ -18,7 +18,7 @@
 //!   this crate guesses at. The structural shape (T15.7's reparse-gated
 //!   splice) is the one damping applies to: verified structure earns one
 //!   class lower than a blind edit on the same file, measurably.
-//! - **The gate** ([`gate`]): rules first (deny wins, literally; an allow
+//! - **The gate** ([`gate()`]): rules first (deny wins, literally; an allow
 //!   short-circuits; no rule falls through), authority second (before the
 //!   mode is ever examined, so no mode can widen it), the mode matrix third.
 //!
