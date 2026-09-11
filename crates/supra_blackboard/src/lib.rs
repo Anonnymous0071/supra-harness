@@ -3,9 +3,9 @@
 //!
 //! **T21**. §4's contract, as types: no agent is privileged; peers
 //! publish claims to one shared board, validators vote, quorum is
-//! `ceil(2k/3)` computed rationally in `supra_types`, a proposer's vote
-//! never counts toward its own claim (T12.5 L7), and proposer roles
-//! attach per claim and rotate within a turn.
+//! `ceil(2k/3)` computed rationally in `supra_types`, and publication
+//! contributes the proposer's affirmative vote without creating a validator
+//! row; proposer roles attach per claim and rotate within a turn.
 //!
 //! Every vote updates an incremental quorum tally and returns the
 //! claim's new status, so the turn loop (T23) evaluates after every vote:
@@ -31,7 +31,7 @@
 //!
 //! let yes = Verdict::new(Vote::Yes, Confidence::High, "holds", None).expect("verdict");
 //! let outcome = board.vote(claim, validators[0], &yes).expect("vote");
-//! assert!(!outcome.is_reached());
+//! assert!(outcome.is_reached());
 //! # Ok::<(), supra_blackboard::BlackboardError>(())
 //! ```
 

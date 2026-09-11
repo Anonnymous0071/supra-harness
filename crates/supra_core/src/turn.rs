@@ -347,11 +347,10 @@ mod tests {
         assert_eq!(turn.shards(), 1);
 
         assert_eq!(turn.record(answer(peers[0], "fix it")).expect("proposal"), Step::Collecting);
-        assert_eq!(turn.record(validation(peers[1], Vote::Yes)).expect("v1"), Step::Collecting);
+        assert_eq!(turn.record(validation(peers[1], Vote::Yes)).expect("v1"), Step::Reached);
         assert_eq!(turn.answer(), Some("fix it"));
-        assert_eq!(turn.record(validation(peers[2], Vote::Yes)).expect("v2"), Step::Reached);
         assert_eq!(turn.status(), Some(QuorumStatus::Reached));
-        assert_eq!(turn.steps(), &[Step::Collecting, Step::Reached]);
+        assert_eq!(turn.steps(), &[Step::Reached]);
 
         let mut ledger = supra_prompt::PromptLedger::new();
         let id = turn.finish(&mut ledger).expect("finish");
@@ -366,7 +365,6 @@ mod tests {
         let mut turn = Turn::start(board(), Bus::new(), "the task text", peers.clone()).expect("turn");
         turn.record(answer(peers[0], "the agreed answer")).expect("proposal");
         turn.record(validation(peers[1], Vote::Yes)).expect("v1");
-        turn.record(validation(peers[2], Vote::Yes)).expect("v2");
 
         let mut ledger = supra_prompt::PromptLedger::new();
         turn.finish(&mut ledger).expect("finish");
@@ -388,10 +386,9 @@ mod tests {
 
     #[test]
     fn finish_is_refused_before_quorum_and_after_escalation() {
-        let peers = agents(2);
+        let peers = agents(3);
         let mut turn = Turn::start(board(), Bus::new(), "task", peers.clone()).expect("turn");
         turn.record(answer(peers[0], "an answer")).expect("proposal");
-        turn.record(validation(peers[1], Vote::Yes)).expect("v1");
         let mut ledger = supra_prompt::PromptLedger::new();
         assert!(turn.finish(&mut ledger).is_err(), "open quorum cannot finish");
 
@@ -433,7 +430,6 @@ mod tests {
         let mut turn = Turn::start(board(), bus, "the fix", peers.clone()).expect("turn");
         turn.record(answer(peers[0], "fix it")).expect("proposal");
         turn.record(validation(peers[1], Vote::Yes)).expect("v1");
-        turn.record(validation(peers[2], Vote::Yes)).expect("v2");
 
         let mut saw_vote = false;
         let mut saw_reached = false;
@@ -459,7 +455,6 @@ mod tests {
         let mut turn = Turn::start(board(), bus, "the fix", peers.clone()).expect("turn");
         turn.record(answer(peers[0], "fix it")).expect("proposal");
         turn.record(validation(peers[1], Vote::Yes)).expect("v1");
-        turn.record(validation(peers[2], Vote::Yes)).expect("v2");
         let mut ledger = supra_prompt::PromptLedger::new();
         turn.finish(&mut ledger).expect("finish");
 
@@ -504,15 +499,15 @@ mod tests {
         let peers = agents(6);
         let mut turn = Turn::start(board(), Bus::new(), "the fix", peers.clone()).expect("turn");
         turn.record(answer(peers[0], "fix")).expect("proposal");
-        for voter in &peers[1..4] {
+        for voter in &peers[1..3] {
             assert_eq!(
                 turn.record(validation(*voter, Vote::Yes)).expect("agreeing"),
                 Step::Collecting,
-                "quorum(6) = 4: the fourth yes is the reach"
+                "quorum(6) = 4: proposer plus three validators reach"
             );
         }
-        assert_eq!(turn.record(validation(peers[4], Vote::Yes)).expect("the reach"), Step::Reached);
-        let result = turn.record(validation(peers[5], Vote::Yes));
+        assert_eq!(turn.record(validation(peers[3], Vote::Yes)).expect("the reach"), Step::Reached);
+        let result = turn.record(validation(peers[4], Vote::Yes));
         assert!(matches!(result, Err(TurnError::NoAnswer(_))));
     }
 

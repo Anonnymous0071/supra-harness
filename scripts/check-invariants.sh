@@ -1835,8 +1835,8 @@ fi
 # T21 - blackboard guards
 #
 # The peer contract's load-bearing lines: proposer exclusion at vote,
-# membership through the validators map, unreachable closes the claim.
-# Through `scan`; probed against the same M-series the suite catches.
+# proposer approval at publication, membership through the validators map,
+# and atomic vote/status persistence.
 # ---------------------------------------------------------------------------
 bbsrc="crates/supra_blackboard/src"
 
@@ -1848,11 +1848,26 @@ if [ -d "$bbsrc" ]; then
             "T12.5 L7: a proposer's vote never counts toward its own claim"
     fi
 
+    implicit_vote=$(scan "$bbsrc/board.rs" 'tally\.record\(Vote::Yes\)')
+    if [ -z "$implicit_vote" ]; then
+        fail "publishing no longer contributes the proposer's vote" \
+            "crates/supra_blackboard/src/board.rs" \
+            "k includes the proposer, so the E1 two-peer tier needs that implicit approval to reach ceil(2k/3)"
+    fi
+
     membership=$(scan "$bbsrc/board.rs" 'state\.validators\.get_mut\(&voter\)')
     if [ -z "$membership" ]; then
         fail "cohort membership is no longer checked through the roster" \
             "crates/supra_blackboard/src/board.rs" \
             "a stranger must have no slot to vote through"
+    fi
+
+    atomic_vote=$(scan "$bbsrc/board.rs" 'schema::insert_vote\(tx, claim, voter, verdict\)')
+    atomic_status=$(scan "$bbsrc/board.rs" 'schema::update_status\(tx, claim, status_text\(outcome\)\)')
+    if [ -z "$atomic_vote" ] || [ -z "$atomic_status" ]; then
+        fail "terminal votes and claim status are no longer persisted together" \
+            "crates/supra_blackboard/src/board.rs" \
+            "a crash must not preserve a decisive vote while leaving its claim open"
     fi
 
     closed=$(scan "$bbsrc/board.rs" 'state\.status = outcome;')

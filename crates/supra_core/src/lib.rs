@@ -33,7 +33,7 @@
 //! let verdict = Verdict::new(Vote::Yes, Confidence::Medium, "checked independently", None)
 //!     .expect("valid verdict");
 //! let step = turn.record(PeerAnswer::validation(agents[1], verdict))?;
-//! assert_eq!(step, Step::Collecting);
+//! assert_eq!(step, Step::Reached);
 //! # Ok::<(), supra_core::TurnError>(())
 //! ```
 
