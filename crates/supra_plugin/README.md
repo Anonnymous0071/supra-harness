@@ -65,6 +65,15 @@ not the argument's pointer: the argument's memory belongs to the caller,
 and a guest returning it traps `string pointer/length out of bounds` -
 three fixture shapes measured that before the fourth landed.
 
+**Component calls own their cleanup.** With the pinned Wasmtime 48 API,
+`TypedFunc::call` lifts the owned result and executes canonical post-return
+before returning it. A post-return failure therefore returns from the same
+call as `PluginError::Trap`; fuel exhaustion during either guest execution
+or cleanup remains `FuelExhausted`. The repeated-call fixture pins that a
+successful call leaves one component instance reusable. The deprecated
+public `post_return` method is intentionally not called because it is a
+no-op in this Wasmtime version.
+
 **`HostState` is the T23 socket.** One state per component instance, host
 functions closing over it; today it carries the call log the tests and
 the audit read, and T23's dispatch (file reads through the workspace,

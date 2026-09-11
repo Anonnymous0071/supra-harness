@@ -5,20 +5,15 @@
 //! composed in that order. T6 owns the axes and the matrix; T16.7 owns the
 //! composition a tool call actually passes through:
 //!
-//! 1. **Rules first.** [`supra_types::resolve`] over the caller's rule set:
-//!    any deny refuses outright (deny always wins, literally), an allow
-//!    short-circuits consent, no rule falls through to the matrix.
-//! 2. **The matrix.** [`supra_types::decide`] consults the class before the
-//!    mode, so no mode - `yolo` included - can widen authority. The
-//!    reversibility comes from the catalogue ([`crate::catalogue`]), with
-//!    damping applied exactly when the effect is the verified structural
-//!    shape.
+//! 1. **Explicit deny.** [`supra_types::resolve`] rejects any matching deny.
+//!    An allow records that ordinary consent is pre-granted; it cannot grant
+//!    caller authority or waive a separate mandatory ceremony.
+//! 2. **Authority.** The registered class is checked before consent, so no
+//!    mode or allow rule can widen it.
 //! 3. **The escape-hatch exception.** An effect that asks a guard to step
-//!    aside is a question in *every* mode, including `yolo`. Consent is
-//!    what `yolo` pre-grants; stepping aside from the sandbox is not a
-//!    reversibility question at all but a ceremony the architecture
-//!    assigns to `--sandbox off` - so the gate routes it to [`Outcome::Ask`]
-//!    no matter what the matrix alone would say.
+//!    aside is a question in *every* mode and under every allow rule.
+//! 4. **Ordinary consent.** An allow runs; no rule falls through to
+//!    [`supra_types::decide`] and the mode matrix.
 //!
 //! # Batching
 //!
@@ -101,41 +96,41 @@ pub enum RefuseReason {
     },
 }
 
-/// The complete gate: rules, then authority, then consent.
+/// The complete gate: explicit deny, authority, mandatory ceremony, then consent.
 ///
 /// `rules` are the caller's resolved rules for this invocation (T16.8/T30
 /// own loading and precedence assembly; the gate only evaluates what it is
 /// handed, so the same gate serves every source set).
 #[must_use]
 pub fn gate(request: &Request, mode: Mode, rules: &[Rule]) -> Outcome {
-    // Rules first: deny always wins, an allow skips consent, no rule falls
-    // through. T6's `resolve` implements the literal reading; the gate adds
-    // only the outcome shapes.
-    if let Some(effect) = resolve(rules) {
-        return match effect {
-            supra_types::RuleEffect::Deny => {
-                let source = rules
-                    .iter()
-                    .find(|rule| rule.effect == supra_types::RuleEffect::Deny)
-                    .map_or(supra_types::RuleSource::Builtin, |rule| rule.source);
-                Outcome::Refuse { reason: RefuseReason::Rule { source } }
-            }
-            supra_types::RuleEffect::Allow => Outcome::Run,
-        };
+    // Resolve explicit prohibitions before any other axis. An allow is kept
+    // for the ordinary-consent step below; it cannot manufacture authority
+    // or waive the escape-hatch ceremony.
+    let resolved_rule = resolve(rules);
+    if matches!(resolved_rule, Some(supra_types::RuleEffect::Deny)) {
+        let source = rules
+            .iter()
+            .find(|rule| rule.effect == supra_types::RuleEffect::Deny)
+            .map_or(supra_types::RuleSource::Builtin, |rule| rule.source);
+        return Outcome::Refuse { reason: RefuseReason::Rule { source } };
     }
 
-    // Authority before consent, and no damping touches this axis: the class
-    // is consulted first and a refusal returns before the mode is examined,
-    // exactly as `decide` does.
+    // Authority before consent, and no damping touches this axis: neither a
+    // mode nor a matching allow rule can widen the registered class.
     if !request.class.permits(request.invoker) {
         return Outcome::Refuse { reason: RefuseReason::Authority };
     }
 
-    // The escape-hatch exception: consent is what a mode pre-grants, and
-    // stepping aside from a guard is not consent's to grant. Every mode
-    // asks, including `yolo`.
+    // Stepping aside from a guard is a separate mandatory ceremony. Allow
+    // rules pre-authorise ordinary consent only, so every mode still asks.
     if matches!(request.effect, Effect::EscapeHatch { .. }) {
         return Outcome::Ask { request: clone_request(request), reason: AskReason::EscapeHatch };
+    }
+
+    // A rule allow skips only the ordinary mode/reversibility consent
+    // decision, after all non-relaxable checks have passed.
+    if matches!(resolved_rule, Some(supra_types::RuleEffect::Allow)) {
+        return Outcome::Run;
     }
 
     // The matrix, with damping applied exactly when the effect is the
@@ -234,6 +229,9 @@ mod tests {
         Request { effect, class: ToolClass::Agent, invoker: Invoker::Host, summary: "the tool".to_owned() }
     }
 
+    const RULE_SOURCES: [RuleSource; 5] =
+        [RuleSource::Builtin, RuleSource::User, RuleSource::Project, RuleSource::Cli, RuleSource::Session];
+
     #[test]
     fn rules_come_first_and_deny_wins() {
         let read = request(Effect::Read);
@@ -277,6 +275,35 @@ mod tests {
     }
 
     #[test]
+    fn allow_rules_never_widen_any_authority_pair() {
+        let classes = [ToolClass::Agent, ToolClass::Host, ToolClass::User];
+        let invokers = [Invoker::Agent, Invoker::Host, Invoker::User];
+
+        for class in classes {
+            for invoker in invokers {
+                for mode in Mode::ALL {
+                    for source in RULE_SOURCES {
+                        let request = Request {
+                            effect: Effect::Read,
+                            class,
+                            invoker,
+                            summary: "authority matrix".to_owned(),
+                        };
+                        let allow = Rule { source, effect: RuleEffect::Allow };
+                        let outcome = gate(&request, mode, &[allow]);
+                        let expected = if class.permits(invoker) {
+                            Outcome::Run
+                        } else {
+                            Outcome::Refuse { reason: RefuseReason::Authority }
+                        };
+                        assert_eq!(outcome, expected, "{class:?} / {invoker:?} / {mode:?} / {source:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn plan_refuses_rather_than_queues() {
         let edit = request(Effect::BlindEdit);
         assert_eq!(gate(&edit, Mode::Plan, &[]), Outcome::Refuse { reason: RefuseReason::Plan });
@@ -313,20 +340,72 @@ mod tests {
     }
 
     #[test]
+    fn allow_rules_never_waive_escape_hatch_ceremony() {
+        let classes = [ToolClass::Agent, ToolClass::Host, ToolClass::User];
+        let invokers = [Invoker::Agent, Invoker::Host, Invoker::User];
+
+        for class in classes {
+            for invoker in invokers {
+                for mode in Mode::ALL {
+                    for source in RULE_SOURCES {
+                        let request = Request {
+                            effect: Effect::EscapeHatch { what: "sandbox".to_owned() },
+                            class,
+                            invoker,
+                            summary: "disable sandbox".to_owned(),
+                        };
+                        let allow = Rule { source, effect: RuleEffect::Allow };
+                        let outcome = gate(&request, mode, &[allow]);
+                        if class.permits(invoker) {
+                            assert!(
+                                matches!(outcome, Outcome::Ask { reason: AskReason::EscapeHatch, .. }),
+                                "{class:?} / {invoker:?} / {mode:?} / {source:?}"
+                            );
+                        } else {
+                            assert_eq!(
+                                outcome,
+                                Outcome::Refuse { reason: RefuseReason::Authority },
+                                "{class:?} / {invoker:?} / {mode:?} / {source:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn any_deny_beats_any_allow_in_either_order() {
+        let hatch = request(Effect::EscapeHatch { what: "sandbox".to_owned() });
+        for mode in Mode::ALL {
+            for deny_source in RULE_SOURCES {
+                for allow_source in RULE_SOURCES {
+                    let deny = Rule { source: deny_source, effect: RuleEffect::Deny };
+                    let allow = Rule { source: allow_source, effect: RuleEffect::Allow };
+                    for rules in [[deny, allow], [allow, deny]] {
+                        assert!(
+                            matches!(
+                                gate(&hatch, mode, &rules),
+                                Outcome::Refuse { reason: RefuseReason::Rule { .. } }
+                            ),
+                            "{mode:?} / deny {deny_source:?} / allow {allow_source:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_rule_deny_beats_an_escape_hatch_allow() {
-        // The uncomfortable corner, stated: a session allow cannot make a
-        // sandbox-off effect run unasked, because the escape-hatch routing
-        // is checked after rules only for asks - and a deny anywhere still
-        // wins over everything.
         let hatch = request(Effect::EscapeHatch { what: "sandbox".to_owned() });
         let deny = Rule { source: RuleSource::Builtin, effect: RuleEffect::Deny };
-        assert!(matches!(gate(&hatch, Mode::Yolo, &[deny]), Outcome::Refuse { .. }));
-
-        // And an allow short-circuits before the escape-hatch check - which
-        // is the rule set's prerogative, and the reason `builtin` is
-        // obliged to deny exactly the never-permittable and nothing else.
         let allow = Rule { source: RuleSource::Session, effect: RuleEffect::Allow };
-        assert_eq!(gate(&hatch, Mode::Yolo, &[allow]), Outcome::Run);
+
+        assert!(matches!(
+            gate(&hatch, Mode::Yolo, &[allow, deny]),
+            Outcome::Refuse { reason: RefuseReason::Rule { source: RuleSource::Builtin } }
+        ));
     }
 
     #[test]

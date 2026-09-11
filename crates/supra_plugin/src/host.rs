@@ -242,10 +242,14 @@ impl Plugin {
     /// Call the `run` export with canonical argument text.
     ///
     /// The guest answers canonical text back; the host returns it
-    /// unchanged - interpretation is the turn loop's business. A fuel
-    /// trap surfaces as [`PluginError::FuelExhausted`] (the budget is
-    /// what ran out, and the component is spent for this turn); any
-    /// other trap is [`PluginError::Trap`] with the trap's own message.
+    /// unchanged - interpretation is the turn loop's business. Wasmtime's
+    /// Component Model [`wasmtime::component::TypedFunc::call`] consumes the
+    /// owned result and performs canonical post-return before it returns;
+    /// post-return failure is therefore part of the same invocation error.
+    /// A fuel failure surfaces as [`PluginError::FuelExhausted`] (the budget
+    /// is what ran out, and the component is spent for this turn); any other
+    /// invocation or cleanup failure is [`PluginError::Trap`] with
+    /// Wasmtime's own message.
     ///
     /// # Errors
     ///
@@ -530,11 +534,15 @@ mod tests {
 
         let mut plugin =
             host.instantiate("echo", &component, supra_types::ToolClass::Agent).expect("instantiate");
-        let answer = plugin.call("hello").expect("call");
+        let first = plugin.call("hello").expect("first call");
+        let second = plugin.call("again").expect("second call");
         // The guest answered "hi" from its own data segment: lifted
         // (param string) in and lifted (result string) out, through the
-        // guest's own memory, no dangling pointer between the two.
-        assert_eq!(answer, "hi", "the guest returned its data segment");
+        // guest's own memory. Wasmtime consumes the owned result and runs
+        // canonical post-return inside `TypedFunc::call`, so the same
+        // instance is ready for another call without a dangling allocation.
+        assert_eq!(first, "hi", "the first call returned the guest data segment");
+        assert_eq!(second, "hi", "post-return left the instance reusable");
     }
 
     #[test]

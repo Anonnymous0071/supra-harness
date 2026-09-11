@@ -18,13 +18,14 @@
 //!   this crate guesses at. The structural shape (T15.7's reparse-gated
 //!   splice) is the one damping applies to: verified structure earns one
 //!   class lower than a blind edit on the same file, measurably.
-//! - **The gate** ([`gate()`]): rules first (deny wins, literally; an allow
-//!   short-circuits; no rule falls through), authority second (before the
-//!   mode is ever examined, so no mode can widen it), the mode matrix third.
+//! - **The gate** ([`gate()`]): explicit deny first; non-relaxable authority
+//!   second; mandatory escape-hatch ceremony third; ordinary consent last.
+//!   An allow may skip only the final mode/reversibility decision. It cannot
+//!   manufacture caller authority or waive a separate ceremony.
 //!
 //!   The escape-hatch exception: a guard-stepping-aside effect asks in
-//!   *every* mode, `yolo` included, because consent is not the axis a
-//!   sandbox rides on.
+//!   *every* mode and under every allow rule, because consent is not the axis
+//!   a sandbox rides on.
 //! - **Batched prompts** ([`Batch`]): many questions become one prompt,
 //!   answers come back per item, and an unanswered item refuses rather
 //!   than runs - a question the user did not answer is not consent.

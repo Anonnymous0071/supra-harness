@@ -319,7 +319,12 @@ impl Registry {
         tool.validate(map)?;
         tool.check_precondition(map, facts)?;
 
-        Ok(Invocation { tool: name.to_owned(), arguments: canonical, effect: tool.resolve_effect(map) })
+        Ok(Invocation {
+            tool: name.to_owned(),
+            class: tool.class(),
+            arguments: canonical,
+            effect: tool.resolve_effect(map),
+        })
     }
 }
 
@@ -332,11 +337,13 @@ impl Default for Registry {
 /// The validated invocation the turn loop receives.
 ///
 /// `arguments` is the canonical text - the same string the ledger's
-/// `ToolUse` block will hold, produced by the same serialiser. `effect`
-/// is what the permission gate classifies.
+/// `ToolUse` block will hold, produced by the same serialiser. `class` and
+/// `effect` are copied from the resolved registered [`Tool`], so dispatch
+/// cannot reconstruct authority from guest-controlled input.
 #[derive(Clone, Debug)]
 pub struct Invocation {
     tool: String,
+    class: ToolClass,
     arguments: CanonicalJson,
     effect: Effect,
 }
@@ -346,6 +353,15 @@ impl Invocation {
     #[must_use]
     pub fn tool(&self) -> &str {
         &self.tool
+    }
+
+    /// The registered authority class, copied from the resolved tool.
+    ///
+    /// Dispatch must use this value for the permission request rather than
+    /// accepting a class from guest arguments or other untrusted metadata.
+    #[must_use]
+    pub const fn class(&self) -> ToolClass {
+        self.class
     }
 
     /// The canonical argument text, as the ledger will hold it.
@@ -486,6 +502,34 @@ mod tests {
             "canonical: sorted keys, no whitespace"
         );
         assert!(matches!(invocation.effect(), EffectShape::BlindEdit));
+        assert_eq!(invocation.class(), ToolClass::Agent, "authority came from registration");
+    }
+
+    #[test]
+    fn the_invocation_carries_registered_authority_not_guest_input() {
+        let mut registry = Registry::new();
+        registry
+            .register(
+                Tool::register(
+                    "host_dispatch",
+                    ToolClass::Host,
+                    vec![Field {
+                        name: "class".into(),
+                        field_type: FieldType::Text,
+                        required: true,
+                        description: "Guest-supplied, non-authoritative data.".into(),
+                    }],
+                    |_| EffectShape::ScratchWork,
+                )
+                .expect("register"),
+            )
+            .expect("register host tool");
+
+        let invocation = registry
+            .invoke("host_dispatch", r#"{ "class": "agent" }"#, &SessionFacts::default())
+            .expect("invoke");
+        assert_eq!(invocation.class(), ToolClass::Host);
+        assert_eq!(invocation.tool(), "host_dispatch");
     }
 
     #[test]

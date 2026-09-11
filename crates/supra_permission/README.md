@@ -37,15 +37,13 @@ blind edit prompts and a verified splice on the same file runs.
 
 **The escape-hatch exception.** `yolo` pre-grants consent; stepping aside
 from the sandbox is not consent's to grant. An `EscapeHatch` effect asks in
-*every* mode, `yolo` included - the gate routes it before the matrix. A
-rule deny still beats it (deny wins over everything), and a rule allow
-short-circuits before the check, which is the rule set's prerogative and
-the reason `builtin` is obliged to deny exactly the never-permittable.
+*every* mode, `yolo` included, and an allow rule cannot waive that separate
+ceremony. A rule deny still beats it (deny wins over everything).
 
-**Rules, authority, matrix - in that order.** Deny wins literally (T6's
-`resolve`); an allow skips consent; no rule falls through. Authority is
-consulted before the mode is examined, so no mode can widen it - the
-two-axis property, asserted exhaustively at the gate level. Plan refuses
+**Deny, authority, ceremony, ordinary consent - in that order.** Deny wins
+literally (T6's `resolve`). Authority is non-relaxable, so neither a mode nor
+an allow can widen it. Escape hatches always ask. Only after those checks may
+an allow skip the ordinary mode/reversibility consent decision. Plan refuses
 rather than queues: a plan that queues its refusals is a staging area.
 
 **Unanswered is not consent.** Batch answers align by item index; a missing

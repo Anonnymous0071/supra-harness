@@ -11,7 +11,7 @@
 //! | `MissingHostImport` | the host offers no function the class set needs | the operator (a host bug) |
 //! | `WrongSignature` | a component import's type is not the declared one | the author |
 //! | `FuelExhausted` | the guest burnt its fuel | the author (or the budget) |
-//! | `Trap` | the guest trapped | the author |
+//! | `Trap` | component invocation or canonical cleanup failed | the author |
 
 use thiserror::Error;
 
@@ -76,9 +76,11 @@ pub enum PluginError {
         budget: u64,
     },
 
-    /// The guest trapped. The detail is the trap's own message - it names
-    /// the fault, and the author owns it.
-    #[error("component {component:?} trapped: {detail}")]
+    /// Component invocation failed. This includes guest traps, result
+    /// lifting failures, and canonical post-return cleanup failures because
+    /// Wasmtime performs all three inside one typed call. The detail is
+    /// Wasmtime's own message, and the component author owns it.
+    #[error("component {component:?} invocation failed: {detail}")]
     Trap {
         /// The component, by its configured name.
         component: String,
