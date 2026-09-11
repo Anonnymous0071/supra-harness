@@ -332,7 +332,7 @@ fn upserting_the_same_locator_replaces_the_entry_rather_than_adding_one() {
 fn a_replaced_entry_is_reranked_against_its_new_vector() {
     // The failure this catches: the exact-vector cache holding the old embedding under a live
     // slot. The code would be new, the vector old, and the ranking would look ordinary.
-    let scratch = Scratch::new("stale-cache");
+    let scratch = Scratch::new("replacement-rerank");
     let index = index(scratch.store());
     index.upsert("a", "text", &simple(0)).expect("upsert");
 

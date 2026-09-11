@@ -127,7 +127,7 @@ invariants:
 docs-check:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps --all-features
 
-lint: fmt-check clippy deny invariants docs-check
+lint: fmt-check clippy deny invariants docs-check tidy
 
 # What CI runs. Ordered cheapest-first so failures surface fast.
 ci: lint msrv test-cpp build-wasm test-rust

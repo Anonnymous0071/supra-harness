@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -22,12 +25,12 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install toolchain
         run: rustup show
       - name: Install just
-        uses: extractions/setup-just@v3
-      - uses: Swatinem/rust-cache@v2
+        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # Routed through just so the workspace-scope guard (no Rust members
       # before T5) is applied identically here and locally.
       - run: just fmt-check
@@ -37,12 +40,8 @@ jobs:
     name: supply chain
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Count Rust members
-        id: members
-        run: echo "count=$(bash scripts/rust-members.sh)" >> "$GITHUB_OUTPUT"
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        if: steps.members.outputs.count != '0'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
           arguments: --all-features
@@ -51,14 +50,14 @@ jobs:
     name: invariants, docs, and MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned development toolchain
         run: rustup show
       - name: Install Rust 1.86 MSRV
         run: rustup toolchain install 1.86.0 --profile minimal
       - name: Install just
-        uses: extractions/setup-just@v3
-      - uses: Swatinem/rust-cache@v2
+        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: just invariants
       - run: just docs-check
       - run: just msrv
@@ -71,7 +70,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install clang (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang clang-tidy ninja-build
@@ -83,16 +82,19 @@ jobs:
       # test reports "Not Run".
       - name: Build
         run: cmake --build build --parallel --config Release
-      # --no-tests=error once libraries exist; before T2 an empty suite is the
-      # expected state and must not fail the pipeline.
       - name: Test
-        shell: bash
-        run: |
-          if compgen -G "cpp/libsupra_*/CMakeLists.txt" >/dev/null; then
-            ctest --test-dir build -C Release --output-on-failure --no-tests=error
-          else
-            echo "no C++ libraries yet (T2-T4)"
-          fi
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
+
+  cpp-tidy:
+    name: cpp clang-tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install clang-tidy
+        run: sudo apt-get update && sudo apt-get install -y clang clang-tidy ninja-build
+      - name: Install just
+        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+      - run: just tidy
 
   # C++ built with sanitizers on. The width and ANSI libraries index into
   # static tables from untrusted byte input, so out-of-bounds reads must fail
@@ -101,7 +103,7 @@ jobs:
     name: cpp sanitizers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: sudo apt-get update && sudo apt-get install -y clang ninja-build
       - name: Configure
         run: |
@@ -112,22 +114,16 @@ jobs:
       - name: Build
         run: cmake --build build-asan --parallel
       - name: Test
-        shell: bash
-        run: |
-          if compgen -G "cpp/libsupra_*/CMakeLists.txt" >/dev/null; then
-            ctest --test-dir build-asan --output-on-failure --no-tests=error
-          else
-            echo "no C++ libraries yet (T2-T4)"
-          fi
+        run: ctest --test-dir build-asan --output-on-failure --no-tests=error
 
   wasm:
     name: wasm components
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Add component target
         run: rustup target add wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: bash scripts/build-wasm.sh wasm32-wasip2
 
   test:
@@ -139,13 +135,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install clang (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: Install just
-        uses: extractions/setup-just@v3
-      - uses: Swatinem/rust-cache@v2
+        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: just test-rust
 
   # Guards the economics claims in docs/ARCHITECTURE.md: the offline
@@ -154,7 +150,7 @@ jobs:
     name: economy gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: extractions/setup-just@v3
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: just eval

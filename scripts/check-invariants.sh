@@ -177,6 +177,7 @@ has_sql() {
 # either package list is empty, every downstream Rust gate would otherwise certify nothing.
 if ! metadata=$(cargo metadata --locked --no-deps --format-version 1 2>&1); then
     fail "cargo metadata failed; Rust validation cannot determine its scope" "$metadata"
+    metadata_counts="0 0"
 else
     metadata_counts=$(printf '%s' "$metadata" | python3 -c \
         'import json, sys; data=json.load(sys.stdin); print(len(data["packages"]), len(data["workspace_members"]))' \
@@ -190,6 +191,17 @@ else
             "packages=${package_count:-unknown} workspace_members=${member_count:-unknown}" \
             "an empty workspace makes build, test, lint, and dependency checks vacuous"
     fi
+fi
+
+# CI executes this checker on a committed tree. Refuse any workflow action whose ref can
+# move after review: tags and branches are supply-chain input, not immutable provenance.
+workflow_hits=$(grep -RInE \
+    'uses:[[:space:]]+[^#[:space:]]+@(v[0-9]+|main|master|latest)([[:space:]]|$)' \
+    .github/workflows 2>/dev/null || true)
+if [ -n "$workflow_hits" ]; then
+    fail "GitHub Actions are not pinned to immutable commits" \
+        "$workflow_hits" \
+        "a mutable action tag can replace trusted CI code after review"
 fi
 
 # The package MSRV and Clippy policy are one compatibility claim. The pinned default
