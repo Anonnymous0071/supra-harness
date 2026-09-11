@@ -1504,7 +1504,7 @@ if [ -d "$journal" ]; then
     # the kernel may drop. No userspace test can observe a power loss, so
     # the call is pinned structurally - mutation M3 survived the suite and
     # is caught here instead.
-    flushed=$(scan "$journal/journal.rs" 'file\.sync_all\(\)\?;')
+    flushed=$(scan "$journal/journal.rs" 'temporary\.file_mut\(\)\?\.sync_all\(\)\?;')
     if [ -z "$flushed" ]; then
         fail "undo no longer flushes the restored bytes" \
             "crates/supra_journal/src/journal.rs" \
@@ -1547,7 +1547,7 @@ if [ -d "$journal" ]; then
     # The mark and the write share one transaction: mark_undone inside
     # undo's with_transaction. A mark that ran outside it would let two
     # concurrent undoes both pass the read.
-    marked=$(scan "$journal/journal.rs" 'schema::mark_undone\(transaction, snapshot\)\?;')
+    marked=$(scan "$journal/journal.rs" 'if !schema::mark_undone\(transaction, snapshot\)\? \{')
     if [ -z "$marked" ]; then
         fail "the undo mark no longer shares the undo's transaction" \
             "crates/supra_journal/src/journal.rs" \
@@ -1616,9 +1616,10 @@ if [ -d "$permission" ]; then
     fi
 
     # Rules are consulted before everything: resolve(rules) is the gate's
-    # first move. A gate that evaluated the matrix first would let a deny
-    # be outrun by an ask.
-    rules_first=$(scan "$permission/gate.rs" 'if let Some\(effect\) = resolve\(rules\) \{')
+    # first move. Keep the binding rather than pinning one control-flow style:
+    # deny is handled immediately, while allow survives the non-relaxable
+    # authority and escape-hatch checks before waiving ordinary consent.
+    rules_first=$(scan "$permission/gate.rs" 'let resolved_rule = resolve\(rules\);')
     if [ -z "$rules_first" ]; then
         fail "the gate no longer consults rules first" \
             "crates/supra_permission/src/gate.rs" \
