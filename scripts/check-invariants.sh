@@ -2260,6 +2260,83 @@ if [ -d "$clisrc" ]; then
     fi
 fi
 
+# Release automation is itself a trust boundary. Manual runs must check out and
+# publish the requested tag, Windows packaging must name the actual `.exe`, and
+# official publication must fail closed when the signing key is absent.
+release_workflow=".github/workflows/release.yml"
+if [ -f "$release_workflow" ]; then
+    if ! python3 - "$release_workflow" .github/workflows/ci.yml <<'PY'
+import sys
+import yaml
+
+release_path, ci_path = sys.argv[1:]
+release = yaml.safe_load(open(release_path, encoding="utf-8"))
+ci = yaml.safe_load(open(ci_path, encoding="utf-8"))
+# PyYAML 1.1 parses the key `on` as True.
+ci_on = ci.get("on", ci.get(True, {}))
+call = ci_on.get("workflow_call") if isinstance(ci_on, dict) else None
+assert isinstance(call, dict), "ci.yml is not a reusable workflow"
+assert call.get("inputs", {}).get("ref", {}).get("required") is True, "workflow_call.ref is not required"
+jobs = release.get("jobs", {})
+preflight = jobs["preflight"]
+assert preflight["steps"][0]["with"]["ref"] == "${{ env.RELEASE_TAG }}"
+assert jobs["gate"]["uses"] == "./.github/workflows/ci.yml"
+assert jobs["gate"]["with"]["ref"] == "${{ needs.preflight.outputs.sha }}"
+assert "gate" in jobs["build"]["needs"]
+assert "gate" in jobs["publish"]["needs"]
+assert release["permissions"]["contents"] == "read"
+assert jobs["publish"]["permissions"]["contents"] == "write"
+assert jobs["publish"]["steps"][-1]["with"]["tag_name"] == "${{ needs.preflight.outputs.tag }}"
+PY
+    then
+        fail "release workflow no longer binds and validates an exact tagged revision" \
+            "$release_workflow" \
+            "publication must depend on the complete reusable CI gate for that exact commit"
+    fi
+fi
+
+if [ -f scripts/package.sh ]; then
+    if ! grep -qF '*-windows-*) binary="supra.exe"' scripts/package.sh; then
+        fail "Windows packaging no longer selects supra.exe" \
+            "scripts/package.sh" \
+            "the Windows release target never emits an extensionless supra binary"
+    fi
+    if grep -qE 'sha256sum[[:space:]]+"?dist/' scripts/package.sh; then
+        fail "package checksum sidecars contain a dist/ path" \
+            "scripts/package.sh" \
+            "the installer verifies from an empty directory where only basenames exist"
+    fi
+fi
+
+if [ -f scripts/package-os.sh ] && grep -qE 'rpm_header|cpio_entry|struct\.pack' scripts/package-os.sh; then
+    fail "Linux packaging contains a handwritten RPM encoder" \
+        "scripts/package-os.sh" \
+        "release formats must be emitted and validated by standard package tooling"
+fi
+
+if [ -f scripts/sign-release.sh ]; then
+    if grep -qF 'skipping signatures' scripts/sign-release.sh; then
+        fail "official release signing can still silently skip" \
+            "scripts/sign-release.sh" \
+            "an unsigned artifact must not pass through the publication workflow"
+    fi
+    if grep -qE 'artefacts=.*supra-' scripts/sign-release.sh; then
+        fail "release signing excludes publishable artifact names" \
+            "scripts/sign-release.sh" \
+            "Debian packages and the aggregate manifest must be signed too"
+    fi
+fi
+
+if [ -f scripts/install.sh ] && grep -qE 'SKIP_CHECKSUM|checksum only|no \.minisig|releases/latest' scripts/install.sh; then
+    fail "the installer still permits mutable, unsigned, or unchecked installation" \
+        "scripts/install.sh" \
+        "installation is the last trust boundary and must be tag-pinned and fail closed"
+fi
+
+if [ -f packaging/homebrew/supra.rb ] && grep -qF 'REPLACE_WITH_' packaging/homebrew/supra.rb; then
+    printf '%s\n' "invariants: Homebrew formula is a release template and is not installable yet" >&2
+fi
+
 # ---------------------------------------------------------------------------
 # T28.5 - theme guards
 #

@@ -99,15 +99,15 @@ Requirements: Rust 1.86+, CMake 3.24+, clang++ with C++20, git. Optional:
 ### Option A — one line (release binary)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Anonnymous0071/supra-harness/main/scripts/install.sh | bash
+curl -fsSL "https://raw.githubusercontent.com/Anonnymous0071/supra-harness/vX.Y.Z/scripts/install.sh" | SUPRA_VERSION=vX.Y.Z SUPRA_PUBKEY='<published minisign public key>' bash
 ```
 
-Installs the latest `supra` for your platform into `~/.local/bin`
-(override with `PREFIX=`, pin with `SUPRA_VERSION=vX.Y.Z`), verifies the
-SHA-256 checksum before touching anything, and verifies the minisign
-signature when the release carries `.minisig` files (needs `minisign`
-plus `SUPRA_PUBKEY=` set to the release key — refusing is correct when
-the key is unknown). Needs `curl`.
+Installs the selected `supra` release for your platform into `~/.local/bin`
+(override with `PREFIX=`), verifies its SHA-256 checksum and required Minisign
+signature before touching the destination, and refuses when `minisign` or the
+independently published `SUPRA_PUBKEY` is unavailable. Use the tag-pinned
+installer URL shown in that release's notes; do not pipe the mutable `main`
+branch into a shell. Needs `curl`, `sha256sum`, and `minisign`.
 
 ### Option B — from source (developers)
 

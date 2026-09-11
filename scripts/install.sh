@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # Install the latest signed supra release for this platform.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Anonnymous0071/supra-harness/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Anonnymous0071/supra-harness/vX.Y.Z/scripts/install.sh |
+#     SUPRA_VERSION=vX.Y.Z SUPRA_PUBKEY='<published minisign public key>' bash
 #
-# Env: PREFIX (default ~/.local/bin), SUPRA_VERSION (default: latest tag).
-# Verifies SHA-256 and, when the release carries .minisig files, the minisign
-# signature against the embedded public key before installing anything.
+# Env: PREFIX (default ~/.local/bin), SUPRA_VERSION (required release tag),
+# SUPRA_PUBKEY (required independently published Minisign public key).
+# Verifies SHA-256 and requires a minisign signature against SUPRA_PUBKEY before
+# installing anything. Official releases are never installed checksum-only.
 set -euo pipefail
 
 REPO="Anonnymous0071/supra-harness"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 VERSION="${SUPRA_VERSION:-latest}"
-# Release signing key. Published on first signed release; until then the
-# installer verifies SHA-256 only and says so. Never paste a test key here:
-# the only minisign key in-tree today lives in supra_update's unit tests.
+# Release signing key. Pass the published project key explicitly until a key is
+# embedded in a future release; absence is a refusal, never checksum-only fallback.
 PUBKEY="${SUPRA_PUBKEY:-}"
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -26,16 +27,25 @@ case "$os-$arch" in
     *) echo "install: unsupported platform $os-$arch" >&2; exit 1 ;;
 esac
 
+if [ "$VERSION" = "latest" ]; then
+    echo "install: SUPRA_VERSION must pin the release tag used to fetch this installer" >&2
+    exit 1
+fi
+if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+    echo "install: invalid release version $VERSION" >&2
+    exit 1
+fi
+
 need() {
     command -v "$1" >/dev/null 2>&1 || { echo "install: need $1 ($2)" >&2; exit 1; }
 }
 need curl "download releases"
-need sha256sum "checksum verification (or set SKIP_CHECKSUM=1)"
-
-if [ "$VERSION" = "latest" ]; then
-    VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" | sed 's#.*/tag/##')
-    [ -n "$VERSION" ] || { echo "install: could not resolve latest release" >&2; exit 1; }
-fi
+need sha256sum "checksum verification"
+need minisign "signature verification"
+[ -n "$PUBKEY" ] || {
+    echo "install: SUPRA_PUBKEY is required to verify official releases" >&2
+    exit 1
+}
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -46,21 +56,13 @@ echo "install: fetching supra $VERSION for $target"
 curl -fsSL -O "https://github.com/$REPO/releases/download/${VERSION}/${base}"
 curl -fsSL -O "https://github.com/$REPO/releases/download/${VERSION}/${base}.sha256"
 
-if [ -z "${SKIP_CHECKSUM:-}" ]; then
-    sha256sum -c "${base}.sha256" || { echo "install: checksum FAILED" >&2; exit 1; }
-fi
-
-if curl -fsSL -O "https://github.com/$REPO/releases/download/${VERSION}/${base}.minisig" 2>/dev/null; then
-    if [ -z "$PUBKEY" ]; then
-        echo "install: release is signed but SUPRA_PUBKEY is unset; refusing (checksum passed)." >&2
-        exit 1
-    fi
-    need minisign "signature verification"
-    echo "$PUBKEY" > supra.pub
-    minisign -Vm "$base" -p supra.pub -x "${base}.minisig" || { echo "install: signature FAILED" >&2; exit 1; }
-else
-    echo "install: no .minisig in this release; checksum only." >&2
-fi
+sha256sum -c "${base}.sha256" || { echo "install: checksum FAILED" >&2; exit 1; }
+curl -fsSL -O "https://github.com/$REPO/releases/download/${VERSION}/${base}.minisig"
+echo "$PUBKEY" > supra.pub
+minisign -Vm "$base" -p supra.pub -x "${base}.minisig" || {
+    echo "install: signature FAILED" >&2
+    exit 1
+}
 
 mkdir -p "$PREFIX"
 install -m 755 "$base" "$PREFIX/supra"
