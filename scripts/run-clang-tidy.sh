@@ -16,7 +16,7 @@ if [[ ! -f "$build_dir/compile_commands.json" ]]; then
 fi
 
 shopt -s nullglob globstar
-sources=("$root"/cpp/**/*.cpp)
+sources=("$root"/crates/supra_ffi/native/cpp/**/*.cpp)
 if [[ ${#sources[@]} -eq 0 ]]; then
     echo "no C++ sources yet; libraries land in T2-T4"
     exit 0

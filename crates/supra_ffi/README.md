@@ -61,9 +61,10 @@ a static linker resolves left to right). Two overrides:
 
 - `SUPRA_CPP_BUILD_DIR` - reuse an existing configured tree (such as the one
   `just build-cpp` maintains) and skip the second build;
-- `SUPRA_CXX` - override the compiler, which defaults to `clang++` to match
-  `just build-cpp`, so Cargo links archives built by the same frontend the C++
-  suites were verified with.
+- `SUPRA_CXX` - override the compiler. Native builds default to `clang++` to
+  match `just build-cpp`; cross builds select the target C++ compiler
+  (`x86_64-linux-musl-g++` or `aarch64-linux-gnu-g++`) and link the matching
+  runtime.
 
 ## Mutation results
 

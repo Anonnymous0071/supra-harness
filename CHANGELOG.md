@@ -1094,7 +1094,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   compile" is reported BUILD_FAIL (not a verdict) and only a compiled-then-
   failed run counts as CAUGHT.
 
-- **T4** `cpp/libsupra_sandbox`: OS-level process isolation behind one C ABI.
+- **T4** `crates/supra_ffi/native/cpp/libsupra_sandbox`: OS-level process isolation behind one C ABI.
   - Linux backend is native rather than a bubblewrap wrapper, decided by
     measurement: applying a Landlock ruleset and then exec'ing `bwrap` fails with
     "Failed to make / slave: Operation not permitted", and still fails under a
@@ -1253,7 +1253,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   for *older* kernels untested. `supra_sandbox_force_tier_for_testing` pins the
   tier downward to reach them.
 
-- **T3** `cpp/libsupra_ansi`: escape sequence parsing, SGR state, style-safe
+- **T3** `crates/supra_ffi/native/cpp/libsupra_ansi`: escape sequence parsing, SGR state, style-safe
   truncation.
   - Resumable state machine over the DEC STD 070 / VT500 grammar, covering the
     cases a regex cannot: both OSC terminators (`ESC \` and `BEL`), colon
@@ -1278,10 +1278,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - Eight deliberate mutations introduced, all eight caught. One initially
     survived - the byte-wise C1 test - proving no test actually exercised the
     invariant; a split-boundary regression test now does.
-  - `cpp/testing`: shared assertion helpers, extracted from
+  - `crates/supra_ffi/native/cpp/testing`: shared assertion helpers, extracted from
     `libsupra_width/tests` when libsupra_ansi became the second consumer.
 
-- **T2** `cpp/libsupra_width`: terminal cell width and grapheme segmentation.
+- **T2** `crates/supra_ffi/native/cpp/libsupra_width`: terminal cell width and grapheme segmentation.
   - Flat C ABI: UTF-8 decoding, per-code-point width, UAX #29 grapheme cluster
     segmentation, string measurement, cluster-safe truncation, validation, and a
     startup glyph probe.

@@ -40,7 +40,7 @@ System packages (clang, cmake, bubblewrap) install per-distribution;
 It must pass before you push.
 
 Recipes that have nothing to do yet say so and exit 0. `test-cpp` switches to
-`--no-tests=error` the moment a `cpp/libsupra_*` directory exists, so an empty
+`--no-tests=error` the moment a `crates/supra_ffi/native/cpp/libsupra_*` directory exists, so an empty
 suite stops being acceptable at exactly the point it becomes a defect.
 
 ## Code conventions

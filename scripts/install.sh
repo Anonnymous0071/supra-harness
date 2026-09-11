@@ -40,7 +40,14 @@ need() {
     command -v "$1" >/dev/null 2>&1 || { echo "install: need $1 ($2)" >&2; exit 1; }
 }
 need curl "download releases"
-need sha256sum "checksum verification"
+if command -v sha256sum >/dev/null 2>&1; then
+    checksum() { sha256sum -c "$1"; }
+elif command -v shasum >/dev/null 2>&1; then
+    checksum() { shasum -a 256 -c "$1"; }
+else
+    echo "install: need sha256sum or shasum (checksum verification)" >&2
+    exit 1
+fi
 need minisign "signature verification"
 [ -n "$PUBKEY" ] || {
     echo "install: SUPRA_PUBKEY is required to verify official releases" >&2
@@ -56,7 +63,7 @@ echo "install: fetching supra $VERSION for $target"
 curl -fsSL -O "https://github.com/$REPO/releases/download/${VERSION}/${base}"
 curl -fsSL -O "https://github.com/$REPO/releases/download/${VERSION}/${base}.sha256"
 
-sha256sum -c "${base}.sha256" || { echo "install: checksum FAILED" >&2; exit 1; }
+checksum "${base}.sha256" || { echo "install: checksum FAILED" >&2; exit 1; }
 curl -fsSL -O "https://github.com/$REPO/releases/download/${VERSION}/${base}.minisig"
 echo "$PUBKEY" > supra.pub
 minisign -Vm "$base" -p supra.pub -x "${base}.minisig" || {

@@ -74,7 +74,7 @@ dev:
 test-cpp: build-cpp
     #!/usr/bin/env bash
     set -euo pipefail
-    if compgen -G "cpp/libsupra_*/CMakeLists.txt" >/dev/null; then
+    if compgen -G "crates/supra_ffi/native/cpp/libsupra_*/CMakeLists.txt" >/dev/null; then
         ctest --test-dir {{ build_dir }} --output-on-failure --no-tests=error
     else
         echo "test-cpp: no C++ libraries yet (they land in T2-T4)"

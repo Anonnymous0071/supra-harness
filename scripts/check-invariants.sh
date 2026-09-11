@@ -2333,10 +2333,46 @@ if [ -f scripts/package.sh ]; then
     fi
 fi
 
-if [ -f scripts/package-os.sh ] && grep -qE 'rpm_header|cpio_entry|struct\.pack' scripts/package-os.sh; then
-    fail "Linux packaging contains a handwritten RPM encoder" \
-        "scripts/package-os.sh" \
-        "release formats must be emitted and validated by standard package tooling"
+if [ -f scripts/install.sh ]; then
+    if grep -qE 'SKIP_CHECKSUM|checksum only|no \.minisig|releases/latest' scripts/install.sh; then
+        fail "the installer still permits mutable, unsigned, or unchecked installation" \
+            "scripts/install.sh" \
+            "installation is the last trust boundary and must be tag-pinned and fail closed"
+    fi
+    if ! grep -qF 'shasum -a 256 -c' scripts/install.sh; then
+        fail "the installer requires GNU sha256sum on every platform" \
+            "scripts/install.sh" \
+            "stock macOS provides shasum, so advertised Darwin installation must support it"
+    fi
+fi
+
+if [ -f crates/supra_ffi/Cargo.toml ]; then
+    if ! grep -qF '"native/**"' crates/supra_ffi/Cargo.toml || \
+       ! grep -qF 'manifest_dir.join("native")' crates/supra_ffi/build.rs; then
+        fail "supra_ffi's registry archive does not own its native build inputs" \
+            "crates/supra_ffi/{Cargo.toml,build.rs}" \
+            "cargo package must compile without relying on files outside the crate archive"
+    fi
+    if ! grep -qF 'x86_64-linux-musl-g++' crates/supra_ffi/build.rs || \
+       ! grep -qF 'rustc-link-lib=static=stdc++' crates/supra_ffi/build.rs; then
+        fail "musl builds can select the host C++ compiler or dynamic runtime" \
+            "crates/supra_ffi/build.rs" \
+            "the release target must use a musl C++ compiler and static matching runtime"
+    fi
+fi
+
+if [ -f scripts/package-os.sh ]; then
+    if grep -qE 'rpm_header|cpio_entry|struct\.pack' scripts/package-os.sh; then
+        fail "Linux packaging contains a handwritten RPM encoder" \
+            "scripts/package-os.sh" \
+            "release formats must be emitted and validated by standard package tooling"
+    fi
+    if ! grep -qF '/usr/share/doc/supra/changelog.gz' scripts/package-os.sh || \
+       ! grep -qF '%license /usr/share/licenses/supra/LICENSE-APACHE' scripts/package-os.sh; then
+        fail "native Linux packages omit licence or changelog payloads" \
+            "scripts/package-os.sh" \
+            "installable packages must carry their legal and release documentation"
+    fi
 fi
 
 if [ -f scripts/sign-release.sh ]; then
@@ -2350,12 +2386,6 @@ if [ -f scripts/sign-release.sh ]; then
             "scripts/sign-release.sh" \
             "Debian packages and the aggregate manifest must be signed too"
     fi
-fi
-
-if [ -f scripts/install.sh ] && grep -qE 'SKIP_CHECKSUM|checksum only|no \.minisig|releases/latest' scripts/install.sh; then
-    fail "the installer still permits mutable, unsigned, or unchecked installation" \
-        "scripts/install.sh" \
-        "installation is the last trust boundary and must be tag-pinned and fail closed"
 fi
 
 if [ -f packaging/homebrew/supra.rb ] && grep -qF 'REPLACE_WITH_' packaging/homebrew/supra.rb; then

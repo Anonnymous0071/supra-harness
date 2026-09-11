@@ -107,7 +107,8 @@ Installs the selected `supra` release for your platform into `~/.local/bin`
 signature before touching the destination, and refuses when `minisign` or the
 independently published `SUPRA_PUBKEY` is unavailable. Use the tag-pinned
 installer URL shown in that release's notes; do not pipe the mutable `main`
-branch into a shell. Needs `curl`, `sha256sum`, and `minisign`.
+branch into a shell. Needs `curl`, `minisign`, and either `sha256sum` (Linux)
+or `shasum` (stock macOS).
 
 ### Option B — from source (developers)
 
@@ -142,7 +143,7 @@ supra update check     # names the verifier for the artefact
 Cargo.toml           workspace, dependency pinning, lint and profile policy
 CMakeLists.txt       C++20 root: shared flag contract for T2-T4
 cmake/               CMake helper functions
-cpp/                 C++20 libraries: width (T2), ansi (T3), sandbox (T4)
+crates/supra_ffi/native/ C++20 libraries: width, ansi, and sandbox
 crates/              Rust crates: 36 members, T5 onward (supra_cli is the binary)
 agents/              WASM agent components (T20)
 docs/ARCHITECTURE.md normative architecture contract
