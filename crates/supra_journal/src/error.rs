@@ -39,6 +39,31 @@ pub enum JournalError {
     #[error("the file refused: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The journal cannot preserve this path in its TEXT schema without
+    /// changing its bytes. Refusing is safer than storing a lossy spelling
+    /// that undo could resolve to a different file.
+    #[error("the path is not valid UTF-8 and cannot be journaled losslessly: {path:?}")]
+    NonUtf8Path {
+        /// The path that could not be represented exactly.
+        path: std::path::PathBuf,
+    },
+
+    /// The path stopped naming the descriptor opened for the snapshot.
+    ///
+    /// This is the fail-closed outcome for a concurrent rename or symlink
+    /// swap: the bytes are not committed under an identity they did not come
+    /// from.
+    #[error("the path changed identity while it was being snapshotted: {path:?}")]
+    PathIdentityChanged {
+        /// The path whose descriptor and resolved name disagreed.
+        path: std::path::PathBuf,
+    },
+
+    /// This platform cannot provide the no-follow and identity checks needed
+    /// to bind snapshot bytes to one path safely.
+    #[error("safe journal path handling is unsupported on this platform")]
+    UnsupportedPathSafety,
+
     /// A stored snapshot does not hash to the digest recorded with it.
     ///
     /// The bytes are **not** offered to the caller. I4's reasoning applies

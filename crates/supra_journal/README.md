@@ -62,6 +62,27 @@ deliberately, because the caller picked the id. The `AlreadyUndone`
 refusal exists for the same reason - a second undo of the same row would
 revert whatever legitimate edit landed after the first one.
 
+**Content only, deliberately.** The schema stores bytes and their digest, not
+permissions, ownership, timestamps, ACLs, xattrs, or hard-link relationships.
+Undo writes a new private (`0600` on Unix) regular file and atomically replaces
+the target, so callers must not treat journal undo as metadata recovery. Tests
+pin both the byte restoration and the mode change.
+
+**Snapshot identity fails closed.** On Unix, snapshot opens the final component
+with no-follow semantics, derives bytes and device/inode identity from that one
+descriptor, and verifies the resolved path still names the same regular file
+before committing. A final symlink, concurrent rename/swap, or ambiguous file
+type is refused. The TEXT schema accepts only paths that round-trip as UTF-8;
+non-UTF-8 paths are explicitly rejected rather than stored lossily. Platforms
+without equivalent descriptor identity support refuse snapshot creation.
+
+**Undo temporary files are retry-safe.** Each restore uses an exclusively
+created sibling temporary with an RAII cleanup guard. Create, write, file-sync,
+or rename failure leaves no stale temporary and does not mark the row. After
+rename, undo fsyncs the parent directory before marking the row undone. A mark
+or commit failure can leave restored bytes with a live row; retry writes the
+same snapshot bytes again.
+
 **The digest is domain-separated (kind `0x11`).** `TurnBody` is `0x10`; a
 turn body and a file snapshot hashing the same bytes must not produce the
 same digest, or a collision between them could look like verification. The

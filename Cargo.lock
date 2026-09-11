@@ -3361,6 +3361,7 @@ dependencies = [
 name = "supra_journal"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "rusqlite",
  "supra_store",
  "supra_types",
