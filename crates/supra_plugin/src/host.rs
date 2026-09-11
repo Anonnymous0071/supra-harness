@@ -243,10 +243,10 @@ impl Plugin {
     ///
     /// The guest answers canonical text back; the host returns it
     /// unchanged - interpretation is the turn loop's business. Wasmtime's
-    /// Component Model [`wasmtime::component::TypedFunc::call`] consumes the
-    /// owned result and performs canonical post-return before it returns;
-    /// post-return failure is therefore part of the same invocation error.
-    /// A fuel failure surfaces as [`PluginError::FuelExhausted`] (the budget
+    /// Component Model [`wasmtime::component::TypedFunc::call`] lifts the
+    /// owned result, after which [`wasmtime::component::TypedFunc::post_return`]
+    /// must run before this instance can be entered again. A call or cleanup
+    /// fuel failure surfaces as [`PluginError::FuelExhausted`] (the budget
     /// is what ran out, and the component is spent for this turn); any other
     /// invocation or cleanup failure is [`PluginError::Trap`] with
     /// Wasmtime's own message.
@@ -261,20 +261,23 @@ impl Plugin {
         let typed = self.instance.get_typed_func::<(String,), (String,)>(&mut self.store, "run").map_err(
             |error| PluginError::WrongSignature { import: "run".to_owned(), detail: error.to_string() },
         )?;
-        match typed.call(&mut self.store, (arguments.to_owned(),)) {
-            Ok((answer,)) => Ok(answer),
-            Err(error) => {
-                let message = format!("{error:#}");
-                // wasmtime's fuel trap renders with `fuel` / `out of fuel`
-                // in its chain; other traps render as backtraces without
-                // that word. Grepping the formatted chain is cheaper than
-                // downcasting through wasmtime's error type.
-                if message.contains("fuel") || message.contains("out of fuel") {
-                    Err(PluginError::FuelExhausted { component: self.name.clone(), budget: self.fuel })
-                } else {
-                    Err(PluginError::Trap { component: self.name.clone(), detail: message })
-                }
-            }
+        let (answer,) = typed
+            .call(&mut self.store, (arguments.to_owned(),))
+            .map_err(|error| self.execution_error(&error))?;
+        typed.post_return(&mut self.store).map_err(|error| self.execution_error(&error))?;
+        Ok(answer)
+    }
+
+    fn execution_error(&self, error: &wasmtime::Error) -> PluginError {
+        let message = format!("{error:#}");
+        // wasmtime's fuel trap renders with `fuel` / `out of fuel`
+        // in its chain; other traps render as backtraces without
+        // that word. Grepping the formatted chain is cheaper than
+        // downcasting through wasmtime's error type.
+        if message.contains("fuel") || message.contains("out of fuel") {
+            PluginError::FuelExhausted { component: self.name.clone(), budget: self.fuel }
+        } else {
+            PluginError::Trap { component: self.name.clone(), detail: message }
         }
     }
 
@@ -538,9 +541,9 @@ mod tests {
         let second = plugin.call("again").expect("second call");
         // The guest answered "hi" from its own data segment: lifted
         // (param string) in and lifted (result string) out, through the
-        // guest's own memory. Wasmtime consumes the owned result and runs
-        // canonical post-return inside `TypedFunc::call`, so the same
-        // instance is ready for another call without a dangling allocation.
+        // guest's own memory. The host runs canonical post-return cleanup
+        // before the second entry, so the same instance is ready for another
+        // call without a dangling allocation.
         assert_eq!(first, "hi", "the first call returned the guest data segment");
         assert_eq!(second, "hi", "post-return left the instance reusable");
     }
