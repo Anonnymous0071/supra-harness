@@ -87,10 +87,7 @@ async fn live_probe() -> anyhow::Result<()> {
         let request = supra_llm::Request {
             provider: client.provider(),
             model: client.model().to_owned(),
-            messages: vec![supra_llm::Message {
-                role: supra_llm::Role::User,
-                content: "Reply with exactly: live-ok".to_owned(),
-            }],
+            messages: vec![supra_llm::Message::text(supra_llm::Role::User, "Reply with exactly: live-ok")],
             tools: Vec::new(),
             thinking: supra_llm::Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
@@ -99,7 +96,7 @@ async fn live_probe() -> anyhow::Result<()> {
             Ok(completion) => {
                 println!(
                     "live probe {name}: ok text={:?} usage={:?}",
-                    completion.text.trim(),
+                    completion.text().trim(),
                     completion.usage
                 );
             }

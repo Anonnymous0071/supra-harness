@@ -20,6 +20,43 @@ use crate::types::{
 
 use self::events::{EventHandler, EventType};
 
+const MAX_ACCUMULATED_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
+fn append_checked(target: &mut String, part: &str) -> Result<()> {
+    let size = target
+        .len()
+        .checked_add(part.len())
+        .ok_or_else(|| AnthropicError::StreamError("stream content size overflow".to_string()))?;
+    if size > MAX_ACCUMULATED_STREAM_BYTES {
+        return Err(AnthropicError::StreamError(format!(
+            "stream content exceeds {MAX_ACCUMULATED_STREAM_BYTES} bytes"
+        )));
+    }
+    target.push_str(part);
+    Ok(())
+}
+
+fn append_content_delta(block: &mut ContentBlock, delta: &ContentBlockDelta) -> Result<()> {
+    match (block, delta) {
+        (ContentBlock::Text { text }, ContentBlockDelta::TextDelta { text: part }) => {
+            append_checked(text, part)?;
+        }
+        (ContentBlock::ToolUse { input, .. }, ContentBlockDelta::InputJsonDelta { partial_json }) => {
+            let mut buffered = input.as_str().unwrap_or_default().to_owned();
+            append_checked(&mut buffered, partial_json)?;
+            *input = serde_json::from_str(&buffered).unwrap_or(serde_json::Value::String(buffered));
+        }
+        (ContentBlock::Thinking { thinking, .. }, ContentBlockDelta::ThinkingDelta { thinking: part }) => {
+            append_checked(thinking, part)?;
+        }
+        (ContentBlock::Thinking { signature, .. }, ContentBlockDelta::SignatureDelta { signature: part }) => {
+            append_checked(signature, part)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// A streaming response from the Anthropic API.
 ///
 /// `MessageStream` provides an event-driven interface for processing streaming responses
@@ -181,24 +218,19 @@ impl MessageStream {
                                 }
                             }
                             crate::types::MessageStreamEvent::ContentBlockDelta { delta, index } => {
-                                if let Some(ref mut msg) = *current_message_clone.lock().unwrap() {
-                                    if let Some(content_block) = msg.content.get_mut(*index) {
-                                        if let (crate::types::ContentBlock::Text { text }, 
-                                               crate::types::ContentBlockDelta::TextDelta { text: delta_text }) = 
-                                            (content_block, delta) {
-                                            text.push_str(delta_text);
-                                        }
-                                    }
+                                let append = if let Some(ref mut msg) = final_message.as_mut() {
+                                    msg.content
+                                        .get_mut(*index)
+                                        .map_or(Ok(()), |content_block| append_content_delta(content_block, delta))
+                                } else {
+                                    Ok(())
+                                };
+                                if let Err(error) = append {
+                                    *errored_clone.lock().unwrap() = true;
+                                    let _ = completion_sender.send(Err(error));
+                                    break;
                                 }
-                                if let Some(ref mut msg) = final_message.as_mut() {
-                                    if let Some(content_block) = msg.content.get_mut(*index) {
-                                        if let (crate::types::ContentBlock::Text { text }, 
-                                               crate::types::ContentBlockDelta::TextDelta { text: delta_text }) = 
-                                            (content_block, delta) {
-                                            text.push_str(delta_text);
-                                        }
-                                    }
-                                }
+                                *current_message_clone.lock().unwrap() = final_message.clone();
                             }
                             crate::types::MessageStreamEvent::MessageDelta { delta, usage } => {
                                 if let Some(ref mut msg) = *current_message_clone.lock().unwrap() {

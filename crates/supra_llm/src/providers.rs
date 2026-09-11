@@ -19,7 +19,7 @@
 use anthropic_sdk::types::{MessageContent, MessageParam, Role as AnthropicRole};
 use futures::StreamExt as _;
 
-use crate::client::{Completion, Request, Role, Thinking, Usage};
+use crate::client::{Completion, ContentBlock, Request, Role, StopReason, Thinking, Usage};
 use crate::error::LlmError;
 use crate::policy::ProviderKind;
 
@@ -43,6 +43,10 @@ pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-haiku-20241022";
 /// [`LlmError::Unauthorized`], [`LlmError::RateLimited`],
 /// [`LlmError::Transport`], or [`LlmError::BadResponse`], by
 /// recoverability rather than by SDK spelling.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the SDK request and lossless response conversion form one boundary"
+)]
 pub async fn send_anthropic(
     request: &Request,
     endpoint: Option<&str>,
@@ -68,7 +72,40 @@ pub async fn send_anthropic(
                 Role::User => AnthropicRole::User,
                 Role::Assistant => AnthropicRole::Assistant,
             },
-            content: MessageContent::Text(message.content.clone()),
+            content: MessageContent::Blocks(
+                message
+                    .content
+                    .iter()
+                    .map(|block| match block {
+                        ContentBlock::Text { text } => {
+                            anthropic_sdk::types::ContentBlockParam::Text { text: text.clone() }
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            anthropic_sdk::types::ContentBlockParam::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            }
+                        }
+                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                            anthropic_sdk::types::ContentBlockParam::ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                content: Some(content.clone()),
+                                is_error: Some(*is_error),
+                            }
+                        }
+                        ContentBlock::Thinking { thinking, signature } => {
+                            anthropic_sdk::types::ContentBlockParam::Thinking {
+                                thinking: thinking.clone(),
+                                signature: signature.clone(),
+                            }
+                        }
+                        ContentBlock::RedactedThinking { data } => {
+                            anthropic_sdk::types::ContentBlockParam::RedactedThinking { data: data.clone() }
+                        }
+                    })
+                    .collect(),
+            ),
         })
         .collect();
 
@@ -90,10 +127,36 @@ pub async fn send_anthropic(
     let stream = client.messages().stream(params).await.map_err(map_anthropic)?;
     let message = stream.final_message().await.map_err(map_anthropic)?;
 
-    let mut text = String::new();
+    let mut content = Vec::new();
     for block in &message.content {
-        if let anthropic_sdk::types::ContentBlock::Text { text: part } = block {
-            text.push_str(part);
+        match block {
+            anthropic_sdk::types::ContentBlock::Text { text } => {
+                content.push(ContentBlock::text(text.clone()));
+            }
+            anthropic_sdk::types::ContentBlock::ToolUse { id, name, input } => {
+                content.push(ContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                });
+            }
+            anthropic_sdk::types::ContentBlock::ToolResult { tool_use_id, content: result, is_error } => {
+                content.push(ContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: result.clone().unwrap_or_default(),
+                    is_error: is_error.unwrap_or(false),
+                });
+            }
+            anthropic_sdk::types::ContentBlock::Thinking { thinking, signature } => {
+                content.push(ContentBlock::Thinking {
+                    thinking: thinking.clone(),
+                    signature: signature.clone(),
+                });
+            }
+            anthropic_sdk::types::ContentBlock::RedactedThinking { data } => {
+                content.push(ContentBlock::RedactedThinking { data: data.clone() });
+            }
+            anthropic_sdk::types::ContentBlock::Image { .. } => {}
         }
     }
     let usage = Some(Usage {
@@ -101,7 +164,25 @@ pub async fn send_anthropic(
         output_tokens: u64::from(message.usage.output_tokens),
         cached_tokens: u64::from(message.usage.cache_read_input_tokens.unwrap_or(0)),
     });
-    Ok(Completion { text, usage, thinking })
+    let stop_reason = message.stop_reason.as_ref().map_or(StopReason::EndTurn, anthropic_stop_reason);
+    Ok(Completion {
+        content,
+        stop_reason,
+        stop_sequence: message.stop_sequence,
+        model: message.model,
+        request_id: message.request_id.map(|id| id.0),
+        usage,
+        thinking,
+    })
+}
+
+fn anthropic_stop_reason(reason: &anthropic_sdk::types::StopReason) -> StopReason {
+    match reason {
+        anthropic_sdk::types::StopReason::EndTurn => StopReason::EndTurn,
+        anthropic_sdk::types::StopReason::ToolUse => StopReason::ToolUse,
+        anthropic_sdk::types::StopReason::MaxTokens => StopReason::MaxTokens,
+        anthropic_sdk::types::StopReason::StopSequence => StopReason::StopSequence,
+    }
 }
 
 /// Convert canonical tool definitions into the SDK's tool shape.
@@ -123,20 +204,33 @@ fn tools_value(request: &Request) -> Result<Option<Vec<anthropic_sdk::types::Too
         let name = parsed.get("name").and_then(serde_json::Value::as_str).unwrap_or("tool").to_owned();
         let description =
             parsed.get("description").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
-        let properties = parsed
+        let mut schema = parsed
             .get("input_schema")
-            .and_then(|schema| schema.get("properties"))
+            .or_else(|| parsed.get("parameters"))
             .and_then(serde_json::Value::as_object)
             .cloned()
             .unwrap_or_default();
+        let schema_type = schema
+            .remove("type")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "object".to_owned());
+        let properties =
+            schema.remove("properties").and_then(|value| value.as_object().cloned()).unwrap_or_default();
+        let required = schema
+            .remove("required")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect();
         tools.push(anthropic_sdk::types::Tool {
             name,
             description,
             input_schema: anthropic_sdk::types::ToolInputSchema {
-                schema_type: "object".to_owned(),
+                schema_type,
                 properties,
-                required: Vec::new(),
-                additional: serde_json::Map::new(),
+                required,
+                additional: schema,
             },
         });
     }
@@ -247,14 +341,14 @@ fn openai_request(
         .iter()
         .map(|message| match message.role {
             Role::User => ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Text(message.content.clone()),
+                content: ChatCompletionRequestUserMessageContent::Text(message.text_content()),
                 name: None,
             }),
             Role::Assistant => ChatCompletionRequestMessage::Assistant(
                 async_openai::types::chat::ChatCompletionRequestAssistantMessage {
                     content: Some(
                         async_openai::types::chat::ChatCompletionRequestAssistantMessageContent::Text(
-                            message.content.clone(),
+                            message.text_content(),
                         ),
                     ),
                     refusal: None,
@@ -296,10 +390,17 @@ fn blocking_completion(
     response: async_openai::types::chat::CreateChatCompletionResponse,
     thinking: Thinking,
 ) -> Completion {
-    let mut text = String::new();
+    let mut content = Vec::new();
+    let mut stop_reason = StopReason::EndTurn;
     for choice in &response.choices {
         if let Some(part) = &choice.message.content {
-            text.push_str(part);
+            content.push(ContentBlock::text(part.clone()));
+        }
+        if let Some(tool_calls) = &choice.message.tool_calls {
+            content.extend(tool_calls.iter().map(openai_tool_call));
+        }
+        if let Some(reason) = choice.finish_reason {
+            stop_reason = openai_stop_reason(reason);
         }
     }
     let usage = response.usage.map(|reported| Usage {
@@ -307,7 +408,40 @@ fn blocking_completion(
         output_tokens: u64::from(reported.completion_tokens),
         cached_tokens: 0,
     });
-    Completion { text, usage, thinking }
+    Completion {
+        content,
+        stop_reason,
+        stop_sequence: None,
+        model: response.model,
+        request_id: Some(response.id),
+        usage,
+        thinking,
+    }
+}
+
+fn openai_tool_call(call: &async_openai::types::chat::ChatCompletionMessageToolCalls) -> ContentBlock {
+    match call {
+        async_openai::types::chat::ChatCompletionMessageToolCalls::Function(call) => {
+            let input = serde_json::from_str(&call.function.arguments)
+                .unwrap_or_else(|_| serde_json::Value::String(call.function.arguments.clone()));
+            ContentBlock::ToolUse { id: call.id.clone(), name: call.function.name.clone(), input }
+        }
+        async_openai::types::chat::ChatCompletionMessageToolCalls::Custom(call) => ContentBlock::ToolUse {
+            id: call.id.clone(),
+            name: call.custom_tool.name.clone(),
+            input: serde_json::Value::String(call.custom_tool.input.clone()),
+        },
+    }
+}
+
+fn openai_stop_reason(reason: async_openai::types::chat::FinishReason) -> StopReason {
+    match reason {
+        async_openai::types::chat::FinishReason::Stop => StopReason::EndTurn,
+        async_openai::types::chat::FinishReason::Length => StopReason::MaxTokens,
+        async_openai::types::chat::FinishReason::ToolCalls
+        | async_openai::types::chat::FinishReason::FunctionCall => StopReason::ToolUse,
+        async_openai::types::chat::FinishReason::ContentFilter => StopReason::ContentFilter,
+    }
 }
 
 /// Whether a blocking-call failure is worth retrying as a stream.
@@ -338,17 +472,38 @@ async fn stream_openai(
 ) -> Result<Completion, LlmError> {
     let mut stream = client.chat().create_stream(sdk_request).await.map_err(|error| map_openai(&error))?;
 
-    let mut text = String::new();
+    let mut content = Vec::new();
+    let mut tool_calls = std::collections::BTreeMap::<u32, OpenAiToolCall>::new();
     let mut usage: Option<Usage> = None;
-    let mut terminal = false;
+    let mut stop_reason = None;
+    let mut model = String::new();
+    let mut request_id = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| map_openai(&error))?;
+        model.clone_from(&chunk.model);
+        request_id = Some(chunk.id.clone());
         for choice in &chunk.choices {
             if let Some(part) = &choice.delta.content {
-                text.push_str(part);
+                content.push(ContentBlock::text(part.clone()));
             }
-            if choice.finish_reason.is_some() {
-                terminal = true;
+            if let Some(deltas) = &choice.delta.tool_calls {
+                for delta in deltas {
+                    let call = tool_calls.entry(delta.index).or_default();
+                    if let Some(id) = &delta.id {
+                        call.id.clone_from(id);
+                    }
+                    if let Some(function) = &delta.function {
+                        if let Some(name) = &function.name {
+                            call.name.push_str(name);
+                        }
+                        if let Some(arguments) = &function.arguments {
+                            call.arguments.push_str(arguments);
+                        }
+                    }
+                }
+            }
+            if let Some(reason) = choice.finish_reason {
+                stop_reason = Some(openai_stop_reason(reason));
             }
         }
         if let Some(reported) = &chunk.usage {
@@ -360,15 +515,27 @@ async fn stream_openai(
         }
     }
 
-    if !terminal {
-        let detail = if text.is_empty() {
+    let Some(stop_reason) = stop_reason else {
+        let detail = if content.is_empty() {
             "the stream ended with no events".to_owned()
         } else {
             "the stream ended before a terminal marker".to_owned()
         };
         return Err(LlmError::BadResponse { provider: ProviderKind::OpenAI.name().to_owned(), detail });
-    }
-    Ok(Completion { text, usage, thinking })
+    };
+    content.extend(tool_calls.into_values().map(|call| {
+        let input =
+            serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::String(call.arguments));
+        ContentBlock::ToolUse { id: call.id, name: call.name, input }
+    }));
+    Ok(Completion { content, stop_reason, stop_sequence: None, model, request_id, usage, thinking })
+}
+
+#[derive(Default)]
+struct OpenAiToolCall {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 /// The reasoning effort for a request: `medium` when thinking is on,
@@ -456,7 +623,7 @@ mod tests {
         Request {
             provider,
             model: "m".to_owned(),
-            messages: vec![crate::client::Message { role: Role::User, content: "hi".to_owned() }],
+            messages: vec![crate::client::Message::text(Role::User, "hi")],
             tools: Vec::new(),
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
@@ -473,6 +640,41 @@ mod tests {
         let anthropic = sample_request(ProviderKind::Anthropic);
         assert!(tools_value(&anthropic).expect("no tools").is_none());
         assert!(openai_tools(&anthropic).expect("no tools").is_none());
+    }
+
+    #[test]
+    fn anthropic_preserves_complete_tool_schemas() {
+        let request = Request {
+            tools: vec![crate::canonicalize(
+                r#"{"description":"lookup","input_schema":{"additionalProperties":false,"properties":{"query":{"minLength":1,"type":"string"}},"required":["query"],"type":"object"},"name":"lookup"}"#,
+            )
+            .expect("canonical tool")],
+            ..sample_request(ProviderKind::Anthropic)
+        };
+
+        let tools = tools_value(&request).expect("tool converts").expect("one tool");
+        let schema = serde_json::to_value(&tools[0].input_schema).expect("schema serializes");
+        assert_eq!(schema["required"], serde_json::json!(["query"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["query"]["minLength"], 1);
+    }
+
+    #[test]
+    fn provider_stop_reasons_remain_distinct() {
+        assert_eq!(anthropic_stop_reason(&anthropic_sdk::types::StopReason::EndTurn), StopReason::EndTurn);
+        assert_eq!(anthropic_stop_reason(&anthropic_sdk::types::StopReason::ToolUse), StopReason::ToolUse);
+        assert_eq!(
+            anthropic_stop_reason(&anthropic_sdk::types::StopReason::MaxTokens),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            openai_stop_reason(async_openai::types::chat::FinishReason::Length),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            openai_stop_reason(async_openai::types::chat::FinishReason::ToolCalls),
+            StopReason::ToolUse
+        );
     }
 
     #[test]
@@ -515,7 +717,7 @@ mod tests {
             moderation: None,
         };
         let completion = blocking_completion(response, Thinking { budget_tokens: 0 });
-        assert_eq!(completion.text, "live-ok");
+        assert_eq!(completion.text(), "live-ok");
         let usage = completion.usage.expect("usage rides the top level");
         assert_eq!((usage.input_tokens, usage.output_tokens), (213, 7));
     }
@@ -603,10 +805,7 @@ mod tests {
         let request = Request {
             provider: ProviderKind::Anthropic,
             model: model.clone(),
-            messages: vec![crate::client::Message {
-                role: Role::User,
-                content: "Reply with exactly: live-ok".to_owned(),
-            }],
+            messages: vec![crate::client::Message::text(Role::User, "Reply with exactly: live-ok")],
             tools: Vec::new(),
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
@@ -616,7 +815,7 @@ mod tests {
                 .await
                 .expect("the gateway answers through the SDK");
 
-        assert_eq!(completion.text.trim(), "live-ok", "the stream carried the exact answer");
+        assert_eq!(completion.text().trim(), "live-ok", "the stream carried the exact answer");
         let usage = completion.usage.expect("the gateway reports usage");
         assert!(usage.input_tokens > 0, "input usage is reported: {usage:?}");
         assert!(usage.output_tokens > 0, "output usage is reported: {usage:?}");
@@ -642,10 +841,7 @@ mod tests {
         let request = Request {
             provider: ProviderKind::OpenAI,
             model: model.clone(),
-            messages: vec![crate::client::Message {
-                role: Role::User,
-                content: "Reply with exactly: live-ok".to_owned(),
-            }],
+            messages: vec![crate::client::Message::text(Role::User, "Reply with exactly: live-ok")],
             tools: Vec::new(),
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
@@ -655,12 +851,12 @@ mod tests {
                 .await
                 .expect("the gateway answers through the SDK");
 
-        assert!(!completion.text.trim().is_empty(), "the stream carried text");
+        assert!(!completion.text().trim().is_empty(), "the stream carried text");
         if let Some(usage) = completion.usage {
             assert!(usage.input_tokens > 0, "input usage is reported: {usage:?}");
             assert!(usage.output_tokens > 0, "output usage is reported: {usage:?}");
         }
-        println!("live openai text: {:?}", completion.text.trim());
+        println!("live openai text: {:?}", completion.text().trim());
         println!("live openai usage: {:?}", completion.usage);
     }
 

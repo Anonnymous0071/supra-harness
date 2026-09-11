@@ -66,6 +66,17 @@ pub enum ContentBlock {
         content: Option<String>,
         is_error: Option<bool>,
     },
+
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        data: String,
+    },
 }
 
 /// Image source for image content blocks
@@ -182,6 +193,17 @@ pub enum ContentBlockParam {
         tool_use_id: String,
         content: Option<String>,
         is_error: Option<bool>,
+    },
+
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        data: String,
     },
 }
 

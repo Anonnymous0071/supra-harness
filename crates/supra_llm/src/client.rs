@@ -73,13 +73,83 @@ impl Thinking {
     }
 }
 
+/// One ordered content block in a provider message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    /// Visible text.
+    Text {
+        /// The text exactly as received or sent.
+        text: String,
+    },
+    /// Claude reasoning that must be replayed with its signature unchanged.
+    Thinking {
+        /// Reasoning text.
+        thinking: String,
+        /// Provider signature authenticating the reasoning block.
+        signature: String,
+    },
+    /// Provider-redacted reasoning that must still be replayed unchanged.
+    RedactedThinking {
+        /// Opaque provider payload.
+        data: String,
+    },
+    /// A model request to invoke a tool.
+    ToolUse {
+        /// Provider-assigned tool-use identifier.
+        id: String,
+        /// Registered tool name.
+        name: String,
+        /// Tool input exactly as structured by the provider.
+        input: serde_json::Value,
+    },
+    /// A host result corresponding to a prior tool use.
+    ToolResult {
+        /// Identifier of the tool use this answers.
+        tool_use_id: String,
+        /// Result text.
+        content: String,
+        /// Whether execution failed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
+    },
+}
+
+impl ContentBlock {
+    /// Construct a visible text block.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+}
+
 /// One message in a request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     /// Who authored it.
     pub role: Role,
-    /// Text content. Canonical text, not rendered prose: T14 owns rendering.
-    pub content: String,
+    /// Ordered content. Replay-required thinking and tool blocks retain their exact order.
+    pub content: Vec<ContentBlock>,
+}
+
+impl Message {
+    /// Construct a one-block text message.
+    #[must_use]
+    pub fn text(role: Role, text: impl Into<String>) -> Self {
+        Self { role, content: vec![ContentBlock::text(text)] }
+    }
+
+    /// Join only visible text blocks in their original order.
+    #[must_use]
+    pub fn text_content(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// A request to one provider.
@@ -145,17 +215,71 @@ pub struct Usage {
     pub cached_tokens: u64,
 }
 
-/// A completed response.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why a provider stopped generating.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// The model completed the turn normally.
+    EndTurn,
+    /// The model emitted tool-use blocks and requires results.
+    ToolUse,
+    /// The configured output-token limit truncated the answer.
+    MaxTokens,
+    /// A configured stop sequence ended generation.
+    StopSequence,
+    /// The provider removed content under its safety policy.
+    ContentFilter,
+    /// A provider-specific terminal reason not otherwise classified.
+    Other(String),
+}
+
+/// A completed provider response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Completion {
-    /// Text answer.
-    pub text: String,
+    /// Ordered assistant blocks, including replay-required thinking and tool use.
+    pub content: Vec<ContentBlock>,
+    /// Why generation stopped. Callers continue `ToolUse` and must not seal `MaxTokens`.
+    pub stop_reason: StopReason,
+    /// Custom stop sequence, when [`StopReason::StopSequence`] applies.
+    pub stop_sequence: Option<String>,
+    /// Model identifier reported by the provider.
+    pub model: String,
+    /// Provider request identifier, when available.
+    pub request_id: Option<String>,
     /// What the provider reported. `None` when the provider omits usage (`Google`'s
     /// implicit caching reports `total_cached_tokens` unreliably, so absence is an
     /// answer, not an error).
     pub usage: Option<Usage>,
     /// The thinking budget the request carried, echoed for reconciliation.
     pub thinking: Thinking,
+}
+
+impl Completion {
+    /// Join visible text blocks in generation order.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Construct a terminal text completion for non-provider callers and tests.
+    #[must_use]
+    pub fn end_turn(text: impl Into<String>, usage: Option<Usage>, thinking: Thinking) -> Self {
+        Self {
+            content: vec![ContentBlock::text(text)],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            model: String::new(),
+            request_id: None,
+            usage,
+            thinking,
+        }
+    }
 }
 
 /// A provider client: policy, endpoint, and credential source.
@@ -399,12 +523,29 @@ impl Client {
             .messages
             .iter()
             .map(|message| {
+                let parts: Vec<serde_json::Value> = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(serde_json::json!({"text": text})),
+                        ContentBlock::ToolUse { name, input, .. } => {
+                            Some(serde_json::json!({"functionCall": {"name": name, "args": input}}))
+                        }
+                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                            Some(serde_json::json!({"functionResponse": {
+                                "name": tool_use_id,
+                                "response": {"content": content, "is_error": is_error},
+                            }}))
+                        }
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
+                    })
+                    .collect();
                 serde_json::json!({
                     "role": match message.role {
                         Role::User => "user",
                         Role::Assistant => "model",
                     },
-                    "parts": [{"text": message.content}],
+                    "parts": parts,
                 })
             })
             .collect();
@@ -541,7 +682,7 @@ impl Client {
             });
         }
 
-        read_sse(response, request.thinking).await
+        read_google_sse(response, request.thinking).await
     }
 }
 
@@ -610,7 +751,8 @@ fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
 ///
 /// A stream that ends without a terminal marker is refused even when text arrived:
 /// partial text returned as a success is a wrong answer wearing a green light.
-async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Completion, LlmError> {
+#[allow(clippy::too_many_lines, reason = "the streaming parser keeps one explicit terminal-state machine")]
+async fn read_google_sse(response: reqwest::Response, thinking: Thinking) -> Result<Completion, LlmError> {
     use futures::StreamExt as _;
 
     // The provider name for errors. Recovered from the URL is wrong (a custom endpoint
@@ -621,7 +763,9 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
     let mut buffer = Vec::new();
     let mut text = String::new();
     let mut usage: Option<Usage> = None;
-    let mut terminal = false;
+    let mut stop_reason = None;
+    let mut model = String::new();
+    let mut request_id = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
@@ -635,7 +779,15 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
                 let Some(payload) = line.strip_prefix("data:") else { continue };
                 let payload = payload.trim();
                 if payload == "[DONE]" {
-                    return Ok(Completion { text, usage, thinking });
+                    return Ok(Completion {
+                        content: vec![ContentBlock::text(text)],
+                        stop_reason: stop_reason.unwrap_or(StopReason::EndTurn),
+                        stop_sequence: None,
+                        model,
+                        request_id,
+                        usage,
+                        thinking,
+                    });
                 }
                 let json: serde_json::Value =
                     serde_json::from_str(payload).map_err(|_| LlmError::BadResponse {
@@ -672,16 +824,21 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
                 {
                     text.push_str(delta);
                 }
-                // A message_delta with stop_reason, or a finish_reason, ends the answer
-                // even where the sentinel is absent.
-                if json.get("stop_reason").is_some()
-                    || json
-                        .get("choices")
-                        .and_then(|choices| choices.get(0))
-                        .and_then(|choice| choice.get("finish_reason"))
-                        .is_some()
+                if let Some(reported_model) = json.get("model").and_then(serde_json::Value::as_str) {
+                    reported_model.clone_into(&mut model);
+                }
+                if let Some(reported_id) = json.get("id").and_then(serde_json::Value::as_str) {
+                    request_id = Some(reported_id.to_owned());
+                }
+                if let Some(reason) =
+                    json.get("stop_reason").and_then(serde_json::Value::as_str).or_else(|| {
+                        json.get("choices")
+                            .and_then(|choices| choices.get(0))
+                            .and_then(|choice| choice.get("finish_reason"))
+                            .and_then(serde_json::Value::as_str)
+                    })
                 {
-                    terminal = true;
+                    stop_reason = Some(parse_stop_reason(reason));
                 }
                 // Usage arrives on the final event (Anthropic) or as usage (OpenAI).
                 if let Some(reported) = parse_usage(&json) {
@@ -690,15 +847,34 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
             }
         }
     }
-    if !terminal {
+    let Some(stop_reason) = stop_reason else {
         let detail = if text.is_empty() {
             "the stream ended with no events".to_owned()
         } else {
             "the stream ended before a terminal marker".to_owned()
         };
         return Err(LlmError::BadResponse { provider, detail });
+    };
+    Ok(Completion {
+        content: vec![ContentBlock::text(text)],
+        stop_reason,
+        stop_sequence: None,
+        model,
+        request_id,
+        usage,
+        thinking,
+    })
+}
+
+fn parse_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "end_turn" | "stop" => StopReason::EndTurn,
+        "tool_use" | "tool_calls" | "function_call" => StopReason::ToolUse,
+        "max_tokens" | "length" => StopReason::MaxTokens,
+        "stop_sequence" => StopReason::StopSequence,
+        "content_filter" | "safety" => StopReason::ContentFilter,
+        other => StopReason::Other(other.to_owned()),
     }
-    Ok(Completion { text, usage, thinking })
 }
 
 /// Byte offset just past the next `\n\n` boundary, if one is buffered.
@@ -746,7 +922,7 @@ mod tests {
         let request = Request {
             provider: ProviderKind::Anthropic,
             model: "m".to_owned(),
-            messages: vec![Message { role: Role::User, content: "hi".to_owned() }],
+            messages: vec![Message::text(Role::User, "hi")],
             tools: vec![crate::canonicalize(r#"{"b":1,"a":2}"#).expect("canonical")],
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
@@ -787,7 +963,7 @@ mod tests {
 
     #[test]
     fn each_provider_renders_its_own_wire_shape() {
-        let messages = vec![Message { role: Role::User, content: "hi".to_owned() }];
+        let messages = vec![Message::text(Role::User, "hi")];
 
         let anthropic = test_client(ProviderKind::Anthropic);
         let request = Request {
@@ -801,7 +977,7 @@ mod tests {
         let body = anthropic.render_body(&request).expect("anthropic renders");
         assert!(body.as_str().contains("\"max_tokens\""), "{}", body.as_str());
         assert!(
-            body.as_str().contains(r#""messages":[{"content":"hi","role":"user"}]"#),
+            body.as_str().contains(r#""messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}]"#),
             "{}",
             body.as_str()
         );
@@ -810,7 +986,7 @@ mod tests {
         let request = Request { provider: ProviderKind::OpenAI, model: "m".to_owned(), ..request.clone() };
         let body = openai.render_body(&request).expect("openai renders");
         assert!(
-            body.as_str().contains(r#""messages":[{"content":"hi","role":"user"}]"#),
+            body.as_str().contains(r#""messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}]"#),
             "{}",
             body.as_str()
         );
@@ -825,6 +1001,42 @@ mod tests {
             body.as_str()
         );
         assert!(!body.as_str().contains("\"messages\""), "{}", body.as_str());
+    }
+
+    #[test]
+    fn anthropic_replay_bytes_keep_order_and_signatures() {
+        let client = test_client(ProviderKind::Anthropic);
+        let request = Request {
+            provider: ProviderKind::Anthropic,
+            model: "m".to_owned(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking { thinking: "trace".to_owned(), signature: "sig".to_owned() },
+                    ContentBlock::RedactedThinking { data: "opaque".to_owned() },
+                    ContentBlock::ToolUse {
+                        id: "tool-1".to_owned(),
+                        name: "lookup".to_owned(),
+                        input: serde_json::json!({"query": "x"}),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "tool-1".to_owned(),
+                        content: "found".to_owned(),
+                        is_error: true,
+                    },
+                    ContentBlock::text("done"),
+                ],
+            }],
+            tools: Vec::new(),
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+
+        let body = client.render_body(&request).expect("replay renders");
+        assert_eq!(
+            body.as_str(),
+            r#"{"max_tokens":32000,"messages":[{"content":[{"signature":"sig","thinking":"trace","type":"thinking"},{"data":"opaque","type":"redacted_thinking"},{"id":"tool-1","input":{"query":"x"},"name":"lookup","type":"tool_use"},{"content":"found","is_error":true,"tool_use_id":"tool-1","type":"tool_result"},{"text":"done","type":"text"}],"role":"assistant"}],"model":"test-model"}"#
+        );
     }
 
     #[test]
