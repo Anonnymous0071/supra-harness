@@ -153,6 +153,45 @@ impl Blackboard {
         Ok(claim)
     }
 
+    /// Publish the bounded placeholder used by an E0 blind re-derivation.
+    ///
+    /// The proposer is persisted as the sole eligible validation pass while `k`
+    /// remains one, so quorum arithmetic keeps its documented `ceil(2k/3)` meaning.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish`].
+    pub fn publish_blind(
+        &mut self,
+        turn: TurnId,
+        proposer: AgentId,
+        body: &str,
+    ) -> Result<ClaimId, BlackboardError> {
+        if body.len() > MAX_BODY_BYTES {
+            return Err(BlackboardError::Store(supra_store::StoreError::Malformed {
+                detail: format!("claim body is {} bytes, the budget is {MAX_BODY_BYTES}", body.len()),
+            }));
+        }
+        let claim = ClaimId::generate();
+        self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
+            schema::insert_claim(tx, claim, turn, proposer, body, 1, "open", &[proposer])?;
+            Ok(())
+        })?;
+        self.claims.insert(
+            claim,
+            ClaimState {
+                turn,
+                proposer,
+                body: body.to_owned(),
+                k: 1,
+                tally: QuorumTally::new(1),
+                status: QuorumStatus::Open,
+                validators: [(proposer, None)].into_iter().collect(),
+            },
+        );
+        Ok(claim)
+    }
+
     /// Record one vote and report the claim's new standing.
     ///
     /// # Errors
@@ -175,6 +214,42 @@ impl Blackboard {
         if voter == state.proposer {
             return Err(BlackboardError::NotAProposer { agent: voter, claim });
         }
+        Self::record_vote(&self.store, claim, voter, verdict, state)
+    }
+
+    /// Record the E0 proposer's blind, reasoning-free second derivation.
+    ///
+    /// This is the only path where the proposer is also an eligible validator. The
+    /// roster must contain exactly that proposer, so callers cannot use it to widen
+    /// voting authority for an ordinary cohort.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::vote`], plus [`BlackboardError::NotInCohort`] unless this is the
+    /// single-member blind-rederivation roster.
+    pub fn vote_blind(
+        &mut self,
+        claim: ClaimId,
+        voter: AgentId,
+        verdict: &Verdict,
+    ) -> Result<Outcome, BlackboardError> {
+        let state = self.claims.get_mut(&claim).ok_or(BlackboardError::UnknownClaim { claim })?;
+        if state.status != QuorumStatus::Open {
+            return Err(BlackboardError::Closed { claim });
+        }
+        if state.proposer != voter || state.k != 1 || state.validators.len() != 1 {
+            return Err(BlackboardError::NotInCohort { agent: voter, claim });
+        }
+        Self::record_vote(&self.store, claim, voter, verdict, state)
+    }
+
+    fn record_vote(
+        store: &Store,
+        claim: ClaimId,
+        voter: AgentId,
+        verdict: &Verdict,
+        state: &mut ClaimState,
+    ) -> Result<Outcome, BlackboardError> {
         let Some(slot) = state.validators.get_mut(&voter) else {
             return Err(BlackboardError::NotInCohort { agent: voter, claim });
         };
@@ -186,7 +261,7 @@ impl Blackboard {
         // as though the vote never happened, or a retry would read
         // DuplicateVote while the store holds nothing.
         let vote = verdict.vote();
-        self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
+        store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
             schema::insert_vote(tx, claim, voter, verdict)?;
             Ok(())
         })?;
@@ -194,7 +269,7 @@ impl Blackboard {
         let outcome = match state.tally.record(vote) {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
+                store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
                     schema::delete_vote(tx, claim, voter)?;
                     Ok(())
                 })?;
@@ -205,13 +280,12 @@ impl Blackboard {
         state.status = outcome;
 
         if outcome != QuorumStatus::Open {
-            self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
+            store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
                 let _ = schema::update_status(tx, claim, status_text(outcome))?;
                 Ok(())
             })?;
         }
 
-        let state = &self.claims[&claim];
         Ok(Outcome { claim, status: outcome, tally: state.tally })
     }
 
@@ -349,6 +423,34 @@ mod tests {
 
     fn ids(n: usize) -> Vec<AgentId> {
         (0..n).map(|_| AgentId::generate()).collect()
+    }
+
+    #[test]
+    fn a_blind_claim_survives_restart_with_its_single_validator() {
+        let path = store_path();
+        let proposer = AgentId::generate();
+        let claim;
+
+        {
+            let store = Store::open(&path).expect("store");
+            let mut board = Blackboard::open(Arc::new(store)).expect("board");
+            claim = board.publish_blind(TurnId::generate(), proposer, "candidate").expect("blind publish");
+        }
+
+        let store = Store::open(&path).expect("reopen");
+        let mut board = Blackboard::open(Arc::new(store)).expect("hydrate");
+        let outcome = board.vote_blind(claim, proposer, &verdict(Vote::Yes)).expect("persisted blind roster");
+        assert_eq!(outcome.status, QuorumStatus::Reached);
+        assert_eq!(board.votes(claim).expect("votes").len(), 1);
+    }
+
+    #[test]
+    fn an_oversized_blind_claim_leaves_no_state() {
+        let mut board = board();
+        let result =
+            board.publish_blind(TurnId::generate(), AgentId::generate(), &"x".repeat(MAX_BODY_BYTES + 1));
+        assert!(result.is_err());
+        assert!(board.claims.is_empty());
     }
 
     #[test]
