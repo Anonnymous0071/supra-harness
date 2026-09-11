@@ -1896,18 +1896,27 @@ fi
 # ---------------------------------------------------------------------------
 # T23 - turn loop guards
 #
-# The loop's load-bearing properties: agreement is the vote, the
-# escalation abort is published, and the ceiling is checked. Through
-# `scan`; probed against the same M-series.
+# The loop's load-bearing properties: proposals and validator verdicts stay
+# distinct, the escalation abort is published, and the ceiling is checked.
+# Through `scan`; probed against the same M-series.
 # ---------------------------------------------------------------------------
 coresrc="crates/supra_core/src"
 
 if [ -d "$coresrc" ]; then
-    agreement=$(scan "$coresrc/turn.rs" 'answer_is_supported\(&answer\).*Vote::Yes.*Vote::No')
-    if [ -z "$agreement" ]; then
-        fail "a disagreeing peer no longer votes no" \
+    proposal=$(scan "$coresrc/turn.rs" 'PeerAnswer::proposal|pub fn proposal')
+    validation=$(scan "$coresrc/turn.rs" 'PeerAnswer::validation|pub const fn validation')
+    verdict_vote=$(scan "$coresrc/turn.rs" 'let vote = verdict\.vote\(\)')
+    if [ -z "$proposal" ] || [ -z "$validation" ] || [ -z "$verdict_vote" ]; then
+        fail "the turn loop no longer separates proposals from structured verdicts" \
             "crates/supra_core/src/turn.rs" \
-            "a quorum over answers is a quorum: agreement is the vote"
+            "semantic agreement is a bounded validator verdict, not byte equality between generated answers"
+    fi
+
+    proposer_only=$(scan "$coresrc/turn.rs" 'answer\.agent != self\.session\[0\]')
+    if [ -z "$proposer_only" ]; then
+        fail "validators may submit unbounded proposal text" \
+            "crates/supra_core/src/turn.rs" \
+            "only the designated proposer may supply the candidate; validators supply bounded verdicts"
     fi
 
     escalation=$(scan_sql "$coresrc/turn.rs" 'escalating now')
