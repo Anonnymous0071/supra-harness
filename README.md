@@ -95,13 +95,14 @@ experiments but is not invoked by the shipped Linux sandbox backend.
 curl -fsSL "https://raw.githubusercontent.com/Anonnymous0071/supra-harness/vX.Y.Z/scripts/install.sh" | SUPRA_VERSION=vX.Y.Z SUPRA_PUBKEY='<published minisign public key>' bash
 ```
 
-Installs the selected `supra` release for supported Linux and macOS targets into `~/.local/bin`
-(override with `PREFIX=`), verifies its SHA-256 checksum and required Minisign
-signature before touching the destination, and refuses when `minisign` or the
-independently published `SUPRA_PUBKEY` is unavailable. Use the tag-pinned
-installer URL shown in that release's notes; do not pipe the mutable `main`
-branch into a shell. Needs `curl`, `minisign`, and either `sha256sum` (Linux)
-or `shasum` (stock macOS).
+Installs an explicitly pinned `supra` release for supported targets into `~/.local/bin`
+(override with `PREFIX=`). The installer requires the independently published
+`SUPRA_PUBKEY`, verifies a required Minisign signature over the canonical
+per-target manifest, then checks the exact archive name, target, version, size,
+digest, and sole regular executable member before touching the destination.
+There is no checksum-only fallback. Use the tag-pinned installer URL shown in
+the release notes; do not pipe the mutable `main` branch into a shell. Needs
+`curl`, `minisign`, `python3`, and `tar`.
 
 ### Option B — from source (developers)
 
@@ -125,7 +126,9 @@ supra --help           # list commands; an explicit subcommand is required
 supra config show      # resolved config and where each value came from
 supra eval             # offline economy shape-check (always runs, no network)
 supra eval --live      # Anthropic/OpenAI probe; may incur provider charges
-supra update check     # verification guidance; performs no network check
+supra update check --archive ./supra-$TARGET.tar.gz \
+  --manifest ./supra-$TARGET.manifest.json \
+  --signature ./supra-$TARGET.manifest.json.minisig --public-key ./supra.pub
 ```
 
 ---

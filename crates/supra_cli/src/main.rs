@@ -118,21 +118,43 @@ async fn live_probe() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn update_check_message() -> anyhow::Result<String> {
-    let current = supra_update::parse_version(env!("CARGO_PKG_VERSION"))?;
-    Ok(format!("supra {current}: update check needs network; verify artefacts with supra_update::verify"))
-}
-
 fn update_cmd(action: UpdateAction) -> anyhow::Result<()> {
     match action {
-        UpdateAction::Check => {
-            println!("{}", update_check_message()?);
+        UpdateAction::Check { archive, manifest, signature, public_key } => {
+            let verified = supra_update::check_local(supra_update::LocalUpdate {
+                archive: &archive,
+                manifest: &manifest,
+                signature: &signature,
+                public_key: &public_key,
+                expected_target: supra_update::current_target(),
+            })?;
+            println!(
+                "verified supra {} for {}: {} -> {}",
+                verified.version(),
+                verified.target(),
+                verified.archive(),
+                verified.executable_path()
+            );
             Ok(())
         }
-        UpdateAction::Apply => {
-            anyhow::bail!(
-                "supra update apply refuses without a verified signature: fetch, verify, then apply"
-            );
+        UpdateAction::Apply { archive, manifest, signature, public_key, install_path } => {
+            let install_path = match install_path {
+                Some(path) => path,
+                None => std::env::current_exe()
+                    .map_err(|error| anyhow::anyhow!("resolve running supra executable: {error}"))?,
+            };
+            let outcome = supra_update::apply_local(
+                supra_update::LocalUpdate {
+                    archive: &archive,
+                    manifest: &manifest,
+                    signature: &signature,
+                    public_key: &public_key,
+                    expected_target: supra_update::current_target(),
+                },
+                &install_path,
+            )?;
+            println!("installed supra {} at {}", outcome.version, outcome.install_path.display());
+            Ok(())
         }
     }
 }
@@ -178,18 +200,24 @@ mod tests {
     }
 
     #[test]
-    fn update_check_names_the_verifier() {
-        let message = update_check_message().expect("check never fails without network");
-        assert!(
-            message.contains("supra_update::verify"),
-            "check must name the verifier, not just any help: {message}"
-        );
-        update_cmd(UpdateAction::Check).expect("check never fails without network");
-    }
+    fn update_commands_fail_closed_on_missing_local_inputs() {
+        use std::path::PathBuf;
 
-    #[test]
-    fn update_apply_refuses_without_a_signature() {
-        let error = update_cmd(UpdateAction::Apply).expect_err("apply must refuse");
-        assert!(error.to_string().contains("verified signature"), "{error}");
+        let missing = PathBuf::from("definitely-missing-update-input");
+        let check = UpdateAction::Check {
+            archive: missing.clone(),
+            manifest: missing.clone(),
+            signature: missing.clone(),
+            public_key: missing.clone(),
+        };
+        assert!(update_cmd(check).is_err(), "check must not report an unavailable bundle as valid");
+        let apply = UpdateAction::Apply {
+            archive: missing.clone(),
+            manifest: missing.clone(),
+            signature: missing.clone(),
+            public_key: missing,
+            install_path: Some(PathBuf::from("must-not-be-created")),
+        };
+        assert!(update_cmd(apply).is_err(), "apply must verify before creating a destination");
     }
 }

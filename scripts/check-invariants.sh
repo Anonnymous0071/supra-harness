@@ -2271,21 +2271,25 @@ if [ -d "$clisrc" ]; then
             "a probe that cannot run must say so; silence reads as a pass"
     fi
 
-    # `scan_sql`: the refusal text is a literal inside `anyhow::bail!`, and
-    # plain `scan` blanks literals - the same lesson as the thinking-display
-    # cost guard in T29. The `Ok("skipped")` above stays on `scan`: it is an
-    # identifier, not a literal.
-    if ! scan_sql "$clisrc/main.rs" 'refuses without a verified signature' | grep -q .; then
-        fail "update apply no longer refuses an unverified artefact" \
+    if ! scan "$clisrc/main.rs" 'supra_update::check_local' | grep -q .; then
+        fail "update check no longer verifies local artefacts" \
             "crates/supra_cli/src/main.rs" \
-            "fetch, verify, then apply - in that order, or it is a download"
+            "the check command must call the verifier rather than merely describe it"
     fi
 
-    if ! scan_sql "$clisrc/main.rs" 'supra_update::verify' | grep -q .; then
-        fail "update check no longer names the verifier" \
+    if ! scan "$clisrc/main.rs" 'supra_update::apply_local' | grep -q .; then
+        fail "update apply no longer verifies before installation" \
             "crates/supra_cli/src/main.rs" \
-            "the check must say what verifies the artefact, via scan_sql since the name lives in a literal"
+            "apply_local owns the verify-then-apply ordering; bypassing it turns the updater into a download"
     fi
+
+    for required in archive manifest signature public_key; do
+        if ! scan "$clisrc/args.rs" "$required: PathBuf" | grep -q .; then
+            fail "update commands no longer require $required" \
+                "crates/supra_cli/src/args.rs" \
+                "every local trust input must be explicit; no network or implicit discovery is allowed"
+        fi
+    done
 fi
 
 # Release automation is itself a trust boundary. Manual runs must check out and
@@ -2342,10 +2346,10 @@ if [ -f scripts/install.sh ]; then
             "scripts/install.sh" \
             "installation is the last trust boundary and must be tag-pinned and fail closed"
     fi
-    if ! grep -qF 'shasum -a 256 -c' scripts/install.sh; then
-        fail "the installer requires GNU sha256sum on every platform" \
+    if ! grep -qF 'python3' scripts/install.sh || ! grep -qF 'minisign -Vm' scripts/install.sh; then
+        fail "the installer no longer verifies the signed update manifest" \
             "scripts/install.sh" \
-            "stock macOS provides shasum, so advertised Darwin installation must support it"
+            "installation must authenticate the manifest before checking its archive and executable bindings"
     fi
 fi
 
@@ -2384,10 +2388,10 @@ if [ -f scripts/sign-release.sh ]; then
             "scripts/sign-release.sh" \
             "an unsigned artifact must not pass through the publication workflow"
     fi
-    if grep -qE 'artefacts=.*supra-' scripts/sign-release.sh; then
-        fail "release signing excludes publishable artifact names" \
+    if ! grep -qF 'manifest.json' scripts/sign-release.sh; then
+        fail "release signing no longer authenticates update manifests" \
             "scripts/sign-release.sh" \
-            "Debian packages and the aggregate manifest must be signed too"
+            "the signed canonical manifest is the trust root for the archive and executable binding"
     fi
 fi
 

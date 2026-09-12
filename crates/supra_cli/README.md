@@ -30,9 +30,11 @@ gate crates are not yet integrated into this provider-turn path.
 - `supra eval` runs the offline shape check.
 - `supra eval --live` performs network requests only for configured Anthropic
   and OpenAI providers with available credentials. Google is not probed.
-- `supra update check` prints verification guidance; it does not contact a
-  release service.
-- `supra update apply` is not implemented and always refuses.
+- `supra update check` verifies an explicit local archive against its canonical,
+  signed manifest and public key; it performs no network discovery.
+- `supra update apply` repeats that verification and atomically replaces an
+  explicit destination or the running executable on Unix. Windows verifies but
+  refuses application until an equivalent atomic replacement exists.
 - `--ignore-project-config` and `--sandbox off` each require `--yes`. Because
   `run` does not execute tools, the sandbox selection currently has no command
   execution path to affect.

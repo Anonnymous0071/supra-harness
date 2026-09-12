@@ -82,7 +82,7 @@ pub enum Command {
         #[arg(long, help = "Also run the provider-backed evaluation probe")]
         live: bool,
     },
-    #[command(about = "Show signed-update guidance (application is not implemented)")]
+    #[command(about = "Check or apply signed supra updates")]
     Update {
         #[command(subcommand)]
         action: UpdateAction,
@@ -96,10 +96,39 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum UpdateAction {
-    #[command(about = "Print update-availability and verification guidance")]
-    Check,
-    #[command(about = "Not implemented; always refuse without an updater path")]
-    Apply,
+    #[command(about = "Verify a signed local update bundle")]
+    Check {
+        /// Local release archive to verify.
+        #[arg(long, value_name = "PATH", required = true)]
+        archive: PathBuf,
+        /// Canonical JSON manifest signed by the release key.
+        #[arg(long, value_name = "PATH", required = true)]
+        manifest: PathBuf,
+        /// Minisign signature over the manifest bytes.
+        #[arg(long, value_name = "PATH", required = true)]
+        signature: PathBuf,
+        /// Minisign public-key file.
+        #[arg(long, value_name = "PATH", required = true)]
+        public_key: PathBuf,
+    },
+    #[command(about = "Verify and atomically apply a signed local update bundle")]
+    Apply {
+        /// Local release archive to verify and apply.
+        #[arg(long, value_name = "PATH", required = true)]
+        archive: PathBuf,
+        /// Canonical JSON manifest signed by the release key.
+        #[arg(long, value_name = "PATH", required = true)]
+        manifest: PathBuf,
+        /// Minisign signature over the manifest bytes.
+        #[arg(long, value_name = "PATH", required = true)]
+        signature: PathBuf,
+        /// Minisign public-key file.
+        #[arg(long, value_name = "PATH", required = true)]
+        public_key: PathBuf,
+        /// Destination binary; defaults to the running executable.
+        #[arg(long, value_name = "PATH")]
+        install_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -183,6 +212,32 @@ mod tests {
 
         let mut update = Cli::command().find_subcommand_mut("update").expect("update command").clone();
         let update_help = update.render_long_help().to_string();
-        assert!(update_help.contains("Not implemented; always refuse"), "{update_help}");
+        assert!(update_help.contains("Verify and atomically apply"), "{update_help}");
+
+        for action in ["check", "apply"] {
+            let error = <Cli as clap::Parser>::try_parse_from(["supra", "update", action])
+                .expect_err("all trust inputs are required");
+            let rendered = error.to_string();
+            for flag in ["--archive", "--manifest", "--signature", "--public-key"] {
+                assert!(rendered.contains(flag), "{action} did not require {flag}: {rendered}");
+            }
+        }
+
+        let apply = <Cli as clap::Parser>::try_parse_from([
+            "supra",
+            "update",
+            "apply",
+            "--archive",
+            "bundle.tar.gz",
+            "--manifest",
+            "bundle.manifest.json",
+            "--signature",
+            "bundle.manifest.json.minisig",
+            "--public-key",
+            "supra.pub",
+            "--install-path",
+            "/tmp/supra",
+        ]);
+        assert!(apply.is_ok(), "complete apply arguments should parse: {apply:?}");
     }
 }

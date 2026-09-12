@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
-# Install the latest signed supra release for this platform.
+# Install one explicitly pinned, signed supra release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Anonnymous0071/supra-harness/vX.Y.Z/scripts/install.sh |
-#     SUPRA_VERSION=vX.Y.Z SUPRA_PUBKEY='<published minisign public key>' bash
-#
-# Env: PREFIX (default ~/.local/bin), SUPRA_VERSION (required release tag),
-# SUPRA_PUBKEY (required independently published Minisign public key).
-# Verifies SHA-256 and requires a minisign signature against SUPRA_PUBKEY before
-# installing anything. Official releases are never installed checksum-only.
+# SUPRA_VERSION=vX.Y.Z SUPRA_PUBKEY='<published minisign public key>' \
+#   curl -fsSL https://raw.githubusercontent.com/Anonnymous0071/supra-harness/vX.Y.Z/scripts/install.sh | bash
 set -euo pipefail
 
 REPO="Anonnymous0071/supra-harness"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
-VERSION="${SUPRA_VERSION:-latest}"
-# Release signing key. Pass the published project key explicitly until a key is
-# embedded in a future release; absence is a refusal, never checksum-only fallback.
-PUBKEY="${SUPRA_PUBKEY:-}"
+VERSION="${SUPRA_VERSION:?install: SUPRA_VERSION must pin a release tag}"
+PUBKEY="${SUPRA_PUBKEY:?install: SUPRA_PUBKEY is required}"
+[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+    echo "install: invalid release version $VERSION" >&2
+    exit 1
+}
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 arch=$(uname -m)
@@ -27,51 +24,58 @@ case "$os-$arch" in
     *) echo "install: unsupported platform $os-$arch" >&2; exit 1 ;;
 esac
 
-if [ "$VERSION" = "latest" ]; then
-    echo "install: SUPRA_VERSION must pin the release tag used to fetch this installer" >&2
-    exit 1
-fi
-if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-    echo "install: invalid release version $VERSION" >&2
-    exit 1
-fi
-
-need() {
-    command -v "$1" >/dev/null 2>&1 || { echo "install: need $1 ($2)" >&2; exit 1; }
-}
+need() { command -v "$1" >/dev/null 2>&1 || { echo "install: need $1 ($2)" >&2; exit 1; }; }
 need curl "download releases"
-if command -v sha256sum >/dev/null 2>&1; then
-    checksum() { sha256sum -c "$1"; }
-elif command -v shasum >/dev/null 2>&1; then
-    checksum() { shasum -a 256 -c "$1"; }
-else
-    echo "install: need sha256sum or shasum (checksum verification)" >&2
-    exit 1
-fi
-need minisign "signature verification"
-[ -n "$PUBKEY" ] || {
-    echo "install: SUPRA_PUBKEY is required to verify official releases" >&2
-    exit 1
-}
+need minisign "verify manifest signature"
+need python3 "validate manifest binding"
+need tar "extract the verified executable"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cd "$tmp"
-
 base="supra-${target}"
-echo "install: fetching supra $VERSION for $target"
-curl -fsSL -O "https://github.com/$REPO/releases/download/${VERSION}/${base}"
-curl -fsSL -O "https://github.com/$REPO/releases/download/${VERSION}/${base}.sha256"
+archive="${base}.tar.gz"
+manifest="${base}.manifest.json"
+signature="${manifest}.minisig"
+url="https://github.com/$REPO/releases/download/${VERSION}"
+for file in "$archive" "$manifest" "$signature"; do
+    curl -fsSLO "$url/$file"
+done
+printf '%s\n' "$PUBKEY" > supra.pub
+minisign -Vm "$manifest" -p supra.pub -x "$signature" || { echo "install: manifest signature FAILED" >&2; exit 1; }
 
-checksum "${base}.sha256" || { echo "install: checksum FAILED" >&2; exit 1; }
-curl -fsSL -O "https://github.com/$REPO/releases/download/${VERSION}/${base}.minisig"
-echo "$PUBKEY" > supra.pub
-minisign -Vm "$base" -p supra.pub -x "${base}.minisig" || {
-    echo "install: signature FAILED" >&2
-    exit 1
-}
+python3 - "$manifest" "$archive" "${VERSION#v}" "$target" <<'PY'
+import hashlib, json, pathlib, sys, tarfile
+manifest_path, archive_path, version, target = sys.argv[1:]
+manifest_path = pathlib.Path(manifest_path)
+archive_path = pathlib.Path(archive_path)
+raw = manifest_path.read_bytes()
+data = json.loads(raw)
+if raw != (json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n").encode():
+    raise SystemExit("install: manifest is not canonical")
+if set(data) != {"archive", "archive_sha256", "archive_size", "executable", "schema", "target", "version"}:
+    raise SystemExit("install: manifest schema is not strict")
+if set(data["executable"]) != {"path", "sha256", "size"} or data["schema"] != 1:
+    raise SystemExit("install: manifest schema is not supported")
+expected_member = f"supra-{target}/{'supra.exe' if '-windows-' in target else 'supra'}"
+if data["version"] != version or data["target"] != target or data["archive"] != archive_path.name:
+    raise SystemExit("install: manifest release binding mismatch")
+blob = archive_path.read_bytes()
+if len(blob) != data["archive_size"] or hashlib.sha256(blob).hexdigest() != data["archive_sha256"]:
+    raise SystemExit("install: archive binding mismatch")
+with tarfile.open(archive_path, "r:gz") as bundle:
+    members = bundle.getmembers()
+    if len(members) != 1 or members[0].name != expected_member or not members[0].isfile():
+        raise SystemExit("install: unsafe archive members")
+    executable = bundle.extractfile(members[0]).read(128 * 1024 * 1024 + 1)
+if data["executable"]["path"] != expected_member or len(executable) != data["executable"]["size"]:
+    raise SystemExit("install: executable size binding mismatch")
+if hashlib.sha256(executable).hexdigest() != data["executable"]["sha256"]:
+    raise SystemExit("install: executable digest binding mismatch")
+pathlib.Path("supra").write_bytes(executable)
+PY
 
 mkdir -p "$PREFIX"
-install -m 755 "$base" "$PREFIX/supra"
-echo "install: supra $VERSION -> $PREFIX/supra"
+install -m 755 supra "$PREFIX/supra"
+echo "install: supra ${VERSION#v} -> $PREFIX/supra"
 "$PREFIX/supra" --version

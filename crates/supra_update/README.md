@@ -1,26 +1,28 @@
 # supra_update
 
-Signed release verification. **T30** of the stage sequence.
+Local signed update verification and Unix application. **T30** of the stage sequence.
 
-## What this stage is for
+## Trust chain
 
-`verify` checks a minisign signature over release bytes before any of
-them are applied; `parse_version` reads the tag, stripping a leading
-`v`. Fetching is the CLI's job, verification is this crate's - no
-network is opened here.
+`check_local` reads only operator-supplied local files. It verifies a Minisign
+signature over canonical manifest bytes, parses a strict schema with unknown
+fields denied, then binds the requested target and exact archive filename,
+version, compressed size and SHA-256, and the sole executable member's path,
+size, and SHA-256. There is no network or live-release probe.
 
-## Decisions
+The archive is bounded to 128 MiB and 64 headers. It must contain exactly one
+signed regular executable member; traversal, platform prefixes, links, special
+files, duplicates, unsigned extras, malformed paths, and expansion beyond the
+signed size are refused.
 
-**A bad key is a signature error, not a panic.** Every failure -
-unparseable key, undecodable signature, failed verification - returns
-`BadSignature` with the cause as text. The caller decides what a
-refusal means; this crate only says no.
+`apply_local` re-runs the archive verification while writing. On Unix it takes a
+per-destination advisory lock, rejects symlink and non-file destinations,
+records the destination identity, creates a same-directory staging file with
+`create_new`, writes mode `0755`, syncs the file, rechecks type and identity,
+atomically renames, and syncs the parent directory. Windows supports checking
+but application fails closed until equivalent replacement semantics are
+implemented.
 
-**Versions are semver with an optional `v`.** Tags ship as `v0.1.0`;
-the parser strips one leading `v` and nothing else.
-
-## Mutation results
-
-Covered by the CLI behavior probes (apply refusal, check naming)
-and three unit tests: `v`-stripping, tampered payload refusal,
-garbage-key refusal.
+Release packaging emits `supra-<target>.tar.gz` with only
+`supra-<target>/supra` and a canonical `supra-<target>.manifest.json`.
+`sign-release.sh` signs manifests only and refuses absent signing material.

@@ -138,7 +138,7 @@ jobs:
         shell: bash
         run: |
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct '${{ needs.preflight.outputs.tag }}')"
-          bash scripts/package.sh "${{ matrix.target }}"
+          bash scripts/package.sh "${{ matrix.target }}" "${{ needs.preflight.outputs.tag }}"
           if [[ "${{ matrix.target }}" == *linux* ]]; then
             bash scripts/package-os.sh "${{ matrix.target }}" "${{ needs.preflight.outputs.tag }}"
           fi
@@ -208,6 +208,12 @@ jobs:
           umask 077
           printf '%s\n' "$SIGNING_KEY" > "$MINISIGN_KEY"
           bash scripts/sign-release.sh dist
+          shopt -s nullglob
+          manifests=(dist/supra-*.manifest.json)
+          [[ ${#manifests[@]} -gt 0 ]] || { echo "release produced no update manifests" >&2; exit 1; }
+          for manifest in "${manifests[@]}"; do
+            [[ -f "${manifest}.minisig" ]] || { echo "unsigned update manifest: $manifest" >&2; exit 1; }
+          done
 
       - name: Remove signing key
         if: always()
@@ -225,7 +231,9 @@ jobs:
             curl -fsSL "https://raw.githubusercontent.com/Anonnymous0071/supra-harness/${{ needs.preflight.outputs.tag }}/scripts/install.sh" | SUPRA_VERSION="${{ needs.preflight.outputs.tag }}" SUPRA_PUBKEY='<published minisign public key>' bash
             ```
 
-            Or grab the artefact for your platform below: `.tar.gz` everywhere,
-            `.deb`/`.rpm` on Linux. The Homebrew formula is published separately
-            after its version and SHA-256 values have been updated from `SHA256SUMS`.
-            Build from source with the tag-pinned checkout instructions in the README.
+            Or grab the per-target `.tar.gz`, matching `.manifest.json`, and
+            `.manifest.json.minisig`; the required signature binds the exact archive
+            and its sole executable member. `.deb`/`.rpm` are also available on Linux.
+            The Homebrew formula is published separately after its version and SHA-256
+            values have been updated from `SHA256SUMS`. Build from source with the
+            tag-pinned checkout instructions in the README.
