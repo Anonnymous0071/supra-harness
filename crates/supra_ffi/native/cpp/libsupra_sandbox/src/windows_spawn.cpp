@@ -17,7 +17,6 @@
 #include <cwchar>
 #include <limits>
 #include <mutex>
-#include <thread>
 
 #include "internal.hpp"
 #include "supra/sandbox.h"
@@ -36,7 +35,6 @@ struct AclBackup {
 
 struct ProcessState {
     HANDLE job;
-    HANDLE process;
     wchar_t profile_name[96];
     AclBackup backups[SUPRA_SANDBOX_MAX_PATHS];
     std::size_t backup_count;
@@ -511,18 +509,6 @@ int statusFromProcess(HANDLE process, int* out_status) {
     return 1;
 }
 
-void closeDetachedState(ProcessState* state) {
-    if (state == nullptr) {
-        return;
-    }
-    if (state->process != nullptr && state->process != INVALID_HANDLE_VALUE) {
-        static_cast<void>(::WaitForSingleObject(state->process, INFINITE));
-        ::CloseHandle(state->process);
-        state->process = nullptr;
-    }
-    destroyState(state, true);
-}
-
 void releaseOwned(supra_sandbox_process* process, bool terminate_tree) {
     if (process == nullptr) {
         return;
@@ -533,9 +519,6 @@ void releaseOwned(supra_sandbox_process* process, bool terminate_tree) {
     process->native_job = 0U;
     if (native_process != nullptr && native_process != INVALID_HANDLE_VALUE) {
         ::CloseHandle(native_process);
-        if (state != nullptr && state->process == native_process) {
-            state->process = nullptr;
-        }
     }
     destroyState(state, terminate_tree);
 }
@@ -856,29 +839,10 @@ int supra_sandbox_kill(const supra_sandbox_process* process, std::uint32_t grace
 }
 
 void supra_sandbox_release(supra_sandbox_process* process) {
-    if (process == nullptr) {
-        return;
-    }
-    HANDLE native_process = reinterpret_cast<HANDLE>(process->native_process);
-    auto* state = reinterpret_cast<ProcessState*>(process->native_job);
-    process->native_process = 0U;
-    process->native_job = 0U;
-    if (state == nullptr) {
-        if (native_process != nullptr && native_process != INVALID_HANDLE_VALUE) {
-            ::CloseHandle(native_process);
-        }
-        return;
-    }
-    state->process = native_process;
-    try {
-        std::thread(closeDetachedState, state).detach();
-    } catch (...) {
-        // The library is normally built without exceptions; this branch protects
-        // embedders that compile it with exceptions enabled. Keep the tree confined
-        // rather than clearing limits or ACLs while it is still alive.
-        static_cast<void>(::TerminateJobObject(state->job, 137));
-        closeDetachedState(state);
-    }
+    // A detached Windows process cannot safely outlive the ACL grants, job limits,
+    // and AppContainer profile owned by this opaque handle. Refuse to weaken the
+    // running boundary: terminate and clean it just as a dropped owned process.
+    releaseOwned(process, true);
 }
 
 }  // extern "C"
