@@ -490,7 +490,7 @@ pub async fn send_openai(
     let client = openai_client(endpoint, credential);
     let sdk_request = openai_request(request, model, prompt_cache_key)?;
     match client.chat().create(sdk_request.clone()).await {
-        Ok(response) => Ok(blocking_completion(response, thinking)),
+        Ok(response) => blocking_completion(response, thinking),
         Err(error) if blocks_streaming(&error) => stream_openai(&client, sdk_request, thinking).await,
         Err(error) => Err(map_openai(&error)),
     }
@@ -693,7 +693,13 @@ fn tool_result_text(content: &serde_json::Value) -> Result<String, LlmError> {
 fn blocking_completion(
     response: async_openai::types::chat::CreateChatCompletionResponse,
     thinking: Thinking,
-) -> Completion {
+) -> Result<Completion, LlmError> {
+    if response.choices.is_empty() {
+        return Err(LlmError::BadResponse {
+            provider: ProviderKind::OpenAI.name().to_owned(),
+            detail: "the response contained no choices".to_owned(),
+        });
+    }
     let mut content = Vec::new();
     let mut stop_reason = StopReason::EndTurn;
     for choice in &response.choices {
@@ -710,9 +716,12 @@ fn blocking_completion(
     let usage = response.usage.map(|reported| Usage {
         input_tokens: u64::from(reported.prompt_tokens),
         output_tokens: u64::from(reported.completion_tokens),
-        cached_tokens: 0,
+        cached_tokens: reported
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens)
+            .map_or(0, u64::from),
     });
-    Completion {
+    Ok(Completion {
         content,
         stop_reason,
         stop_sequence: None,
@@ -720,7 +729,7 @@ fn blocking_completion(
         request_id: Some(response.id),
         usage,
         thinking,
-    }
+    })
 }
 
 fn openai_tool_call(call: &async_openai::types::chat::ChatCompletionMessageToolCalls) -> ContentBlock {
@@ -814,7 +823,11 @@ async fn stream_openai(
             usage = Some(Usage {
                 input_tokens: u64::from(reported.prompt_tokens),
                 output_tokens: u64::from(reported.completion_tokens),
-                cached_tokens: 0,
+                cached_tokens: reported
+                    .prompt_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens)
+                    .map_or(0, u64::from),
             });
         }
     }
@@ -902,6 +915,8 @@ fn map_openai(error: &async_openai::error::OpenAIError) -> LlmError {
                 LlmError::Unauthorized { provider, detail }
             } else if status == 429 {
                 LlmError::RateLimited { provider, retry_after_ms: 60_000 }
+            } else if (400..500).contains(&status) {
+                LlmError::BadResponse { provider, detail: format!("HTTP {status}: {detail}") }
             } else {
                 LlmError::Transport { provider, detail: format!("HTTP {status}: {detail}") }
             }
@@ -932,6 +947,34 @@ mod tests {
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
         }
+    }
+
+    fn sample_blocking_response(
+        choices: Vec<async_openai::types::chat::ChatChoice>,
+        usage: Option<async_openai::types::chat::CompletionUsage>,
+    ) -> async_openai::types::chat::CreateChatCompletionResponse {
+        async_openai::types::chat::CreateChatCompletionResponse {
+            id: "chatcmpl-test".to_owned(),
+            choices,
+            created: 0,
+            model: "m".to_owned(),
+            service_tier: None,
+            #[allow(deprecated)]
+            system_fingerprint: None,
+            object: "chat.completion".to_owned(),
+            usage,
+            metadata: None,
+            moderation: None,
+        }
+    }
+
+    #[test]
+    fn empty_openai_choices_are_a_bad_response() {
+        let error =
+            blocking_completion(sample_blocking_response(Vec::new(), None), Thinking { budget_tokens: 0 })
+                .expect_err("an empty choice list is not a successful answer");
+        assert!(matches!(error, LlmError::BadResponse { .. }), "{error}");
+        assert!(error.to_string().contains("no choices"), "{error}");
     }
 
     #[test]
@@ -1122,6 +1165,7 @@ mod tests {
     fn blocking_answers_read_text_and_usage() {
         use async_openai::types::chat::{
             ChatChoice, ChatCompletionResponseMessage, CompletionUsage, CreateChatCompletionResponse,
+            PromptTokensDetails,
         };
 
         let response = CreateChatCompletionResponse {
@@ -1151,16 +1195,20 @@ mod tests {
                 prompt_tokens: 213,
                 completion_tokens: 7,
                 total_tokens: 220,
-                prompt_tokens_details: None,
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: Some(89),
+                    ..Default::default()
+                }),
                 completion_tokens_details: None,
             }),
             metadata: None,
             moderation: None,
         };
-        let completion = blocking_completion(response, Thinking { budget_tokens: 0 });
+        let completion =
+            blocking_completion(response, Thinking { budget_tokens: 0 }).expect("valid completion");
         assert_eq!(completion.text(), "live-ok");
         let usage = completion.usage.expect("usage rides the top level");
-        assert_eq!((usage.input_tokens, usage.output_tokens), (213, 7));
+        assert_eq!((usage.input_tokens, usage.output_tokens, usage.cached_tokens), (213, 7, 89));
     }
 
     #[test]
@@ -1245,6 +1293,12 @@ mod tests {
 
         let error = map_openai(&Sdk::ApiError(response(429, "slow")));
         assert!(matches!(error, LlmError::RateLimited { retry_after_ms: 60_000, .. }), "{error}");
+
+        let error = map_openai(&Sdk::ApiError(response(400, "bad model")));
+        assert!(matches!(error, LlmError::BadResponse { .. }), "{error}");
+
+        let error = map_openai(&Sdk::ApiError(response(404, "missing endpoint")));
+        assert!(matches!(error, LlmError::BadResponse { .. }), "{error}");
 
         let error = map_openai(&Sdk::ApiError(response(500, "boom")));
         assert!(matches!(error, LlmError::Transport { .. }), "{error}");

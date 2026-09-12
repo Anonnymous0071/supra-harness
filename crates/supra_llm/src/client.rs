@@ -509,6 +509,7 @@ impl Client {
         manager: &supra_secrets::SecretManager,
         request: &Request,
     ) -> Result<Completion, LlmError> {
+        self.check_provider(request)?;
         let credential =
             config.provider_secret(request.provider.name(), manager).map_err(LlmError::Credential)?;
         self.send(request, &credential).await
@@ -795,6 +796,7 @@ impl Client {
         request: &Request,
         credential: &supra_secrets::SecretString,
     ) -> Result<Completion, LlmError> {
+        self.check_provider(request)?;
         request.check()?;
         match self.policy.kind {
             ProviderKind::Anthropic => {
@@ -820,6 +822,17 @@ impl Client {
                 .await
             }
             ProviderKind::Google => self.send_legacy(request, credential).await,
+        }
+    }
+
+    fn check_provider(&self, request: &Request) -> Result<(), LlmError> {
+        if request.provider == self.policy.kind {
+            Ok(())
+        } else {
+            Err(LlmError::ProviderMismatch {
+                client: self.policy.kind.name().to_owned(),
+                request: request.provider.name().to_owned(),
+            })
         }
     }
 
@@ -862,10 +875,13 @@ impl Client {
             });
         }
         if !status.is_success() {
-            return Err(LlmError::Transport {
-                provider: self.policy.kind.name().to_owned(),
-                detail: format!("HTTP {status}"),
-            });
+            let detail = response.text().await.unwrap_or_default();
+            let detail = format!("HTTP {status}: {detail}");
+            return if status.is_server_error() {
+                Err(LlmError::Transport { provider: self.policy.kind.name().to_owned(), detail })
+            } else {
+                Err(LlmError::BadResponse { provider: self.policy.kind.name().to_owned(), detail })
+            };
         }
 
         read_google_sse(response, request.thinking).await
@@ -876,9 +892,17 @@ impl Client {
 /// Older model families still require the budget-based request shape.
 fn anthropic_supports_adaptive_thinking(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
-    ["claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-opus-4-6", "claude-sonnet-4-6"]
-        .iter()
-        .any(|family| model.contains(family))
+    [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+    ]
+    .iter()
+    .any(|family| model.contains(family))
 }
 
 /// The endpoint as an SDK base override: `None` when the configuration
@@ -1161,11 +1185,22 @@ fn parse_usage(json: &serde_json::Value) -> Option<Usage> {
         .or_else(|| usage.get("completion_tokens"))
         .or_else(|| usage.get("candidatesTokenCount"))
         .and_then(serde_json::Value::as_u64)?;
+<<<<<<< HEAD
     let cached = usage
         .get("cache_read_input_tokens")
         .or_else(|| usage.get("cachedContentTokenCount"))
+        .or_else(|| usage.get("prompt_tokens_details").and_then(|details| details.get("cached_tokens")))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+||||||| parent of ccad8fb (fix(llm): harden provider response boundaries)
+    let cached = usage.get("cache_read_input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+=======
+    let cached = usage
+        .get("cache_read_input_tokens")
+        .or_else(|| usage.get("prompt_tokens_details").and_then(|details| details.get("cached_tokens")))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+>>>>>>> ccad8fb (fix(llm): harden provider response boundaries)
     Some(Usage { input_tokens: input, output_tokens: output, cached_tokens: cached })
 }
 
@@ -1503,11 +1538,15 @@ mod tests {
         );
 
         let openai = serde_json::json!({
-            "usage": {"prompt_tokens": 50, "completion_tokens": 10}
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 35}
+            }
         });
         assert_eq!(
             parse_usage(&openai),
-            Some(Usage { input_tokens: 50, output_tokens: 10, cached_tokens: 0 })
+            Some(Usage { input_tokens: 50, output_tokens: 10, cached_tokens: 35 })
         );
 
         assert_eq!(parse_usage(&serde_json::json!({})), None);
@@ -1523,6 +1562,50 @@ mod tests {
 
         Client::new("anthropic", "https://x.invalid".to_owned(), "m".to_owned(), 1024).expect("at the floor");
         Client::new("openai", "https://x.invalid".to_owned(), "m".to_owned(), 1).expect("no floor");
+    }
+
+    #[test]
+    fn mismatched_provider_is_refused_before_credential_resolution() {
+        let client = test_client(ProviderKind::Anthropic);
+        let request = Request {
+            provider: ProviderKind::OpenAI,
+            model: "m".to_owned(),
+            messages: vec![Message::text(Role::User, "hi")],
+            tools: Vec::new(),
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+        let config = supra_config::resolve(&[]);
+        let manager = supra_secrets::SecretManager::open_with_file_store(
+            std::env::temp_dir().join("supra-provider-mismatch-unused-secrets"),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let error = runtime
+            .block_on(client.send_with_config(&config, &manager, &request))
+            .expect_err("provider mismatch must fail before looking up the missing OpenAI credential");
+        assert!(
+            matches!(
+                error,
+                LlmError::ProviderMismatch { ref client, ref request }
+                    if client == "anthropic" && request == "openai"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn current_anthropic_families_use_adaptive_thinking() {
+        for model in [
+            "claude-opus-4-7-20260219",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5-20260901",
+            "claude-fable-5-1",
+            "claude-sonnet-4-6",
+        ] {
+            assert!(anthropic_supports_adaptive_thinking(model), "{model}");
+        }
+        assert!(!anthropic_supports_adaptive_thinking("claude-opus-4-5-20251101"));
     }
 
     #[test]

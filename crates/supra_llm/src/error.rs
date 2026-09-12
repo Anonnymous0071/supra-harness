@@ -26,6 +26,18 @@ pub enum LlmError {
         name: String,
     },
 
+    /// A request names a different provider than the configured client.
+    ///
+    /// Checked before credential resolution so a secret can never cross provider
+    /// boundaries, even when a caller mismatches public API objects.
+    #[error("{client:?} client cannot send a {request:?} request")]
+    ProviderMismatch {
+        /// Provider the client is configured to contact.
+        client: String,
+        /// Provider named by the request.
+        request: String,
+    },
+
     /// The provider refused the credential.
     ///
     /// Never retried: a 401/403 means the credential is wrong, missing, or revoked,
@@ -106,6 +118,9 @@ impl Clone for LlmError {
     fn clone(&self) -> Self {
         match self {
             Self::UnknownProvider { name } => Self::UnknownProvider { name: name.clone() },
+            Self::ProviderMismatch { client, request } => {
+                Self::ProviderMismatch { client: client.clone(), request: request.clone() }
+            }
             Self::Unauthorized { provider, detail } => {
                 Self::Unauthorized { provider: provider.clone(), detail: detail.clone() }
             }
@@ -153,6 +168,10 @@ impl PartialEq for LlmError {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::UnknownProvider { name: left }, Self::UnknownProvider { name: right }) => left == right,
+            (
+                Self::ProviderMismatch { client: left_client, request: left_request },
+                Self::ProviderMismatch { client: right_client, request: right_request },
+            ) => left_client == right_client && left_request == right_request,
             (
                 Self::Unauthorized { provider: left_provider, detail: left_detail },
                 Self::Unauthorized { provider: right_provider, detail: right_detail },
