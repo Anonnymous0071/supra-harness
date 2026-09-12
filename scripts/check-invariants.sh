@@ -2429,6 +2429,29 @@ if [ -d "$themesrc" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Workspace publication policy
+#
+# Supra is released as one signed binary bundle. The crates are implementation
+# units, not independently versioned registry packages; allowing even a leaf
+# crate to default to publishable creates a partial graph that `cargo package`
+# cannot verify as a workspace and consumers cannot resolve consistently.
+# ---------------------------------------------------------------------------
+if [ -f Cargo.toml ]; then
+    cargo metadata --no-deps --format-version 1 2>/dev/null |
+        python3 -c '
+import json
+import sys
+
+packages = json.load(sys.stdin)["packages"]
+publishable = sorted(package["name"] for package in packages if package["publish"] != [])
+if publishable:
+    raise SystemExit("workspace packages unexpectedly publishable: " + ", ".join(publishable))
+' || fail "the monolithic workspace contains registry-publishable crates" \
+        "every package must declare publish = false" \
+        "release the signed supra binary bundle, not an incomplete internal crate graph"
+fi
+
+# ---------------------------------------------------------------------------
 # Internal dependency versions track the workspace version
 #
 # A path dependency needs an explicit `version` too, or Cargo records `*` - which

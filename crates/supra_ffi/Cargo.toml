@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+publish = false
 
 # The C++ sources and headers are inputs to the build. Owning the native tree
 # inside this crate keeps registry packages self-contained and gives the root
