@@ -249,13 +249,17 @@ pub fn save_checkpoint(
     let _lock = SessionFileLock::acquire(&path)?;
 
     let found = current_revision(&path, checkpoint.session())?;
+    let observed = found.unwrap_or(0);
     if let Some(expected) = expected_revision {
-        if found != expected {
-            return Err(SessionError::RevisionConflict { expected, found });
+        if observed != expected {
+            return Err(SessionError::RevisionConflict { expected, found: observed });
         }
     }
-    if checkpoint.revision() <= found {
-        return Err(SessionError::NonMonotonicRevision { incoming: checkpoint.revision(), current: found });
+    if found.is_some_and(|current| checkpoint.revision() <= current) {
+        return Err(SessionError::NonMonotonicRevision {
+            incoming: checkpoint.revision(),
+            current: observed,
+        });
     }
 
     let document = CheckpointDocument { format: "supra-session", version: CHECKPOINT_VERSION, checkpoint };
@@ -434,8 +438,8 @@ fn merge_legacy_projection(
     Ok(candidate)
 }
 
-fn current_revision(path: &Path, session: SessionId) -> Result<u64, SessionError> {
-    Ok(read_checkpoint_if_present(path, session)?.map_or(0, |checkpoint| checkpoint.revision()))
+fn current_revision(path: &Path, session: SessionId) -> Result<Option<u64>, SessionError> {
+    Ok(read_checkpoint_if_present(path, session)?.map(|checkpoint| checkpoint.revision()))
 }
 
 fn publish_unlocked(
@@ -599,6 +603,20 @@ mod tests {
         let error = save_checkpoint(&dir, &stale, Some(stale.revision() - 1)).expect_err("stale");
         assert!(matches!(error, SessionError::RevisionConflict { .. }), "{error}");
         assert_eq!(load_checkpoint(&dir, session).expect("load").expect("present"), second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_revision_zero_checkpoint_can_be_published_once() {
+        let dir = scratch();
+        let session = SessionId::generate();
+        let checkpoint = SessionCheckpoint::new(session);
+
+        save_checkpoint(&dir, &checkpoint, Some(0)).expect("first revision-zero commit");
+        assert_eq!(load_checkpoint(&dir, session).expect("load"), Some(checkpoint.clone()));
+
+        let replay = save_checkpoint(&dir, &checkpoint, Some(0)).expect_err("replay must fail");
+        assert!(matches!(replay, SessionError::NonMonotonicRevision { incoming: 0, current: 0 }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
