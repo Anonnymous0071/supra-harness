@@ -58,15 +58,16 @@ impl Skills {
     pub fn load(directory: impl AsRef<Path>) -> Result<Self, SkillError> {
         let directory = directory.as_ref();
         let mut loaded = Skills::default();
-        let mut files: Vec<PathBuf> = std::fs::read_dir(directory)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .filter_map(|skill_dir| {
-                let manifest = skill_dir.join("SKILL.md");
-                manifest.is_file().then_some(manifest)
-            })
-            .collect();
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                let manifest = path.join("SKILL.md");
+                if manifest.is_file() {
+                    files.push(manifest);
+                }
+            }
+        }
         files.sort();
 
         for path in files {

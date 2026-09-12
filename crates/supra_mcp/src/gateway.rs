@@ -128,9 +128,9 @@ impl Gateway {
             .await?;
         let init: InitializeResult = serde_json::from_value(result)
             .map_err(|error| McpError::Protocol(format!("initialize result: {error}")))?;
-        if init.protocol_version.is_empty() {
+        if init.protocol_version != PROTOCOL_VERSION {
             return Err(McpError::ProtocolVersion {
-                server: "<empty>".to_owned(),
+                server: init.protocol_version,
                 gateway: PROTOCOL_VERSION,
             });
         }
@@ -425,6 +425,41 @@ while True:
         std::fs::create_dir_all(&dir).expect("dir");
         let db = dir.join("mcp.db");
         std::sync::Arc::new(Store::open(&db).expect("store"))
+    }
+
+    fn incompatible_version_endpoint() -> Endpoint {
+        let script = r#"
+import sys, json
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("method") == "initialize":
+        result = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "old"}}
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+"#;
+        Endpoint::Stdio {
+            argv: vec!["python3".to_owned(), "-u".to_owned(), "-c".to_owned(), script.to_owned()],
+            env: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_negotiated_version_is_refused() {
+        let (_gateway, refusals) = Gateway::probe(
+            store(),
+            vec![ServerConfig { name: "old".to_owned(), endpoint: incompatible_version_endpoint() }],
+        )
+        .await;
+
+        assert_eq!(refusals.len(), 1, "the incompatible server must be refused");
+        assert!(
+            matches!(
+                &refusals[0].1,
+                McpError::ProtocolVersion { server, gateway }
+                    if server == "2024-11-05" && *gateway == PROTOCOL_VERSION
+            ),
+            "{:?}",
+            refusals[0].1
+        );
     }
 
     /// A server that paginates: page one holds `alpha`, the second page
