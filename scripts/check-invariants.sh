@@ -1820,13 +1820,10 @@ if [ -d "$pluginsrc" ]; then
             "a verify-less caller must still be refused; the paranoid path is the pinned path"
     fi
 
-    # The fuel trap is classified by name: grepping the chain is the
-    # classifier, and the word it greps for is load-bearing - M6's
-    # mutation greps for nothing.
-    # `scan_sql`, not `scan`: the classifier's subject is the string
-    # literal "fuel" itself, which `scan` blanks by design - the same
-    # case as T17's instruction guard.
-    classified=$(scan_sql "$pluginsrc/host.rs" 'message\.contains\("fuel"\)')
+    # Fuel exhaustion is classified by Wasmtime's typed trap rather than
+    # matching display text. This remains load-bearing: deleting the
+    # OutOfFuel arm turns budget exhaustion into an undifferentiated trap.
+    classified=$(scan "$pluginsrc/host.rs" 'error\.downcast_ref::<Trap>\(\) == Some\(&Trap::OutOfFuel\)')
     if [ -z "$classified" ]; then
         fail "the fuel trap is no longer classified" \
             "crates/supra_plugin/src/host.rs" \
