@@ -382,10 +382,17 @@ which disappears on reconciliation. A divergence above 10% emits
 `Event::UsageDrift`: the token counter needs calibration, and that is worth
 knowing.
 
-Never shed at any width: context %, cache %, session spend, the cache-break
-marker, and the permission mode - the mode joins the four because a silently
-changed mode is a consent the operator never gave. An invisible cost leak is
-the failure this design exists to prevent.
+Protected from priority shedding: context %, cache %, session spend, the
+cache-break marker, and permission mode - the mode joins the four because a
+silently changed mode is a consent the operator never gave. Before any
+protected concept is clipped, T29 switches them to compact labels and removes
+optional status segments. That compact set has a finite physical minimum (for
+representative two-digit percentages and a live sub-dollar estimate, 18 cells
+with the marker and 16 without it); below the applicable minimum, a single line
+cannot identify every concept simultaneously and truncates to the terminal's
+actual cell budget. An invisible cost leak is the failure this design exists to
+prevent, but `NEVER_SHED` is a priority guarantee, not a claim that rendering
+can create cells.
 
 ---
 

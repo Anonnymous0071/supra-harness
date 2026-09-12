@@ -7,14 +7,16 @@
 //! (T28.5 tokens), every gauge goes through `gauge_for` - never an
 //! embedded escape sequence, never a fixed cell cost.
 //!
-//! The status line sheds by priority as the terminal narrows, but four
-//! segments never shed: context %, cache %, session spend, and the
-//! cache-break marker. An invisible cost leak is the failure this
-//! design exists to prevent.
+//! The status line sheds by priority as the terminal narrows. Five
+//! protected concepts use compact forms before the complete set reaches
+//! its documented physical minimum: context %, cache %, session spend,
+//! the cache-break marker, and permission mode. Below that minimum the
+//! renderer truncates honestly rather than claiming impossible visibility.
 //!
 //! The thinking display is read-only: `∵ Thinking…` while streaming,
-//! `∴ Thought for Ns (ctrl+o to collapse)` after - no cost preview, the
-//! tokens are billed either way.
+//! `∴ Thought for Ns (ctrl+o to collapse)` after - completed details are
+//! cell- and row-bounded and visible only while expanded. There is no cost
+//! preview; the tokens are billed either way.
 
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::print_stderr))]
@@ -43,7 +45,7 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<StatusLine>();
     assert_send_sync::<Meter>();
-    assert_send_sync::<ThinkingDisplay>();
+    assert_send_sync::<ThinkingDisplay<'_>>();
     assert_send_sync::<Viewport>();
     assert_send_sync::<Spinner>();
     assert_send_sync::<Panel>();

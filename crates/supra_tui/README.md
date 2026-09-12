@@ -19,12 +19,14 @@ shows.
 
 ## Decisions
 
-**Five segments never shed.** Context %, cache %, session spend, the
-cache-break marker, and the permission mode survive any width - §7
-names four, and the mode joins them because a silently changed mode is
-a consent the operator never gave. Everything else sheds from the
-lowest priority down; a single over-wide never-shed truncates rather
-than vanishes.
+**Five concepts are protected from priority shedding.** Context %, cache %,
+session spend, the conditional cache-break marker, and permission mode
+switch to compact labels (`c`, `h`, `$…m`, `!`, `m`) before any protected
+concept is clipped. With representative two-digit percentages and a live
+sub-dollar estimate, all five fit in 18 cells (16 without a cache break).
+A narrower single line cannot identify every concept simultaneously, so
+it truncates the complete compact line to the physical cell budget rather
+than pretending `NEVER_SHED` can create cells. Everything else sheds first.
 
 **Cost is mills, not cents.** `Cost { mills }` renders `+$0.014~`
 while estimated, `+$0.014` once reconciled - the §7 shape with three
@@ -38,8 +40,10 @@ portable `#`/`.` pair instead.
 
 **The thinking display carries no cost.** `∵ Thinking…` while
 streaming, `∴ Thought for Ns (ctrl+o to …)` after - read-only,
-toggled by `ctrl+o` alone. Thinking tokens are billed either way; a
-preview would price the wrong surface.
+toggled by `ctrl+o` alone. Completed details are retained externally,
+shown only while expanded, stripped of terminal controls, and bounded by
+both caller-supplied rows and display cells. Thinking tokens are billed
+either way; a preview would price the wrong surface.
 
 **The viewport clamps twice.** `new` clamps the offset, and
 `visible_range` clamps again - a struct built field-by-field skips
