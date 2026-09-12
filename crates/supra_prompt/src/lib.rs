@@ -56,13 +56,15 @@ pub mod evict;
 pub mod generation;
 pub mod ledger;
 
-pub use breakpoints::{Plan, check_lookback, find_reversal, plan_breakpoints, truncate_for_policy, validate};
+pub use breakpoints::{
+    Plan, check_lookback, find_reversal, plan_breakpoints, plan_breakpoints_at, truncate_for_policy, validate,
+};
 pub use error::PromptError;
 pub use evict::{
     ThinkingDisposition, evict_turn, index_entry, index_segment, plan_eviction, recall_turn, render_body,
 };
 pub use generation::{needs_rewrite, rewrite, verify_rewrite};
-pub use ledger::{Generation, PromptLedger};
+pub use ledger::{Generation, LedgerSnapshot, PromptLedger};
 
 /// The ledger is shared between the turn loop and recall tasks, so this is a
 /// requirement rather than an observation.

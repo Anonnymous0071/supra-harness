@@ -61,15 +61,43 @@ impl Plan {
 /// offset silently moves a cache boundary onto the wrong segment.
 ///
 /// BP4 defaults to the full length: with no turn boundary information the only honest
-/// position is "everything so far". T23 narrows it to turn n-1 once the turn loop
-/// owns turn tracking; the plan never guesses a boundary it was not given.
+/// position is "everything so far". Call [`plan_breakpoints_at`] when the turn loop
+/// owns the explicit end of turn n-1; this compatibility wrapper never guesses a
+/// boundary it was not given.
 ///
 /// # Errors
 ///
 /// [`crate::error::PromptError::RegionOrder`] when the regions do not appear
 /// in prefix order.
 pub fn plan_breakpoints(segments: &[Sealed<Segment>]) -> Result<Plan, crate::error::PromptError> {
+    plan_breakpoints_at(segments, segments.len())
+}
+
+/// Lay the four breakpoints over a segment sequence using an explicit BP4 boundary.
+///
+/// `previous_turn_end` is the ledger offset one past the final segment of turn n-1.
+/// The turn driver supplies it before appending the current turn, so BP4 rolls at the
+/// completed-turn boundary instead of being guessed from segment kinds. It must not
+/// exceed the sequence length and must not precede BP3; either shape would reverse a
+/// cache boundary and is refused.
+///
+/// # Errors
+///
+/// [`crate::error::PromptError::InvalidSnapshot`] when `previous_turn_end` is outside
+/// the segment sequence or before the memory-index boundary.
+/// [`crate::error::PromptError::RegionOrder`] when the regions do not appear in prefix
+/// order.
+pub fn plan_breakpoints_at(
+    segments: &[Sealed<Segment>],
+    previous_turn_end: usize,
+) -> Result<Plan, crate::error::PromptError> {
     use supra_types::SegmentKind;
+
+    if previous_turn_end > segments.len() {
+        return Err(crate::error::PromptError::InvalidSnapshot {
+            detail: format!("BP4 offset {previous_turn_end} exceeds the ledger length {}", segments.len()),
+        });
+    }
 
     let mut bp1_tools = 0;
     let mut bp2_system = 0;
@@ -99,7 +127,13 @@ pub fn plan_breakpoints(segments: &[Sealed<Segment>]) -> Result<Plan, crate::err
         }
     }
 
-    Ok(Plan { bp1_tools, bp2_system, bp3_memory, bp4_previous: segments.len() })
+    if previous_turn_end < bp3_memory {
+        return Err(crate::error::PromptError::InvalidSnapshot {
+            detail: format!("BP4 offset {previous_turn_end} precedes BP3 offset {bp3_memory}"),
+        });
+    }
+
+    Ok(Plan { bp1_tools, bp2_system, bp3_memory, bp4_previous: previous_turn_end })
 }
 
 fn region_order(earlier: &'static str, later: &'static str) -> crate::error::PromptError {

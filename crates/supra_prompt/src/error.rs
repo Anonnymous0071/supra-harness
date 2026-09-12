@@ -106,4 +106,15 @@ pub enum PromptError {
         /// The region it followed.
         later: &'static str,
     },
+
+    /// A persisted ledger snapshot violates an append-only ledger invariant.
+    ///
+    /// Snapshots cross a trust boundary. Refusing the entire snapshot is safer
+    /// than repairing counters, positions, or generation seals: repair would
+    /// make the resumed prefix differ from the prefix that was persisted.
+    #[error("the ledger snapshot is invalid: {detail}")]
+    InvalidSnapshot {
+        /// Which persisted invariant failed.
+        detail: String,
+    },
 }

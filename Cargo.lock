@@ -3355,6 +3355,8 @@ dependencies = [
 name = "supra_prompt"
 version = "0.2.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "supra_store",
  "supra_types",
  "thiserror",
