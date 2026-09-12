@@ -35,7 +35,7 @@ pub(crate) async fn execute_turn(
     let provider = select_provider(config, requested_provider)?;
     let client = supra_llm::Client::from_config(config, provider)?;
     let credential = config.provider_secret(provider, secrets)?;
-    let (_, cohort_size) = plan_turn(config, estimate_tier())
+    let (_, cohort_size) = plan_turn(config, estimate_tier(task))
         .admitted
         .ok_or_else(|| anyhow::anyhow!("cohort limit leaves no admissible turn"))?;
     let agents: Vec<supra_types::AgentId> =
@@ -183,10 +183,58 @@ pub(crate) fn plan_turn(config: &Config, requested: supra_types::Tier) -> Plan {
     Plan { admitted: supra_types::admit(requested, config.cohort_limit()) }
 }
 
-pub(crate) fn estimate_tier() -> supra_types::Tier {
-    let signals = supra_cohort::Signals::minimal();
-    let areas = supra_cohort::AreaFlags::none();
+pub(crate) fn estimate_tier(task: &str) -> supra_types::Tier {
+    let paths: Vec<&str> = task
+        .split_whitespace()
+        .filter(|word| word.contains('/') || word.contains('\\'))
+        .map(|word| {
+            word.trim_matches(|character: char| {
+                character.is_ascii_punctuation() && character != '/' && character != '\\'
+            })
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut signals = supra_cohort::Signals::minimal();
+    signals.anchors = supra_cohort::AnchorBand::of(paths.len().min(10));
+    if paths.len() > 1 {
+        signals.blast = supra_cohort::BlastBand::Contained;
+    }
+    if task_is_mutating(task) {
+        signals.reversibility = supra_types::Reversibility::R1;
+    }
+    let areas = supra_cohort::AreaFlags::of_paths(&paths);
     supra_cohort::estimate(&signals, &areas)
+}
+
+fn task_is_mutating(task: &str) -> bool {
+    const MUTATING_WORDS: &[&str] = &[
+        "add",
+        "apply",
+        "build",
+        "change",
+        "commit",
+        "create",
+        "delete",
+        "edit",
+        "fix",
+        "implement",
+        "install",
+        "migrate",
+        "modify",
+        "move",
+        "publish",
+        "refactor",
+        "release",
+        "remove",
+        "rename",
+        "replace",
+        "run",
+        "save",
+        "update",
+        "write",
+    ];
+    task.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|word| MUTATING_WORDS.contains(&word.to_ascii_lowercase().as_str()))
 }
 
 #[cfg(test)]
@@ -211,8 +259,12 @@ mod tests {
     }
 
     #[test]
-    fn a_minimal_task_estimates_e0() {
-        assert_eq!(estimate_tier(), supra_types::Tier::E0);
+    fn task_evidence_selects_nonminimal_tiers() {
+        assert_eq!(estimate_tier("explain"), supra_types::Tier::E0);
+        assert_eq!(estimate_tier("fix bug"), supra_types::Tier::E1);
+        assert_eq!(estimate_tier("review src/lib.rs"), supra_types::Tier::E1);
+        assert_eq!(estimate_tier("compare src/lib.rs tests/lib.rs"), supra_types::Tier::E2);
+        assert_eq!(estimate_tier("fix src/auth/session.rs"), supra_types::Tier::E4);
     }
 
     #[test]
