@@ -70,8 +70,13 @@ pub enum LogFormatArg {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    #[command(about = "Start an interactive supra session")]
-    Run,
+    #[command(about = "Execute one peer-validated provider turn")]
+    Run {
+        #[arg(long, value_name = "NAME", help = "Use the configured provider NAME")]
+        provider: Option<String>,
+        #[arg(required = true, trailing_var_arg = true, help = "Task to send to the provider cohort")]
+        task: Vec<String>,
+    },
     #[command(about = "Run the offline evaluation suite")]
     Eval {
         #[arg(long, help = "Also run the provider-backed evaluation probe")]
@@ -169,7 +174,12 @@ mod tests {
         let top_help = top.render_long_help().to_string();
         assert!(top_help.contains("Confirm security-sensitive"), "{top_help}");
         assert!(top_help.contains("Enable or disable sandboxing"), "{top_help}");
-        assert!(top_help.contains("Start an interactive supra session"), "{top_help}");
+        assert!(top_help.contains("Execute one peer-validated provider turn"), "{top_help}");
+
+        let mut run = Cli::command().find_subcommand_mut("run").expect("run command").clone();
+        let run_help = run.render_long_help().to_string();
+        assert!(run_help.contains("configured provider"), "{run_help}");
+        assert!(run_help.contains("Task to send"), "{run_help}");
 
         let mut update = Cli::command().find_subcommand_mut("update").expect("update command").clone();
         let update_help = update.render_long_help().to_string();

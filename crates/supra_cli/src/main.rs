@@ -1,6 +1,6 @@
 //! `supra` — the single binary for T30.
 //!
-//! One binary, subcommands `run` (default), `eval`, `update`, `config show`.
+//! One binary, subcommands `run`, `eval`, `update`, `config show`.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -21,32 +21,38 @@ fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
     cli.validate()?;
 
-    let command = cli.command.take().unwrap_or(Command::Run);
+    let command = cli
+        .command
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("a command is required; run `supra run --help` to execute a task"))?;
     match command {
-        Command::Run => run(cli),
+        Command::Run { provider, task } => run(cli, provider.as_deref(), &task.join(" ")),
         Command::Eval { live } => eval_cmd(live),
         Command::Update { action } => update_cmd(action),
         Command::Config { action } => config_cmd(&cli, action),
     }
 }
 
-fn run(cli: Cli) -> anyhow::Result<()> {
+fn run(cli: Cli, provider: Option<&str>, task: &str) -> anyhow::Result<()> {
     let config = startup::discover_resolve(&cli)?;
     let log = startup::init_logging(&cli)?;
     let secrets = startup::open_secrets(&cli);
-    let _ = secrets.primary_backend();
     let sandbox_off = cli.sandbox == SandboxArg::Off;
     let wired = registry::wire(&config);
     let assembled = startup::assemble(config, log, sandbox_off);
-    let estimated = runtime::estimate_tier();
-    let planned = runtime::plan_turn(&assembled.config, estimated);
-    println!(
-        "mode {} cohort {} sessions {} | {}",
-        assembled.config.permission_mode().label(),
-        assembled.config.cohort_limit(),
-        wired.session_dir.display(),
-        runtime::describe(&planned)
-    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("tokio runtime: {error}"))?;
+    let result = runtime.block_on(runtime::execute_turn(
+        &assembled.config,
+        &secrets,
+        &wired.session_dir,
+        provider,
+        task,
+    ))?;
+    println!("session {}", result.session);
+    println!("{}", result.answer);
     Ok(())
 }
 
@@ -66,7 +72,7 @@ fn eval_cmd(live: bool) -> anyhow::Result<()> {
 }
 
 async fn live_probe() -> anyhow::Result<()> {
-    let cli = Cli::try_parse_from(["supra"])?;
+    let cli = Cli::try_parse_from(["supra", "eval", "--live"])?;
     let config = startup::discover_resolve(&cli)?;
     let secrets = startup::open_secrets(&cli);
 
@@ -151,7 +157,7 @@ mod tests {
     fn the_live_probe_skips_providers_with_no_credential() {
         // An empty environment names no provider, so the probe has
         // nothing to call: absence is `Ok`, not a refusal.
-        let cli = Cli::try_parse_from(["supra"]).expect("args parse");
+        let cli = Cli::try_parse_from(["supra", "eval"]).expect("args parse");
         let config = startup::discover_resolve(&cli).expect("empty env resolves");
         assert!(config.providers().is_empty(), "no providers without configuration");
     }
@@ -160,7 +166,7 @@ mod tests {
     fn a_configured_provider_without_a_credential_is_named_not_panicked() {
         // The probe resolves the secret through the manager; a missing
         // credential is a skip with the provider named, never a panic.
-        let cli = Cli::try_parse_from(["supra"]).expect("args parse");
+        let cli = Cli::try_parse_from(["supra", "eval"]).expect("args parse");
         let config = startup::discover_resolve(&cli).expect("resolves");
         let secrets = startup::open_secrets(&cli);
         for name in ["anthropic", "openai"] {

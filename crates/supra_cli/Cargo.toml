@@ -28,6 +28,9 @@ supra_theme = { workspace = true }
 supra_command = { workspace = true }
 supra_cohort = { workspace = true }
 supra_core = { workspace = true }
+supra_blackboard = { workspace = true }
+supra_eventbus = { workspace = true }
+supra_prompt = { workspace = true }
 supra_session = { workspace = true }
 supra_hook = { workspace = true }
 supra_mcp = { workspace = true }
