@@ -566,7 +566,7 @@ impl Client {
         match self.policy.kind {
             ProviderKind::Anthropic => Self::render_anthropic(request, &mut body),
             ProviderKind::OpenAI => Self::render_openai(request, &mut body),
-            ProviderKind::Google => Self::render_google(request, &mut body),
+            ProviderKind::Google => Self::render_google(request, &mut body)?,
         }
         crate::canonicalize_value(&serde_json::Value::Object(body))
     }
@@ -654,44 +654,71 @@ impl Client {
         body.insert("prompt_cache_key".to_owned(), serde_json::Value::String("supra-prefix".to_owned()));
     }
 
-    fn render_google(request: &Request, body: &mut serde_json::Map<String, serde_json::Value>) {
-        let contents: Vec<serde_json::Value> = request
-            .messages
-            .iter()
-            .map(|message| {
-                let parts: Vec<serde_json::Value> = message
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text, .. } => Some(serde_json::json!({"text": text})),
-                        ContentBlock::ToolUse { name, input, .. } => {
-                            Some(serde_json::json!({"functionCall": {"name": name, "args": input}}))
+    fn render_google(
+        request: &Request,
+        body: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), crate::CanonicalError> {
+        let mut function_names = std::collections::BTreeMap::new();
+        for message in &request.messages {
+            if message.role != Role::Assistant {
+                continue;
+            }
+            for block in &message.content {
+                if let ContentBlock::ToolUse { id, name, .. } = block {
+                    function_names.insert(id.as_str(), name.as_str());
+                }
+            }
+        }
+
+        let mut contents = Vec::with_capacity(request.messages.len());
+        for message in &request.messages {
+            let mut parts = Vec::with_capacity(message.content.len());
+            for block in &message.content {
+                match block {
+                    ContentBlock::Text { text, .. } => {
+                        parts.push(serde_json::json!({"text": text}));
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        let mut call = serde_json::json!({"name": name, "args": input});
+                        if !id.is_empty() {
+                            call["id"] = serde_json::Value::String(id.clone());
                         }
-                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                            Some(serde_json::json!({"functionResponse": {
-                                "name": tool_use_id,
-                                "response": {"content": content, "is_error": is_error},
-                            }}))
+                        parts.push(serde_json::json!({"functionCall": call}));
+                    }
+                    ContentBlock::ToolResult { tool_use_id, content, is_error: _ } => {
+                        let name = function_names.get(tool_use_id.as_str()).ok_or_else(|| {
+                            crate::CanonicalError::Invalid {
+                                detail: format!(
+                                    "Google tool result {tool_use_id:?} has no matching function call"
+                                ),
+                            }
+                        })?;
+                        let mut response = serde_json::json!({
+                            "name": name,
+                            "response": content,
+                        });
+                        if !tool_use_id.is_empty() {
+                            response["id"] = serde_json::Value::String(tool_use_id.clone());
                         }
-                        ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. }
-                        | ContentBlock::Unknown { .. } => None,
-                    })
-                    .collect();
-                serde_json::json!({
-                    "role": match message.role {
-                        Role::User => "user",
-                        Role::Assistant => "model",
-                    },
-                    "parts": parts,
-                })
-            })
-            .collect();
+                        parts.push(serde_json::json!({"functionResponse": response}));
+                    }
+                    ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::Unknown { .. } => {}
+                }
+            }
+            contents.push(serde_json::json!({
+                "role": match message.role {
+                    Role::User => "user",
+                    Role::Assistant => "model",
+                },
+                "parts": parts,
+            }));
+        }
         body.insert("contents".to_owned(), serde_json::Value::Array(contents));
         if !request.tools.is_empty() {
-            if let Ok(tools) = Self::tools_value(request) {
-                body.insert("tools".to_owned(), serde_json::json!([{"function_declarations": tools}]));
-            }
+            let declarations = Self::google_tools_value(request)?;
+            body.insert("tools".to_owned(), serde_json::json!([{"functionDeclarations": declarations}]));
         }
         if request.thinking.enabled() {
             body.insert(
@@ -701,6 +728,25 @@ impl Client {
                 }),
             );
         }
+        Ok(())
+    }
+
+    fn google_tools_value(request: &Request) -> Result<serde_json::Value, crate::CanonicalError> {
+        let parsed = Self::tools_value(request)?;
+        let serde_json::Value::Array(mut declarations) = parsed else {
+            return Err(crate::CanonicalError::Invalid {
+                detail: "Google tool declarations are not an array".to_owned(),
+            });
+        };
+        for declaration in &mut declarations {
+            let object = declaration.as_object_mut().ok_or_else(|| crate::CanonicalError::Invalid {
+                detail: "Google tool declaration is not an object".to_owned(),
+            })?;
+            if let Some(input_schema) = object.remove("input_schema") {
+                object.insert("parameters".to_owned(), input_schema);
+            }
+        }
+        Ok(serde_json::Value::Array(declarations))
     }
 
     fn messages_value(request: &Request) -> serde_json::Value {
@@ -891,6 +937,115 @@ fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
     60_000
 }
 
+/// Native Google stream state. `generateContent` returns candidate parts rather than
+/// OpenAI-style deltas; keeping ordered blocks here lets a function call replay byte-for-byte.
+#[derive(Default)]
+struct GoogleStreamState {
+    content: Vec<ContentBlock>,
+    stop_reason: Option<StopReason>,
+    model: String,
+    request_id: Option<String>,
+    usage: Option<Usage>,
+    saw_tool_use: bool,
+}
+
+impl GoogleStreamState {
+    fn apply_event(&mut self, json: &serde_json::Value) -> Result<(), String> {
+        let candidate = json
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|candidates| candidates.first());
+        if let Some(candidate) = candidate {
+            if let Some(parts) = candidate
+                .get("content")
+                .and_then(|content| content.get("parts"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                        self.content.push(ContentBlock::text(text));
+                    }
+                    if let Some(call) = part.get("functionCall") {
+                        let name = call
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| "Google functionCall has no string name".to_owned())?;
+                        let id = call.get("id").and_then(serde_json::Value::as_str).unwrap_or_default();
+                        let input = call
+                            .get("args")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                        self.content.push(ContentBlock::ToolUse {
+                            id: id.to_owned(),
+                            name: name.to_owned(),
+                            input,
+                        });
+                        self.saw_tool_use = true;
+                    }
+                }
+            }
+            if let Some(reason) = candidate.get("finishReason").and_then(serde_json::Value::as_str) {
+                let parsed = parse_stop_reason(reason);
+                self.stop_reason = Some(if self.saw_tool_use && parsed == StopReason::EndTurn {
+                    StopReason::ToolUse
+                } else {
+                    parsed
+                });
+            }
+        } else {
+            if let Some(delta) =
+                json.get("delta").and_then(|delta| delta.get("text")).and_then(serde_json::Value::as_str)
+            {
+                self.content.push(ContentBlock::text(delta));
+            } else if let Some(delta) =
+                json.get("choices").and_then(|choices| choices.get(0)).and_then(|choice| {
+                    choice
+                        .get("delta")
+                        .and_then(|delta| delta.get("content"))
+                        .and_then(serde_json::Value::as_str)
+                })
+            {
+                self.content.push(ContentBlock::text(delta));
+            }
+            if let Some(reason) = json.get("stop_reason").and_then(serde_json::Value::as_str).or_else(|| {
+                json.get("choices")
+                    .and_then(|choices| choices.get(0))
+                    .and_then(|choice| choice.get("finish_reason"))
+                    .and_then(serde_json::Value::as_str)
+            }) {
+                self.stop_reason = Some(parse_stop_reason(reason));
+            }
+        }
+
+        if let Some(model) =
+            json.get("modelVersion").or_else(|| json.get("model")).and_then(serde_json::Value::as_str)
+        {
+            model.clone_into(&mut self.model);
+        }
+        if let Some(id) =
+            json.get("responseId").or_else(|| json.get("id")).and_then(serde_json::Value::as_str)
+        {
+            self.request_id = Some(id.to_owned());
+        }
+        if let Some(usage) = parse_usage(json) {
+            self.usage = Some(usage);
+        }
+        Ok(())
+    }
+
+    fn into_completion(self, stop_reason: StopReason, thinking: Thinking) -> Completion {
+        Completion {
+            content: self.content,
+            stop_reason,
+            stop_sequence: None,
+            model: self.model,
+            request_id: self.request_id,
+            usage: self.usage,
+            thinking,
+        }
+    }
+}
+
 /// Read a server-sent-event stream into a completion.
 ///
 /// Splits on event boundaries (`\n\n`), parses each `data:` payload, accumulates `text`
@@ -910,11 +1065,7 @@ async fn read_google_sse(response: reqwest::Response, thinking: Thinking) -> Res
     let provider = response.url().host_str().unwrap_or("unknown").to_owned();
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
-    let mut text = String::new();
-    let mut usage: Option<Usage> = None;
-    let mut stop_reason = None;
-    let mut model = String::new();
-    let mut request_id = None;
+    let mut state = GoogleStreamState::default();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
@@ -928,15 +1079,12 @@ async fn read_google_sse(response: reqwest::Response, thinking: Thinking) -> Res
                 let Some(payload) = line.strip_prefix("data:") else { continue };
                 let payload = payload.trim();
                 if payload == "[DONE]" {
-                    return Ok(Completion {
-                        content: vec![ContentBlock::text(text)],
-                        stop_reason: stop_reason.unwrap_or(StopReason::EndTurn),
-                        stop_sequence: None,
-                        model,
-                        request_id,
-                        usage,
-                        thinking,
+                    let stop_reason = state.stop_reason.take().unwrap_or(if state.saw_tool_use {
+                        StopReason::ToolUse
+                    } else {
+                        StopReason::EndTurn
                     });
+                    return Ok(state.into_completion(stop_reason, thinking));
                 }
                 let json: serde_json::Value =
                     serde_json::from_str(payload).map_err(|_| LlmError::BadResponse {
@@ -959,72 +1107,34 @@ async fn read_google_sse(response: reqwest::Response, thinking: Thinking) -> Res
                         .unwrap_or("the provider sent an error object");
                     return Err(LlmError::BadResponse { provider, detail: detail.to_owned() });
                 }
-                if let Some(delta) =
-                    json.get("delta").and_then(|delta| delta.get("text")).and_then(serde_json::Value::as_str)
-                {
-                    text.push_str(delta);
-                } else if let Some(delta) =
-                    json.get("choices").and_then(|choices| choices.get(0)).and_then(|choice| {
-                        choice
-                            .get("delta")
-                            .and_then(|delta| delta.get("content"))
-                            .and_then(serde_json::Value::as_str)
-                    })
-                {
-                    text.push_str(delta);
-                }
-                if let Some(reported_model) = json.get("model").and_then(serde_json::Value::as_str) {
-                    reported_model.clone_into(&mut model);
-                }
-                if let Some(reported_id) = json.get("id").and_then(serde_json::Value::as_str) {
-                    request_id = Some(reported_id.to_owned());
-                }
-                if let Some(reason) =
-                    json.get("stop_reason").and_then(serde_json::Value::as_str).or_else(|| {
-                        json.get("choices")
-                            .and_then(|choices| choices.get(0))
-                            .and_then(|choice| choice.get("finish_reason"))
-                            .and_then(serde_json::Value::as_str)
-                    })
-                {
-                    stop_reason = Some(parse_stop_reason(reason));
-                }
-                // Usage arrives on the final event (Anthropic) or as usage (OpenAI).
-                if let Some(reported) = parse_usage(&json) {
-                    usage = Some(reported);
-                }
+                state
+                    .apply_event(&json)
+                    .map_err(|detail| LlmError::BadResponse { provider: provider.clone(), detail })?;
             }
         }
     }
-    let Some(stop_reason) = stop_reason else {
-        let detail = if text.is_empty() {
+    let Some(stop_reason) = state.stop_reason.take() else {
+        let detail = if state.content.is_empty() {
             "the stream ended with no events".to_owned()
         } else {
             "the stream ended before a terminal marker".to_owned()
         };
         return Err(LlmError::BadResponse { provider, detail });
     };
-    Ok(Completion {
-        content: vec![ContentBlock::text(text)],
-        stop_reason,
-        stop_sequence: None,
-        model,
-        request_id,
-        usage,
-        thinking,
-    })
+    Ok(state.into_completion(stop_reason, thinking))
 }
 
 fn parse_stop_reason(reason: &str) -> StopReason {
     match reason {
-        "end_turn" | "stop" => StopReason::EndTurn,
+        "end_turn" | "stop" | "STOP" => StopReason::EndTurn,
         "tool_use" | "tool_calls" | "function_call" => StopReason::ToolUse,
-        "max_tokens" | "length" => StopReason::MaxTokens,
+        "max_tokens" | "length" | "MAX_TOKENS" => StopReason::MaxTokens,
         "stop_sequence" => StopReason::StopSequence,
         "pause_turn" => StopReason::PauseTurn,
         "refusal" => StopReason::Refusal,
         "model_context_window_exceeded" => StopReason::ModelContextWindowExceeded,
-        "content_filter" | "safety" => StopReason::ContentFilter,
+        "content_filter" | "safety" | "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT"
+        | "SPII" | "IMAGE_SAFETY" => StopReason::ContentFilter,
         other => StopReason::Other(other.to_owned()),
     }
 }
@@ -1039,16 +1149,23 @@ fn find_event_end(buffer: &[u8]) -> Option<usize> {
 fn parse_usage(json: &serde_json::Value) -> Option<Usage> {
     // Anthropic: { usage: { input_tokens, output_tokens, cache_read_input_tokens } }.
     // OpenAI: { usage: { prompt_tokens, completion_tokens, prompt_tokens_details? } }.
-    let usage = json.get("usage")?;
+    // Google: { usageMetadata: { promptTokenCount, candidatesTokenCount, cachedContentTokenCount? } }.
+    let usage = json.get("usage").or_else(|| json.get("usageMetadata"))?;
     let input = usage
         .get("input_tokens")
         .or_else(|| usage.get("prompt_tokens"))
+        .or_else(|| usage.get("promptTokenCount"))
         .and_then(serde_json::Value::as_u64)?;
     let output = usage
         .get("output_tokens")
         .or_else(|| usage.get("completion_tokens"))
+        .or_else(|| usage.get("candidatesTokenCount"))
         .and_then(serde_json::Value::as_u64)?;
-    let cached = usage.get("cache_read_input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let cached = usage
+        .get("cache_read_input_tokens")
+        .or_else(|| usage.get("cachedContentTokenCount"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     Some(Usage { input_tokens: input, output_tokens: output, cached_tokens: cached })
 }
 
@@ -1155,6 +1272,138 @@ mod tests {
             body.as_str()
         );
         assert!(!body.as_str().contains("\"messages\""), "{}", body.as_str());
+    }
+
+    #[test]
+    fn google_native_tools_calls_and_results_have_exact_wire_shape() {
+        let client = test_client(ProviderKind::Google);
+        let request = Request {
+            provider: ProviderKind::Google,
+            model: "m".to_owned(),
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::ToolUse {
+                            id: "call-a".to_owned(),
+                            name: "lookup".to_owned(),
+                            input: serde_json::json!({"query": "a"}),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call-b".to_owned(),
+                            name: "lookup".to_owned(),
+                            input: serde_json::json!({"query": "b"}),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call-b".to_owned(),
+                            content: serde_json::json!({"value": "B"}),
+                            is_error: false,
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call-a".to_owned(),
+                            content: serde_json::json!({"value": "A"}),
+                            is_error: false,
+                        },
+                    ],
+                },
+            ],
+            tools: vec![crate::canonicalize(
+                r#"{"description":"Lookup a value","input_schema":{"properties":{"query":{"type":"string"}},"required":["query"],"type":"object"},"name":"lookup"}"#,
+            )
+            .expect("tool")],
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+
+        let body = client.render_body(&request).expect("Google tool request renders");
+        assert_eq!(
+            body.as_str(),
+            r#"{"contents":[{"parts":[{"functionCall":{"args":{"query":"a"},"id":"call-a","name":"lookup"}},{"functionCall":{"args":{"query":"b"},"id":"call-b","name":"lookup"}}],"role":"model"},{"parts":[{"functionResponse":{"id":"call-b","name":"lookup","response":{"value":"B"}}},{"functionResponse":{"id":"call-a","name":"lookup","response":{"value":"A"}}}],"role":"user"}],"model":"test-model","tools":[{"functionDeclarations":[{"description":"Lookup a value","name":"lookup","parameters":{"properties":{"query":{"type":"string"}},"required":["query"],"type":"object"}}]}]}"#
+        );
+    }
+
+    #[test]
+    fn google_native_function_call_parses_and_replays_exactly() {
+        let mut state = GoogleStreamState::default();
+        state
+            .apply_event(&serde_json::json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "functionCall": {
+                                "args": {"query": "x"},
+                                "id": "call-7",
+                                "name": "lookup"
+                            }
+                        }],
+                        "role": "model"
+                    },
+                    "finishReason": "STOP"
+                }],
+                "modelVersion": "gemini-3-pro-preview",
+                "responseId": "response-7",
+                "usageMetadata": {
+                    "cachedContentTokenCount": 3,
+                    "candidatesTokenCount": 5,
+                    "promptTokenCount": 11
+                }
+            }))
+            .expect("native event parses");
+        assert_eq!(
+            state.content,
+            vec![ContentBlock::ToolUse {
+                id: "call-7".to_owned(),
+                name: "lookup".to_owned(),
+                input: serde_json::json!({"query": "x"}),
+            }]
+        );
+        assert_eq!(state.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(state.model, "gemini-3-pro-preview");
+        assert_eq!(state.request_id.as_deref(), Some("response-7"));
+        assert_eq!(state.usage, Some(Usage { input_tokens: 11, output_tokens: 5, cached_tokens: 3 }));
+
+        let client = test_client(ProviderKind::Google);
+        let request = Request {
+            provider: ProviderKind::Google,
+            model: "m".to_owned(),
+            messages: vec![Message { role: Role::Assistant, content: state.content }],
+            tools: Vec::new(),
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+        let body = client.render_body(&request).expect("parsed function call replays");
+        assert_eq!(
+            body.as_str(),
+            r#"{"contents":[{"parts":[{"functionCall":{"args":{"query":"x"},"id":"call-7","name":"lookup"}}],"role":"model"}],"model":"test-model"}"#
+        );
+    }
+
+    #[test]
+    fn google_refuses_a_result_without_its_function_call() {
+        let client = test_client(ProviderKind::Google);
+        let request = Request {
+            provider: ProviderKind::Google,
+            model: "m".to_owned(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "missing-call".to_owned(),
+                    content: serde_json::json!({"value": "orphaned"}),
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+
+        let error = client.render_body(&request).expect_err("orphaned result must not be mislabeled");
+        assert!(error.to_string().contains("missing-call"), "{error}");
     }
 
     #[test]
