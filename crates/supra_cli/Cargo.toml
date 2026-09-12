@@ -39,7 +39,7 @@ supra_telemetry = { workspace = true }
 supra_update = { workspace = true }
 supra_eval = { workspace = true }
 supra_llm = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "test-util"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
