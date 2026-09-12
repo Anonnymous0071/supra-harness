@@ -460,8 +460,9 @@ fn import_in_set(import: &str, allowed: &[(&str, &str)]) -> bool {
             return true;
         }
     }
-    // The bare interface spelling: the class owns the whole namespace.
-    if allowed.iter().any(|(interface, _)| import == *interface) {
+    // The interface spelling: the class owns the whole namespace. Compiled
+    // WIT imports qualify it with the ABI version registered by `Host::new`.
+    if allowed.iter().any(|(interface, _)| import == *interface || import == format!("{interface}@0.1.0")) {
         return true;
     }
     // The bare function spelling: the name without its namespace, after
@@ -489,6 +490,19 @@ mod tests {
             _argument: &str,
         ) -> Result<String, DispatchError> {
             self.result.clone()
+        }
+    }
+
+    struct EchoDispatcher;
+
+    impl HostDispatcher for EchoDispatcher {
+        fn dispatch(
+            &self,
+            _caller: &PluginIdentity,
+            _function: HostFunction,
+            argument: &str,
+        ) -> Result<String, DispatchError> {
+            Ok(argument.to_owned())
         }
     }
 
@@ -595,13 +609,20 @@ mod tests {
             .map(std::path::PathBuf::from)
             .expect("SUPRA_COMPONENT_ARTIFACT names the built component");
         let name = path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("component");
-        let host = host();
+        let host = Host::with_dispatcher(Arc::new(EchoDispatcher)).expect("host");
         let component = Plugin::load_file(&host, &path).expect("component artifact loads");
         let mut plugin = host
             .instantiate(name, &component, supra_types::ToolClass::Agent)
             .expect("component links and exports run(string) -> string");
         let answer = plugin.call(SENTINEL).expect("component run export executes");
         assert_eq!(answer, SENTINEL, "contract-smoke must echo the sentinel unchanged");
+    }
+
+    #[test]
+    fn an_unknown_interface_version_is_not_in_a_class_set() {
+        let allowed = imports_for(supra_types::ToolClass::Agent);
+        assert!(import_in_set("supra:plugin/agent-tools@0.1.0", allowed));
+        assert!(!import_in_set("supra:plugin/agent-tools@999.0.0", allowed));
     }
 
     #[test]
