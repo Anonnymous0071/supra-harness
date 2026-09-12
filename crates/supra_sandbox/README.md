@@ -102,6 +102,6 @@ Three structural checks, each probed:
 - **T16.7** owns the reversibility classifier; this crate carries the
   classification through `SpawnRequest::reversibility` and refuses
   nothing itself on that axis.
-- **T23** `supra_core` is the only consumer: the turn loop calls
-  `spawn` once per peer command, and the `TreeBudget` it shares is
-  what the TUI status line reads.
+- **Executable integration** is pending: a future turn driver must call `spawn`
+  for each peer command and share its `TreeBudget` with the TUI. The current
+  `supra run` path does not execute tools or consume this crate.

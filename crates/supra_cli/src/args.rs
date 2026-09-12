@@ -82,7 +82,7 @@ pub enum Command {
         #[arg(long, help = "Also run the provider-backed evaluation probe")]
         live: bool,
     },
-    #[command(about = "Check or apply signed supra updates")]
+    #[command(about = "Show signed-update guidance (application is not implemented)")]
     Update {
         #[command(subcommand)]
         action: UpdateAction,
@@ -96,9 +96,9 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum UpdateAction {
-    #[command(about = "Check whether a signed update is available")]
+    #[command(about = "Print update-availability and verification guidance")]
     Check,
-    #[command(about = "Apply an update after signature verification")]
+    #[command(about = "Not implemented; always refuse without an updater path")]
     Apply,
 }
 
@@ -183,6 +183,6 @@ mod tests {
 
         let mut update = Cli::command().find_subcommand_mut("update").expect("update command").clone();
         let update_help = update.render_long_help().to_string();
-        assert!(update_help.contains("Apply an update after signature verification"), "{update_help}");
+        assert!(update_help.contains("Not implemented; always refuse"), "{update_help}");
     }
 }

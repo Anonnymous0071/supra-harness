@@ -49,8 +49,8 @@
 /// all-or-nothing; a blocked connection reports `EACCES` rather than
 /// `ENETUNREACH`.
 ///
-/// bwrap remains available as an explicit fallback backend where Landlock is
-/// missing and the caller prefers mount-based isolation.
+/// The shipped backend does not invoke bwrap; there is no mount-based fallback
+/// when Landlock is missing.
 ///
 /// ## What this does not defend against
 ///

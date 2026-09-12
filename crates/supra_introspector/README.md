@@ -5,11 +5,10 @@ sequence.
 
 ## What this stage is for
 
-The turn loop's step 7 names this crate a deterministic gate and step 9
-names its output: "append findings; a confirmed finding escalates". §5's
-instruction-efficiency table says the same thing from the model's side:
-"verify with tests" is not prose - the introspector runs automatically
-post-edit.
+The target turn loop's step 7 names this crate as a deterministic gate and step
+9 names its output: "append findings; a confirmed finding escalates". This crate
+implements those gate and finding primitives, but the current `supra run` path
+does not execute edits or schedule the introspector automatically.
 
 | Module | Owns |
 |---|---|

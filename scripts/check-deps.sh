@@ -43,7 +43,7 @@ echo
 echo "optional"
 opt clang "clang static analyser in T22 introspector; skipped when absent"
 opt ninja "faster CMake builds"
-opt bwrap "Linux sandbox backend (T4); tool execution is unsandboxed without it"
+opt bwrap "detected for experiments only; the shipped Linux backend does not invoke it"
 opt cargo-nextest "faster test runs"
 
 echo

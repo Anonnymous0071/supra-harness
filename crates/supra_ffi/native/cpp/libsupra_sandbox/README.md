@@ -35,7 +35,8 @@ It also enforces more precisely. Landlock `NET_CONNECT_TCP` is **per-port**;
 a network namespace is all-or-nothing. A blocked connection reports `EACCES`
 rather than `ENETUNREACH`.
 
-bwrap remains available as an explicit fallback where Landlock is missing.
+The shipped backend does not invoke bwrap. Its presence is informational only;
+there is no bwrap fallback when Landlock is missing.
 
 ## Tiers are reported, never assumed
 

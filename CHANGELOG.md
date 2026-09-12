@@ -18,8 +18,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and budget from `[providers.<name>]`; empty model selects the cheapest
   active default (`gpt-4o-mini` / `claude-haiku-4-5-20251001`); credential
   resolves per request and is never stored.
-- `supra eval --live` probes every configured SDK provider through
-  `Client` instead of refusing.
+- `supra eval --live` probes configured Anthropic and OpenAI providers through
+  `Client`; Google live probing is not implemented.
 - Ignored live-probe tests for both SDK paths
   (`SUPRA_LIVE_{ANTHROPIC,OPENAI}_{BASE,KEY,MODEL}`), validated against
   live gateways.
