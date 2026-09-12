@@ -44,8 +44,33 @@ PY
         echo "build-wasm: expected non-empty component artifact missing: $artifact" >&2
         exit 1
     fi
-    SUPRA_COMPONENT_ARTIFACT="$artifact" \
-        cargo test --manifest-path "$root/Cargo.toml" --locked -p supra_plugin component_contract_accepts -- --ignored
+    if ! test_output=$(SUPRA_COMPONENT_ARTIFACT="$artifact" \
+        cargo test --manifest-path "$root/Cargo.toml" --locked -p supra_plugin --lib \
+        host::tests::component_contract_accepts -- --ignored --exact 2>&1); then
+        printf '%s\n' "$test_output" >&2
+        exit 1
+    fi
+    printf '%s\n' "$test_output"
+    if ! python3 -c '
+import re
+import sys
+
+expected = "host::tests::component_contract_accepts"
+output = sys.stdin.read()
+executions = re.findall(rf"^test {re.escape(expected)} \.\.\. ok$", output, re.MULTILINE)
+results = re.findall(
+    r"^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$",
+    output,
+    re.MULTILINE,
+)
+if len(executions) != 1 or len(results) != 1:
+    raise SystemExit(
+        "build-wasm: host contract gate did not execute exactly one "
+        f"{expected} test (executions={len(executions)}, one-test-results={len(results)})"
+    )
+' <<<"$test_output"; then
+        exit 1
+    fi
     built=$((built + 1))
 done
 

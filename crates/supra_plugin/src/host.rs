@@ -587,6 +587,24 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires SUPRA_COMPONENT_ARTIFACT from scripts/build-wasm.sh"]
+    fn component_contract_accepts() {
+        const SENTINEL: &str = "supra-component-contract-smoke";
+
+        let path = std::env::var_os("SUPRA_COMPONENT_ARTIFACT")
+            .map(std::path::PathBuf::from)
+            .expect("SUPRA_COMPONENT_ARTIFACT names the built component");
+        let name = path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("component");
+        let host = host();
+        let component = Plugin::load_file(&host, &path).expect("component artifact loads");
+        let mut plugin = host
+            .instantiate(name, &component, supra_types::ToolClass::Agent)
+            .expect("component links and exports run(string) -> string");
+        let answer = plugin.call(SENTINEL).expect("component run export executes");
+        assert_eq!(answer, SENTINEL, "contract-smoke must echo the sentinel unchanged");
+    }
+
+    #[test]
     fn the_constructor_registers_every_class_import() {
         // The MissingHostImport arm exists for a harness bug; this test
         // pins there is no harness bug today - every import in every
