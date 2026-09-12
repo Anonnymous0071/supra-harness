@@ -1,22 +1,17 @@
-//! One request, one response, through the official provider SDKs.
+//! One request, one response, through provider-native transports.
 //!
-//! The `Anthropic` path speaks the Messages API; the `OpenAI`
-//! path speaks the Chat Completions API. Both stream: the
-//! SDK owns the wire framing and the event parsing, and this crate
-//! accumulates text deltas plus usage into a [`Completion`], exactly as
-//! it did when the framing was hand-rolled. The policy layer
-//! ([`CachePolicy`](crate::CachePolicy)) is unchanged — the SDKs carry
-//! the cache fields the policy names, they do not decide them.
+//! The `Anthropic` path sends canonical Messages API bytes over rustls;
+//! the `OpenAI` path uses its official SDK's Chat Completions API. Both
+//! stream into the same lossless [`Completion`] contract. The policy layer
+//! ([`CachePolicy`](crate::CachePolicy)) owns cache shape and thinking policy;
+//! transports only send those decisions and classify failures.
 //!
-//! What the SDKs do *not* own: credential storage, retry policy, or the
-//! conversion from [`LlmError`] recoverability classes.
-//! An SDK error is mapped at the boundary into the variant the caller
-//! already matches on — [`Unauthorized`](crate::LlmError::Unauthorized),
+//! Credentials arrive per request and retry policy stays with the caller.
+//! Boundary failures are classified as [`Unauthorized`](crate::LlmError::Unauthorized),
 //! [`RateLimited`](crate::LlmError::RateLimited),
 //! [`Transport`](crate::LlmError::Transport), or
-//! [`BadResponse`](crate::LlmError::BadResponse) — so no caller changes.
+//! [`BadResponse`](crate::LlmError::BadResponse).
 
-use anthropic_sdk::types::{MessageContent, MessageParam, Role as AnthropicRole};
 use futures::StreamExt as _;
 
 use crate::client::{Completion, ContentBlock, Request, Role, StopReason, Thinking, Usage};
@@ -29,239 +24,445 @@ pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 
 /// The Anthropic model used when the configuration pins none, and the one
 /// the live test exercises: the cheapest current Messages model.
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-haiku-20241022";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5-20251001";
 
-/// Send one Anthropic request through the official SDK and read the
+/// Send one Anthropic request as canonical Messages API bytes and read the
 /// streamed completion.
 ///
-/// `endpoint` overrides the API base (a custom gateway or a test
-/// double); `None` means the SDK default. The credential arrives per
-/// request and is never stored — the SDK holds it for the call only.
+/// `endpoint` overrides the API base (a custom gateway or test double);
+/// `None` selects `https://api.anthropic.com`. The credential arrives per
+/// request and is never stored.
 ///
 /// # Errors
 ///
 /// [`LlmError::Unauthorized`], [`LlmError::RateLimited`],
 /// [`LlmError::Transport`], or [`LlmError::BadResponse`], by
-/// recoverability rather than by SDK spelling.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the SDK request and lossless response conversion form one boundary"
-)]
+/// recoverability rather than by wire spelling.
+#[allow(clippy::too_many_lines, reason = "the lossless response conversion forms one boundary")]
 pub async fn send_anthropic(
+    http: reqwest::Client,
     request: &Request,
     endpoint: Option<&str>,
     model: &str,
     thinking: Thinking,
     credential: &supra_secrets::SecretString,
 ) -> Result<Completion, LlmError> {
-    use anthropic_sdk::config::ClientConfig;
+    let endpoint = anthropic_messages_endpoint(endpoint);
+    let body = anthropic_body(request, model)?;
+    let response = http
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("x-api-key", credential.expose())
+        .header("anthropic-version", "2023-06-01")
+        .body(body.as_str().to_owned())
+        .send()
+        .await
+        .map_err(|error| LlmError::Transport {
+            provider: ProviderKind::Anthropic.name().to_owned(),
+            detail: error.to_string(),
+        })?;
 
-    let mut config = ClientConfig::new(credential.expose());
-    if let Some(base) = endpoint {
-        config.base_url = base.to_owned();
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(LlmError::Unauthorized {
+            provider: ProviderKind::Anthropic.name().to_owned(),
+            detail: format!("HTTP {status}"),
+        });
     }
-    let client = anthropic_sdk::client::Anthropic::with_config(config).map_err(|error| {
-        LlmError::Transport { provider: ProviderKind::Anthropic.name().to_owned(), detail: error.to_string() }
-    })?;
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(LlmError::RateLimited {
+            provider: ProviderKind::Anthropic.name().to_owned(),
+            retry_after_ms: provider_retry_after_ms(response.headers()),
+        });
+    }
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(LlmError::BadResponse {
+            provider: ProviderKind::Anthropic.name().to_owned(),
+            detail: format!("HTTP {status}: {detail}"),
+        });
+    }
+    read_anthropic_sse(response, thinking).await
+}
 
-    let messages: Vec<MessageParam> = request
-        .messages
-        .iter()
-        .map(|message| MessageParam {
-            role: match message.role {
-                Role::User => AnthropicRole::User,
-                Role::Assistant => AnthropicRole::Assistant,
+fn anthropic_messages_endpoint(base: Option<&str>) -> String {
+    let base = base.unwrap_or("https://api.anthropic.com").trim_end_matches('/');
+    if base.ends_with("/v1/messages") { base.to_owned() } else { format!("{base}/v1/messages") }
+}
+
+fn anthropic_body(request: &Request, model: &str) -> Result<supra_types::CanonicalJson, LlmError> {
+    let renderer = crate::client::Client::new(
+        ProviderKind::Anthropic.name(),
+        String::new(),
+        model.to_owned(),
+        request.thinking.budget_tokens,
+    )?;
+    renderer.render_body(request).map_err(|error| LlmError::BadResponse {
+        provider: ProviderKind::Anthropic.name().to_owned(),
+        detail: format!("request body is not canonical: {error}"),
+    })
+}
+
+const MAX_ANTHROPIC_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ANTHROPIC_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_ANTHROPIC_BLOCKS: usize = 4096;
+
+fn provider_retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
+    if let Some(seconds) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return seconds.saturating_mul(1_000);
+    }
+    headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(60_000)
+}
+
+#[derive(Debug)]
+enum AnthropicBlock {
+    Text { text: String, citations: Vec<serde_json::Value> },
+    Thinking { thinking: String, signature: String },
+    RedactedThinking { data: String },
+    ToolUse { id: String, name: String, input: serde_json::Value, partial_json: String },
+    Unknown { raw: serde_json::Value, partial_json: String },
+}
+
+impl AnthropicBlock {
+    fn start(raw: serde_json::Value) -> Self {
+        let kind = raw.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let string =
+            |name: &str| raw.get(name).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        match kind {
+            "text" => Self::Text {
+                text: string("text"),
+                citations: raw
+                    .get("citations")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
             },
-            content: MessageContent::Blocks(
-                message
-                    .content
-                    .iter()
-                    .map(|block| match block {
-                        ContentBlock::Text { text } => {
-                            anthropic_sdk::types::ContentBlockParam::Text { text: text.clone() }
-                        }
-                        ContentBlock::ToolUse { id, name, input } => {
-                            anthropic_sdk::types::ContentBlockParam::ToolUse {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: input.clone(),
-                            }
-                        }
-                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                            anthropic_sdk::types::ContentBlockParam::ToolResult {
-                                tool_use_id: tool_use_id.clone(),
-                                content: Some(content.clone()),
-                                is_error: Some(*is_error),
-                            }
-                        }
-                        ContentBlock::Thinking { thinking, signature } => {
-                            anthropic_sdk::types::ContentBlockParam::Thinking {
-                                thinking: thinking.clone(),
-                                signature: signature.clone(),
-                            }
-                        }
-                        ContentBlock::RedactedThinking { data } => {
-                            anthropic_sdk::types::ContentBlockParam::RedactedThinking { data: data.clone() }
-                        }
-                    })
-                    .collect(),
-            ),
-        })
-        .collect();
-
-    let params = anthropic_sdk::types::MessageCreateParams {
-        model: model.to_owned(),
-        max_tokens: 32_000,
-        messages,
-        system: None,
-        temperature: None,
-        top_p: None,
-        top_k: None,
-        stop_sequences: None,
-        stream: None,
-        tools: tools_value(request)?,
-        tool_choice: None,
-        metadata: None,
-    };
-
-    let stream = client.messages().stream(params).await.map_err(map_anthropic)?;
-    let message = stream.final_message().await.map_err(map_anthropic)?;
-
-    let mut content = Vec::new();
-    for block in &message.content {
-        match block {
-            anthropic_sdk::types::ContentBlock::Text { text } => {
-                content.push(ContentBlock::text(text.clone()));
-            }
-            anthropic_sdk::types::ContentBlock::ToolUse { id, name, input } => {
-                content.push(ContentBlock::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                });
-            }
-            anthropic_sdk::types::ContentBlock::ToolResult { tool_use_id, content: result, is_error } => {
-                content.push(ContentBlock::ToolResult {
-                    tool_use_id: tool_use_id.clone(),
-                    content: result.clone().unwrap_or_default(),
-                    is_error: is_error.unwrap_or(false),
-                });
-            }
-            anthropic_sdk::types::ContentBlock::Thinking { thinking, signature } => {
-                content.push(ContentBlock::Thinking {
-                    thinking: thinking.clone(),
-                    signature: signature.clone(),
-                });
-            }
-            anthropic_sdk::types::ContentBlock::RedactedThinking { data } => {
-                content.push(ContentBlock::RedactedThinking { data: data.clone() });
-            }
-            anthropic_sdk::types::ContentBlock::Image { .. } => {}
+            "thinking" => Self::Thinking { thinking: string("thinking"), signature: string("signature") },
+            "redacted_thinking" => Self::RedactedThinking { data: string("data") },
+            "tool_use" => Self::ToolUse {
+                id: string("id"),
+                name: string("name"),
+                input: raw.get("input").cloned().unwrap_or(serde_json::Value::Null),
+                partial_json: String::new(),
+            },
+            _ => Self::Unknown { raw, partial_json: String::new() },
         }
     }
-    let usage = Some(Usage {
-        input_tokens: u64::from(message.usage.input_tokens),
-        output_tokens: u64::from(message.usage.output_tokens),
-        cached_tokens: u64::from(message.usage.cache_read_input_tokens.unwrap_or(0)),
-    });
-    let stop_reason = message.stop_reason.as_ref().map_or(StopReason::EndTurn, anthropic_stop_reason);
+
+    fn apply_delta(&mut self, delta: &serde_json::Value) -> Result<(), String> {
+        let kind = delta.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
+        match (self, kind) {
+            (Self::Text { text, .. }, "text_delta") => {
+                text.push_str(delta.get("text").and_then(serde_json::Value::as_str).unwrap_or_default());
+            }
+            (Self::Text { citations, .. }, "citations_delta" | "citation_delta") => {
+                if let Some(citation) = delta.get("citation") {
+                    citations.push(citation.clone());
+                }
+            }
+            (Self::Thinking { thinking, .. }, "thinking_delta") => {
+                thinking
+                    .push_str(delta.get("thinking").and_then(serde_json::Value::as_str).unwrap_or_default());
+            }
+            (Self::Thinking { signature, .. }, "signature_delta") => {
+                signature
+                    .push_str(delta.get("signature").and_then(serde_json::Value::as_str).unwrap_or_default());
+            }
+            (Self::ToolUse { partial_json, .. } | Self::Unknown { partial_json, .. }, "input_json_delta") => {
+                partial_json.push_str(
+                    delta.get("partial_json").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                );
+            }
+            (block, _) => {
+                return Err(format!("{kind} delta does not match {} block", block.kind()));
+            }
+        }
+        Ok(())
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Text { .. } => "text",
+            Self::Thinking { .. } => "thinking",
+            Self::RedactedThinking { .. } => "redacted_thinking",
+            Self::ToolUse { .. } => "tool_use",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+
+    fn finish(self) -> Result<ContentBlock, String> {
+        Ok(match self {
+            Self::Text { text, citations } => ContentBlock::Text { text, citations },
+            Self::Thinking { thinking, signature } => ContentBlock::Thinking { thinking, signature },
+            Self::RedactedThinking { data } => ContentBlock::RedactedThinking { data },
+            Self::ToolUse { id, name, input, partial_json } => {
+                let input = if partial_json.is_empty() {
+                    input
+                } else {
+                    serde_json::from_str(&partial_json)
+                        .map_err(|error| format!("tool input JSON is invalid: {error}"))?
+                };
+                ContentBlock::ToolUse { id, name, input }
+            }
+            Self::Unknown { mut raw, partial_json } => {
+                if !partial_json.is_empty() {
+                    raw["input"] = serde_json::from_str(&partial_json)
+                        .map_err(|error| format!("unknown block input JSON is invalid: {error}"))?;
+                }
+                ContentBlock::Unknown { raw }
+            }
+        })
+    }
+}
+
+#[derive(Default)]
+struct AnthropicStream {
+    open: std::collections::BTreeMap<u32, AnthropicBlock>,
+    complete: std::collections::BTreeMap<u32, ContentBlock>,
+    stop_reason: Option<StopReason>,
+    stop_sequence: Option<String>,
+    model: String,
+    request_id: Option<String>,
+    usage: Option<Usage>,
+    saw_message_stop: bool,
+}
+
+impl AnthropicStream {
+    fn event(&mut self, event: &serde_json::Value) -> Result<(), String> {
+        match event.get("type").and_then(serde_json::Value::as_str).unwrap_or_default() {
+            "message_start" => {
+                let message = event.get("message").ok_or("message_start has no message")?;
+                message
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .clone_into(&mut self.model);
+                self.request_id = message.get("id").and_then(serde_json::Value::as_str).map(str::to_owned);
+                self.merge_usage(message);
+                if let Some(blocks) = message.get("content").and_then(serde_json::Value::as_array) {
+                    for (index, block) in blocks.iter().cloned().enumerate() {
+                        let index = u32::try_from(index).map_err(|error| error.to_string())?;
+                        self.insert_complete(index, AnthropicBlock::start(block).finish()?)?;
+                    }
+                }
+            }
+            "content_block_start" => {
+                let index = event_index(event)?;
+                if self.open.contains_key(&index) || self.complete.contains_key(&index) {
+                    return Err(format!("duplicate content block index {index}"));
+                }
+                self.ensure_block_capacity()?;
+                let raw = event.get("content_block").cloned().ok_or("content_block_start has no block")?;
+                self.open.insert(index, AnthropicBlock::start(raw));
+            }
+            "content_block_delta" => {
+                let index = event_index(event)?;
+                let delta = event.get("delta").ok_or("content_block_delta has no delta")?;
+                self.open
+                    .get_mut(&index)
+                    .ok_or_else(|| format!("delta for unopened block {index}"))?
+                    .apply_delta(delta)?;
+            }
+            "content_block_stop" => {
+                let index = event_index(event)?;
+                let block =
+                    self.open.remove(&index).ok_or_else(|| format!("stop for unopened block {index}"))?;
+                self.insert_complete(index, block.finish()?)?;
+            }
+            "message_delta" => {
+                let delta = event.get("delta").ok_or("message_delta has no delta")?;
+                if let Some(reason) = delta.get("stop_reason").and_then(serde_json::Value::as_str) {
+                    self.stop_reason = Some(anthropic_stop_reason(reason));
+                }
+                self.stop_sequence =
+                    delta.get("stop_sequence").and_then(serde_json::Value::as_str).map(str::to_owned);
+                self.merge_usage(event);
+            }
+            "message_stop" => self.saw_message_stop = true,
+            "ping" => {}
+            "error" => {
+                return Err(event
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("the provider sent an error event")
+                    .to_owned());
+            }
+            kind => return Err(format!("unknown Anthropic stream event {kind:?}")),
+        }
+        Ok(())
+    }
+
+    fn ensure_block_capacity(&self) -> Result<(), String> {
+        if self.open.len().saturating_add(self.complete.len()) >= MAX_ANTHROPIC_BLOCKS {
+            Err(format!("stream exceeds {MAX_ANTHROPIC_BLOCKS} content blocks"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn insert_complete(&mut self, index: u32, block: ContentBlock) -> Result<(), String> {
+        self.ensure_block_capacity()?;
+        if self.complete.insert(index, block).is_some() {
+            return Err(format!("duplicate content block index {index}"));
+        }
+        Ok(())
+    }
+
+    fn merge_usage(&mut self, value: &serde_json::Value) {
+        let Some(reported) = value.get("usage") else { return };
+        let usage = self.usage.get_or_insert_with(Usage::default);
+        if let Some(input) = reported.get("input_tokens").and_then(serde_json::Value::as_u64) {
+            usage.input_tokens = input;
+        }
+        if let Some(output) = reported.get("output_tokens").and_then(serde_json::Value::as_u64) {
+            usage.output_tokens = output;
+        }
+        if let Some(cached) = reported.get("cache_read_input_tokens").and_then(serde_json::Value::as_u64) {
+            usage.cached_tokens = cached;
+        }
+    }
+}
+
+fn event_index(event: &serde_json::Value) -> Result<u32, String> {
+    let index = event.get("index").and_then(serde_json::Value::as_u64).ok_or("stream event has no index")?;
+    u32::try_from(index).map_err(|_| format!("content block index {index} exceeds u32"))
+}
+
+fn anthropic_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "end_turn" => StopReason::EndTurn,
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::MaxTokens,
+        "stop_sequence" => StopReason::StopSequence,
+        "pause_turn" => StopReason::PauseTurn,
+        "refusal" => StopReason::Refusal,
+        "model_context_window_exceeded" => StopReason::ModelContextWindowExceeded,
+        other => StopReason::Other(other.to_owned()),
+    }
+}
+
+async fn read_anthropic_sse(response: reqwest::Response, thinking: Thinking) -> Result<Completion, LlmError> {
+    let provider = ProviderKind::Anthropic.name().to_owned();
+    let header_request_id = response
+        .headers()
+        .get("request-id")
+        .or_else(|| response.headers().get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut received = 0usize;
+    let mut state = AnthropicStream::default();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| LlmError::Transport { provider: provider.clone(), detail: error.to_string() })?;
+        received = received.saturating_add(chunk.len());
+        if received > MAX_ANTHROPIC_STREAM_BYTES {
+            return Err(LlmError::BadResponse {
+                provider,
+                detail: format!("stream exceeds {MAX_ANTHROPIC_STREAM_BYTES} bytes"),
+            });
+        }
+        buffer.extend_from_slice(&chunk);
+        while let Some(end) = find_sse_event_end(&buffer) {
+            if end > MAX_ANTHROPIC_EVENT_BYTES {
+                return Err(LlmError::BadResponse {
+                    provider,
+                    detail: format!("SSE event exceeds {MAX_ANTHROPIC_EVENT_BYTES} bytes"),
+                });
+            }
+            let event: Vec<u8> = buffer.drain(..end).collect();
+            if let Some(payload) = sse_payload(&event)
+                .map_err(|detail| LlmError::BadResponse { provider: provider.clone(), detail })?
+            {
+                if payload == "[DONE]" {
+                    state.saw_message_stop = true;
+                } else {
+                    let json: serde_json::Value =
+                        serde_json::from_str(payload).map_err(|error| LlmError::BadResponse {
+                            provider: provider.clone(),
+                            detail: format!("event is not JSON: {error}"),
+                        })?;
+                    state
+                        .event(&json)
+                        .map_err(|detail| LlmError::BadResponse { provider: provider.clone(), detail })?;
+                }
+            }
+        }
+        if buffer.len() > MAX_ANTHROPIC_EVENT_BYTES {
+            return Err(LlmError::BadResponse {
+                provider,
+                detail: format!("SSE event exceeds {MAX_ANTHROPIC_EVENT_BYTES} bytes"),
+            });
+        }
+    }
+
+    if !buffer.iter().all(u8::is_ascii_whitespace) {
+        return Err(LlmError::BadResponse {
+            provider,
+            detail: "stream ended inside an SSE event".to_owned(),
+        });
+    }
+    if !state.saw_message_stop {
+        return Err(LlmError::BadResponse {
+            provider,
+            detail: "stream ended before message_stop".to_owned(),
+        });
+    }
+    if !state.open.is_empty() {
+        return Err(LlmError::BadResponse {
+            provider,
+            detail: "stream ended with an open content block".to_owned(),
+        });
+    }
+    let stop_reason = state.stop_reason.ok_or_else(|| LlmError::BadResponse {
+        provider: provider.clone(),
+        detail: "message_stop arrived without a stop_reason".to_owned(),
+    })?;
+    let request_id = header_request_id.or(state.request_id);
     Ok(Completion {
-        content,
+        content: state.complete.into_values().collect(),
         stop_reason,
-        stop_sequence: message.stop_sequence,
-        model: message.model,
-        request_id: message.request_id.map(|id| id.0),
-        usage,
+        stop_sequence: state.stop_sequence,
+        model: state.model,
+        request_id,
+        usage: state.usage,
         thinking,
     })
 }
 
-fn anthropic_stop_reason(reason: &anthropic_sdk::types::StopReason) -> StopReason {
-    match reason {
-        anthropic_sdk::types::StopReason::EndTurn => StopReason::EndTurn,
-        anthropic_sdk::types::StopReason::ToolUse => StopReason::ToolUse,
-        anthropic_sdk::types::StopReason::MaxTokens => StopReason::MaxTokens,
-        anthropic_sdk::types::StopReason::StopSequence => StopReason::StopSequence,
+fn find_sse_event_end(buffer: &[u8]) -> Option<usize> {
+    let unix = buffer.windows(2).position(|pair| pair == b"\n\n").map(|at| at + 2);
+    let windows = buffer.windows(4).position(|part| part == b"\r\n\r\n").map(|at| at + 4);
+    match (unix, windows) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
     }
 }
 
-/// Convert canonical tool definitions into the SDK's tool shape.
-///
-/// A definition that does not parse is skipped, not refused: the
-/// canonical layer guarantees shape, so a failure here is a layering
-/// defect worth degrading rather than a request worth dropping.
-fn tools_value(request: &Request) -> Result<Option<Vec<anthropic_sdk::types::Tool>>, LlmError> {
-    if request.tools.is_empty() {
-        return Ok(None);
-    }
-    let mut tools = Vec::new();
-    for tool in &request.tools {
-        let parsed: serde_json::Value =
-            serde_json::from_str(tool.as_str()).map_err(|error| LlmError::BadResponse {
-                provider: ProviderKind::Anthropic.name().to_owned(),
-                detail: format!("tool definition is not JSON: {error}"),
-            })?;
-        let name = parsed.get("name").and_then(serde_json::Value::as_str).unwrap_or("tool").to_owned();
-        let description =
-            parsed.get("description").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
-        let mut schema = parsed
-            .get("input_schema")
-            .or_else(|| parsed.get("parameters"))
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let schema_type = schema
-            .remove("type")
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "object".to_owned());
-        let properties =
-            schema.remove("properties").and_then(|value| value.as_object().cloned()).unwrap_or_default();
-        let required = schema
-            .remove("required")
-            .and_then(|value| value.as_array().cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect();
-        tools.push(anthropic_sdk::types::Tool {
-            name,
-            description,
-            input_schema: anthropic_sdk::types::ToolInputSchema {
-                schema_type,
-                properties,
-                required,
-                additional: schema,
-            },
-        });
-    }
-    Ok(Some(tools))
-}
-
-/// Map an Anthropic SDK failure into the caller's recoverability class.
-///
-/// Authentication and permission failures are never retried; rate
-/// limits carry the documented 60 s default (the SDK does not surface a
-/// `retry-after` value); transport failures stay retryable; everything
-/// else is a response the client cannot use.
-fn map_anthropic(error: anthropic_sdk::types::AnthropicError) -> LlmError {
-    use anthropic_sdk::types::AnthropicError as Sdk;
-
-    let provider = ProviderKind::Anthropic.name().to_owned();
-    match error {
-        Sdk::Authentication { message, .. } | Sdk::PermissionDenied { message, .. } => {
-            LlmError::Unauthorized { provider, detail: message }
+fn sse_payload(event: &[u8]) -> Result<Option<&str>, String> {
+    let text = std::str::from_utf8(event).map_err(|error| format!("SSE event is not UTF-8: {error}"))?;
+    let mut data = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("data:") {
+            if data.is_some() {
+                return Err("SSE event has multiple data lines".to_owned());
+            }
+            data = Some(value.trim());
         }
-        Sdk::InvalidApiKey => LlmError::Unauthorized { provider, detail: "invalid credential".to_owned() },
-        Sdk::RateLimit { .. } => LlmError::RateLimited { provider, retry_after_ms: 60_000 },
-        Sdk::Connection { message } | Sdk::NetworkError(message) => {
-            LlmError::Transport { provider, detail: message }
-        }
-        Sdk::ConnectionTimeout | Sdk::Timeout => {
-            LlmError::Transport { provider, detail: "the request timed out".to_owned() }
-        }
-        Sdk::StreamError(detail) => LlmError::BadResponse { provider, detail },
-        other => LlmError::BadResponse { provider, detail: other.to_string() },
     }
+    Ok(data)
 }
 
 /// Send one `OpenAI` request through the official SDK.
@@ -638,8 +839,9 @@ mod tests {
         assert!(reasoning_effort(&thinking).is_some());
 
         let anthropic = sample_request(ProviderKind::Anthropic);
-        assert!(tools_value(&anthropic).expect("no tools").is_none());
         assert!(openai_tools(&anthropic).expect("no tools").is_none());
+        let body = anthropic_body(&anthropic, DEFAULT_ANTHROPIC_MODEL).expect("body renders");
+        assert!(!body.as_str().contains("\"tools\""), "{}", body.as_str());
     }
 
     #[test]
@@ -652,8 +854,9 @@ mod tests {
             ..sample_request(ProviderKind::Anthropic)
         };
 
-        let tools = tools_value(&request).expect("tool converts").expect("one tool");
-        let schema = serde_json::to_value(&tools[0].input_schema).expect("schema serializes");
+        let body = anthropic_body(&request, DEFAULT_ANTHROPIC_MODEL).expect("body renders");
+        let parsed: serde_json::Value = serde_json::from_str(body.as_str()).expect("body is JSON");
+        let schema = &parsed["tools"][0]["input_schema"];
         assert_eq!(schema["required"], serde_json::json!(["query"]));
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"]["query"]["minLength"], 1);
@@ -661,12 +864,11 @@ mod tests {
 
     #[test]
     fn provider_stop_reasons_remain_distinct() {
-        assert_eq!(anthropic_stop_reason(&anthropic_sdk::types::StopReason::EndTurn), StopReason::EndTurn);
-        assert_eq!(anthropic_stop_reason(&anthropic_sdk::types::StopReason::ToolUse), StopReason::ToolUse);
-        assert_eq!(
-            anthropic_stop_reason(&anthropic_sdk::types::StopReason::MaxTokens),
-            StopReason::MaxTokens
-        );
+        assert_eq!(anthropic_stop_reason("end_turn"), StopReason::EndTurn);
+        assert_eq!(anthropic_stop_reason("tool_use"), StopReason::ToolUse);
+        assert_eq!(anthropic_stop_reason("max_tokens"), StopReason::MaxTokens);
+        assert_eq!(anthropic_stop_reason("pause_turn"), StopReason::PauseTurn);
+        assert_eq!(anthropic_stop_reason("refusal"), StopReason::Refusal);
         assert_eq!(
             openai_stop_reason(async_openai::types::chat::FinishReason::Length),
             StopReason::MaxTokens
@@ -733,33 +935,53 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_auth_failures_never_retry() {
-        use anthropic_sdk::types::AnthropicError as Sdk;
+    fn anthropic_retry_after_obeys_headers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
 
-        let error = map_anthropic(Sdk::InvalidApiKey);
-        assert!(matches!(error, LlmError::Unauthorized { .. }), "{error}");
-        let error = map_anthropic(Sdk::Authentication { message: "bad".to_owned(), status: 401 });
-        assert!(matches!(error, LlmError::Unauthorized { .. }), "{error}");
-        let error = map_anthropic(Sdk::PermissionDenied { message: "no".to_owned(), status: 403 });
-        assert!(matches!(error, LlmError::Unauthorized { .. }), "{error}");
+        let mut headers = HeaderMap::new();
+        assert_eq!(provider_retry_after_ms(&headers), 60_000);
+        headers.insert("retry-after-ms", HeaderValue::from_static("1250"));
+        assert_eq!(provider_retry_after_ms(&headers), 1_250);
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("4"));
+        assert_eq!(provider_retry_after_ms(&headers), 4_000);
     }
 
     #[test]
-    fn anthropic_rate_limits_carry_the_default_delay() {
-        use anthropic_sdk::types::AnthropicError as Sdk;
+    fn anthropic_stream_state_preserves_ordered_protocol_blocks() {
+        let mut stream = AnthropicStream::default();
+        for event in [
+            serde_json::json!({"type":"message_start","message":{"id":"msg_1","model":"claude-test","content":[],"usage":{"input_tokens":7}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reason"}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque"}}),
+            serde_json::json!({"type":"content_block_stop","index":1}),
+            serde_json::json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"lookup","input":{}}}),
+            serde_json::json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"x\"}"}}),
+            serde_json::json!({"type":"content_block_stop","index":2}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":11}}),
+            serde_json::json!({"type":"message_stop"}),
+        ] {
+            stream.event(&event).expect("valid event");
+        }
 
-        let error = map_anthropic(Sdk::RateLimit { message: "slow".to_owned(), status: 429 });
-        assert!(matches!(error, LlmError::RateLimited { retry_after_ms: 60_000, .. }), "{error}");
-    }
-
-    #[test]
-    fn anthropic_transport_failures_stay_retryable() {
-        use anthropic_sdk::types::AnthropicError as Sdk;
-
-        let error = map_anthropic(Sdk::Connection { message: "down".to_owned() });
-        assert!(matches!(error, LlmError::Transport { .. }), "{error}");
-        let error = map_anthropic(Sdk::Timeout);
-        assert!(matches!(error, LlmError::Transport { .. }), "{error}");
+        assert_eq!(stream.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(stream.model, "claude-test");
+        assert_eq!(stream.request_id.as_deref(), Some("msg_1"));
+        assert_eq!(stream.usage, Some(Usage { input_tokens: 7, output_tokens: 11, cached_tokens: 0 }));
+        assert_eq!(
+            stream.complete.into_values().collect::<Vec<_>>(),
+            vec![
+                ContentBlock::Thinking { thinking: "reason".to_owned(), signature: "sig".to_owned() },
+                ContentBlock::RedactedThinking { data: "opaque".to_owned() },
+                ContentBlock::ToolUse {
+                    id: "tool_1".to_owned(),
+                    name: "lookup".to_owned(),
+                    input: serde_json::json!({"query":"x"}),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -810,10 +1032,16 @@ mod tests {
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
         };
-        let completion =
-            send_anthropic(&request, Some(&base), &model, Thinking { budget_tokens: 0 }, &credential)
-                .await
-                .expect("the gateway answers through the SDK");
+        let completion = send_anthropic(
+            reqwest::Client::new(),
+            &request,
+            Some(&base),
+            &model,
+            Thinking { budget_tokens: 0 },
+            &credential,
+        )
+        .await
+        .expect("the gateway answers through the Messages transport");
 
         assert_eq!(completion.text().trim(), "live-ok", "the stream carried the exact answer");
         let usage = completion.usage.expect("the gateway reports usage");

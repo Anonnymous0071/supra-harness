@@ -103,14 +103,9 @@ supra_core = { path = "crates/supra_core", version = "0.2.0" }
 supra_lsp = { path = "crates/supra_lsp", version = "0.2.0" }
 supra_dap = { path = "crates/supra_dap", version = "0.2.0" }
 supra_session = { path = "crates/supra_session", version = "0.2.0" }
-# provider SDKs (T13): official OpenAI client; Anthropic Messages client.
-# The full OpenAI API surface is enabled (chat, responses, realtime,
-# audio, images, video, embeddings, files, batches, vectorstores, admin,
-# moderation, and the rest), so every endpoint the provider ships is
-# callable through the SDK. `anthropic-sdk-rust` ships as
-# `anthropic_sdk`.
+# provider transport (T13): official OpenAI client. Anthropic Messages use
+# direct canonical HTTP because Anthropic does not publish an official Rust SDK.
 async-openai = { version = "0.42.0", default-features = false, features = ["full", "rustls"] }
-anthropic_sdk = { version = "0.1.1", package = "anthropic-sdk-rust" }
 supra_hook = { path = "crates/supra_hook", version = "0.2.0" }
 supra_telemetry = { path = "crates/supra_telemetry", version = "0.2.0" }
 supra_command = { path = "crates/supra_command", version = "0.2.0" }
@@ -273,13 +268,3 @@ lto = "thin"
 codegen-units = 4
 strip = "none"
 debug = 1
-
-# The Anthropic SDK pins reqwest's default features, which pull native-tls
-# and openssl into the graph; this tree is rustls-only by policy (deny.toml
-# bans both crates). The SDK exposes no feature to turn its reqwest defaults
-# off, so the one-line fix ships as a vendored copy: identical to
-# anthropic-sdk-rust 0.1.1 except `default-features = false` plus
-# `rustls-tls` on its reqwest dependency. Every other byte matches the
-# published crate; re-vendor when the SDK publishes an upstream fix.
-[patch.crates-io]
-anthropic-sdk-rust = { path = "vendor/anthropic-sdk-rust" }

@@ -43,7 +43,7 @@
 //!
 //! Until T14 lands, this client carries thinking blocks verbatim and never drops them.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::error::LlmError;
 use crate::policy::{CachePolicy, ProviderKind};
@@ -74,13 +74,14 @@ impl Thinking {
 }
 
 /// One ordered content block in a provider message.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContentBlock {
-    /// Visible text.
+    /// Visible text and any provider citations attached to it.
     Text {
         /// The text exactly as received or sent.
         text: String,
+        /// Provider citation objects, retained verbatim and in order.
+        citations: Vec<serde_json::Value>,
     },
     /// Claude reasoning that must be replayed with its signature unchanged.
     Thinking {
@@ -107,11 +108,15 @@ pub enum ContentBlock {
     ToolResult {
         /// Identifier of the tool use this answers.
         tool_use_id: String,
-        /// Result text.
-        content: String,
+        /// Result content: either a string or an ordered array of provider blocks.
+        content: serde_json::Value,
         /// Whether execution failed.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+    },
+    /// A provider block this version does not interpret, retained for lossless replay.
+    Unknown {
+        /// The complete provider object.
+        raw: serde_json::Value,
     },
 }
 
@@ -119,7 +124,98 @@ impl ContentBlock {
     /// Construct a visible text block.
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
-        Self::Text { text: text.into() }
+        Self::Text { text: text.into(), citations: Vec::new() }
+    }
+
+    fn wire_value(&self) -> serde_json::Value {
+        match self {
+            Self::Text { text, citations } => {
+                let mut value = serde_json::json!({"type": "text", "text": text});
+                if !citations.is_empty() {
+                    value["citations"] = serde_json::Value::Array(citations.clone());
+                }
+                value
+            }
+            Self::Thinking { thinking, signature } => {
+                serde_json::json!({"type": "thinking", "thinking": thinking, "signature": signature})
+            }
+            Self::RedactedThinking { data } => {
+                serde_json::json!({"type": "redacted_thinking", "data": data})
+            }
+            Self::ToolUse { id, name, input } => {
+                serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+            }
+            Self::ToolResult { tool_use_id, content, is_error } => {
+                let mut value = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": content,
+                });
+                if *is_error {
+                    value["is_error"] = serde_json::Value::Bool(true);
+                }
+                value
+            }
+            Self::Unknown { raw } => raw.clone(),
+        }
+    }
+
+    fn from_wire_value(value: serde_json::Value) -> Result<Self, String> {
+        let kind = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "content block has no string type".to_owned())?;
+        let string = |field: &str| {
+            value
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{kind} content block has no string {field}"))
+        };
+        match kind {
+            "text" => Ok(Self::Text {
+                text: string("text")?,
+                citations: value
+                    .get("citations")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            }),
+            "thinking" => {
+                Ok(Self::Thinking { thinking: string("thinking")?, signature: string("signature")? })
+            }
+            "redacted_thinking" => Ok(Self::RedactedThinking { data: string("data")? }),
+            "tool_use" => Ok(Self::ToolUse {
+                id: string("id")?,
+                name: string("name")?,
+                input: value.get("input").cloned().unwrap_or(serde_json::Value::Null),
+            }),
+            "tool_result" => Ok(Self::ToolResult {
+                tool_use_id: string("tool_use_id")?,
+                content: value.get("content").cloned().unwrap_or(serde_json::Value::String(String::new())),
+                is_error: value.get("is_error").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            }),
+            _ => Ok(Self::Unknown { raw: value }),
+        }
+    }
+}
+
+impl Serialize for ContentBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.wire_value().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_wire_value(value).map_err(D::Error::custom)
     }
 }
 
@@ -145,7 +241,7 @@ impl Message {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect()
@@ -227,6 +323,12 @@ pub enum StopReason {
     MaxTokens,
     /// A configured stop sequence ended generation.
     StopSequence,
+    /// Claude paused a long-running server-tool turn and expects continuation.
+    PauseTurn,
+    /// Claude refused the request.
+    Refusal,
+    /// The model's context window was exceeded while generating.
+    ModelContextWindowExceeded,
     /// The provider removed content under its safety policy.
     ContentFilter,
     /// A provider-specific terminal reason not otherwise classified.
@@ -261,7 +363,7 @@ impl Completion {
         self.content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect()
@@ -471,6 +573,7 @@ impl Client {
 
     fn render_anthropic(request: &Request, body: &mut serde_json::Map<String, serde_json::Value>) {
         body.insert("max_tokens".to_owned(), serde_json::Value::from(32_000));
+        body.insert("stream".to_owned(), serde_json::Value::Bool(true));
         body.insert("messages".to_owned(), Self::messages_value(request));
         if !request.tools.is_empty() {
             if let Ok(tools) = Self::tools_value(request) {
@@ -478,30 +581,63 @@ impl Client {
             }
         }
         if request.thinking.enabled() {
-            body.insert(
-                "thinking".to_owned(),
+            let thinking = if anthropic_supports_adaptive_thinking(
+                body.get("model").and_then(serde_json::Value::as_str).unwrap_or_default(),
+            ) {
+                serde_json::json!({"type": "adaptive"})
+            } else {
                 serde_json::json!({
                     "type": "enabled",
                     "budget_tokens": request.thinking.budget_tokens,
-                }),
-            );
-        }
-        let policy = CachePolicy::for_kind(ProviderKind::Anthropic);
-        let breakpoints: Vec<serde_json::Value> = request
-            .effective_breakpoints()
-            .iter()
-            .map(|breakpoint| {
-                serde_json::json!({
-                    "type": "ephemeral",
-                    "ttl": match policy.ttl_for(*breakpoint) {
-                        supra_types::CacheTtl::OneHour => "1h",
-                        supra_types::CacheTtl::FiveMinutes => "5m",
-                    },
                 })
-            })
-            .collect();
-        if !breakpoints.is_empty() {
-            body.insert("cache_control".to_owned(), serde_json::Value::Array(breakpoints));
+            };
+            body.insert("thinking".to_owned(), thinking);
+        }
+        Self::apply_anthropic_cache_controls(request, body);
+    }
+
+    fn apply_anthropic_cache_controls(
+        request: &Request,
+        body: &mut serde_json::Map<String, serde_json::Value>,
+    ) {
+        let policy = CachePolicy::for_kind(ProviderKind::Anthropic);
+        for breakpoint in request.effective_breakpoints() {
+            let cache_control = serde_json::json!({
+                "type": "ephemeral",
+                "ttl": match policy.ttl_for(breakpoint) {
+                    supra_types::CacheTtl::OneHour => "1h",
+                    supra_types::CacheTtl::FiveMinutes => "5m",
+                },
+            });
+            match breakpoint {
+                supra_types::Breakpoint::Bp1Tools => {
+                    if let Some(tool) = body
+                        .get_mut("tools")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|tools| tools.last_mut())
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        tool.insert("cache_control".to_owned(), cache_control);
+                    }
+                }
+                supra_types::Breakpoint::Bp2System | supra_types::Breakpoint::Bp3MemoryIndex => {
+                    // `Request` does not carry system/memory blocks separately yet. Do not
+                    // invent a top-level cache-control shape the API does not accept.
+                }
+                supra_types::Breakpoint::Bp4PreviousTurn => {
+                    if let Some(block) = body
+                        .get_mut("messages")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|messages| messages.last_mut())
+                        .and_then(|message| message.get_mut("content"))
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|content| content.last_mut())
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        block.insert("cache_control".to_owned(), cache_control);
+                    }
+                }
+            }
         }
     }
 
@@ -527,7 +663,7 @@ impl Client {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlock::Text { text } => Some(serde_json::json!({"text": text})),
+                        ContentBlock::Text { text, .. } => Some(serde_json::json!({"text": text})),
                         ContentBlock::ToolUse { name, input, .. } => {
                             Some(serde_json::json!({"functionCall": {"name": name, "args": input}}))
                         }
@@ -537,7 +673,9 @@ impl Client {
                                 "response": {"content": content, "is_error": is_error},
                             }}))
                         }
-                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
+                        ContentBlock::Thinking { .. }
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Unknown { .. } => None,
                     })
                     .collect();
                 serde_json::json!({
@@ -595,10 +733,11 @@ impl Client {
 
     /// Send one request and read the completion.
     ///
-    /// Anthropic and `OpenAI` travel through their official SDKs; Google
-    /// keeps the hand-rolled transport (no official Rust SDK exists),
-    /// with the same body rendering, status mapping, and SSE reading as
-    /// before. The error contract is identical on every path.
+    /// Anthropic uses the canonical request bytes produced here directly;
+    /// `OpenAI` travels through its official SDK. Google keeps the
+    /// hand-rolled transport (no official Rust SDK exists), with the same
+    /// body rendering, status mapping, and SSE reading as before. The error
+    /// contract is identical on every path.
     ///
     /// # Errors
     ///
@@ -614,6 +753,7 @@ impl Client {
         match self.policy.kind {
             ProviderKind::Anthropic => {
                 crate::providers::send_anthropic(
+                    self.http.clone(),
                     request,
                     sdk_endpoint(&self.endpoint),
                     &self.model,
@@ -684,6 +824,15 @@ impl Client {
 
         read_google_sse(response, request.thinking).await
     }
+}
+
+/// Adaptive thinking is accepted by current Claude 4.6+ and 5-series models.
+/// Older model families still require the budget-based request shape.
+fn anthropic_supports_adaptive_thinking(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    ["claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-opus-4-6", "claude-sonnet-4-6"]
+        .iter()
+        .any(|family| model.contains(family))
 }
 
 /// The endpoint as an SDK base override: `None` when the configuration
@@ -872,6 +1021,9 @@ fn parse_stop_reason(reason: &str) -> StopReason {
         "tool_use" | "tool_calls" | "function_call" => StopReason::ToolUse,
         "max_tokens" | "length" => StopReason::MaxTokens,
         "stop_sequence" => StopReason::StopSequence,
+        "pause_turn" => StopReason::PauseTurn,
+        "refusal" => StopReason::Refusal,
+        "model_context_window_exceeded" => StopReason::ModelContextWindowExceeded,
         "content_filter" | "safety" => StopReason::ContentFilter,
         other => StopReason::Other(other.to_owned()),
     }
@@ -939,8 +1091,10 @@ mod tests {
         let request = Request {
             provider: ProviderKind::Anthropic,
             model: "m".to_owned(),
-            messages: Vec::new(),
-            tools: Vec::new(),
+            messages: vec![Message::text(Role::User, "cache me")],
+            tools: vec![
+                crate::canonicalize(r#"{"input_schema":{"type":"object"},"name":"lookup"}"#).expect("tool"),
+            ],
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Breakpoint::ALL.to_vec(),
         };
@@ -1021,7 +1175,7 @@ mod tests {
                     },
                     ContentBlock::ToolResult {
                         tool_use_id: "tool-1".to_owned(),
-                        content: "found".to_owned(),
+                        content: serde_json::Value::String("found".to_owned()),
                         is_error: true,
                     },
                     ContentBlock::text("done"),
@@ -1035,7 +1189,7 @@ mod tests {
         let body = client.render_body(&request).expect("replay renders");
         assert_eq!(
             body.as_str(),
-            r#"{"max_tokens":32000,"messages":[{"content":[{"signature":"sig","thinking":"trace","type":"thinking"},{"data":"opaque","type":"redacted_thinking"},{"id":"tool-1","input":{"query":"x"},"name":"lookup","type":"tool_use"},{"content":"found","is_error":true,"tool_use_id":"tool-1","type":"tool_result"},{"text":"done","type":"text"}],"role":"assistant"}],"model":"test-model"}"#
+            r#"{"max_tokens":32000,"messages":[{"content":[{"signature":"sig","thinking":"trace","type":"thinking"},{"data":"opaque","type":"redacted_thinking"},{"id":"tool-1","input":{"query":"x"},"name":"lookup","type":"tool_use"},{"content":"found","is_error":true,"tool_use_id":"tool-1","type":"tool_result"},{"text":"done","type":"text"}],"role":"assistant"}],"model":"test-model","stream":true}"#
         );
     }
 

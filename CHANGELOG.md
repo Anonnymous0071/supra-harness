@@ -9,14 +9,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-- Official provider SDKs (`supra_llm::providers`): `OpenAI` travels
-  through `async-openai` (chat-completion surface only), `Anthropic`
-  through `anthropic-sdk-rust` Messages streaming. Policy, canonical
+- Provider transports (`supra_llm::providers`): `OpenAI` travels
+  through `async-openai` (chat-completion surface only), while `Anthropic`
+  sends canonical Messages API bytes directly over rustls. Policy, canonical
   rendering, and the `LlmError` recoverability contract are unchanged;
   `Google` keeps the hand-rolled transport.
 - `Client::from_config` / `Client::send_with_config`: endpoint, model,
   and budget from `[providers.<name>]`; empty model selects the cheapest
-  default (`gpt-4o-mini` / `claude-3-5-haiku-20241022`); credential
+  active default (`gpt-4o-mini` / `claude-haiku-4-5-20251001`); credential
   resolves per request and is never stored.
 - `supra eval --live` probes every configured SDK provider through
   `Client` instead of refusing.
