@@ -45,7 +45,7 @@ PY
         exit 1
     fi
     SUPRA_COMPONENT_ARTIFACT="$artifact" \
-        cargo test --locked -p supra_plugin component_contract_accepts -- --ignored
+        cargo test --manifest-path "$root/Cargo.toml" --locked -p supra_plugin component_contract_accepts -- --ignored
     built=$((built + 1))
 done
 
