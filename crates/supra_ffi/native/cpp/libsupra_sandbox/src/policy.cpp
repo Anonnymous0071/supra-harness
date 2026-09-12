@@ -70,7 +70,43 @@ void setErrorErrno(char* dest, std::size_t cap, const char* message, int err) {
 }
 
 bool isAbsolute(const char* path) {
+#if defined(_WIN32)
+    if (path == nullptr) {
+        return false;
+    }
+    const auto isSeparator = [](char ch) { return ch == '\\' || ch == '/'; };
+    const auto isAsciiLetter = [](char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+    };
+
+    // Drive-rooted path. Deliberately reject drive-relative "C:foo" and device
+    // namespaces (\\?\ and \\.\), whose alternate parsing could escape a rule.
+    if (isAsciiLetter(path[0]) && path[1] == ':' && isSeparator(path[2])) {
+        return true;
+    }
+
+    // UNC path requires both a server and share component. A single leading
+    // separator is rooted on the current drive, not an unambiguous absolute path.
+    if (isSeparator(path[0]) && isSeparator(path[1]) && path[2] != '?' && path[2] != '.') {
+        const char* server = path + 2;
+        const char* slash = server;
+        while (*slash != '\0' && !isSeparator(*slash)) {
+            ++slash;
+        }
+        if (slash == server || *slash == '\0') {
+            return false;
+        }
+        const char* share = slash + 1;
+        const char* end = share;
+        while (*end != '\0' && !isSeparator(*end)) {
+            ++end;
+        }
+        return end != share;
+    }
+    return false;
+#else
     return path != nullptr && path[0] == '/';
+#endif
 }
 
 int validatePolicy(const supra_sandbox_policy* policy, char* error, std::size_t error_cap) {
@@ -87,7 +123,17 @@ int validatePolicy(const supra_sandbox_policy* policy, char* error, std::size_t 
         setError(error, error_cap, "port_count exceeds SUPRA_SANDBOX_MAX_PORTS");
         return 0;
     }
+    if (policy->network > SUPRA_SANDBOX_NET_FULL) {
+        setError(error, error_cap, "network is not a known policy");
+        return 0;
+    }
+    if (policy->isolate_processes > 1U || policy->isolate_ipc > 1U) {
+        setError(error, error_cap, "isolation flags must be zero or one");
+        return 0;
+    }
 
+    constexpr std::uint32_t kKnownAccess = SUPRA_SANDBOX_READ | SUPRA_SANDBOX_WRITE |
+                                           SUPRA_SANDBOX_EXECUTE | SUPRA_SANDBOX_MANAGE;
     for (std::size_t i = 0; i < policy->path_count; ++i) {
         const auto& rule = policy->paths[i];
         if (!isAbsolute(rule.path)) {
@@ -101,6 +147,12 @@ int validatePolicy(const supra_sandbox_policy* policy, char* error, std::size_t 
             char message[SUPRA_SANDBOX_ERROR_LEN];
             std::snprintf(message, sizeof message, "path rule %zu grants no access: %s", i,
                           rule.path);
+            setError(error, error_cap, message);
+            return 0;
+        }
+        if ((rule.access & ~kKnownAccess) != 0U) {
+            char message[SUPRA_SANDBOX_ERROR_LEN];
+            std::snprintf(message, sizeof message, "path rule %zu contains unknown access bits", i);
             setError(error, error_cap, message);
             return 0;
         }

@@ -11,7 +11,7 @@
 // Windows: AppContainer via `CreateProcessAsUser` with a capability SID, plus a
 // job object for the process-tree limit.
 
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(__APPLE__) && !defined(_WIN32)
 
 #include <cstddef>
 #include <cstring>
@@ -79,6 +79,10 @@ int supra_sandbox_kill(const supra_sandbox_process* process, uint32_t grace_ms) 
     return 0;
 }
 
+void supra_sandbox_release(supra_sandbox_process* process) {
+    static_cast<void>(process);
+}
+
 }  // extern "C"
 
-#endif  // !__linux__
+#endif  // unsupported platform

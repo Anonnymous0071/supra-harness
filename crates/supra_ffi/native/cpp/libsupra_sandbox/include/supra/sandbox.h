@@ -27,9 +27,9 @@
 ///   absent from the boot list. Process and network isolation hold; filesystem
 ///   policy degrades to what the invoking user's own permissions already allow,
 ///   and the tier says so.
-/// * **macOS**, `sandbox_init` with a generated SBPL profile. Not yet
-///   implemented.
-/// * **Windows**, AppContainer plus a job object. Not yet implemented.
+/// * **macOS**, `sandbox_init` with a generated SBPL profile.
+/// * **Windows**, a restricted token plus explicit handle inheritance and a
+///   kill-on-close job object.
 ///
 /// ### Why not bubblewrap
 ///
@@ -253,6 +253,12 @@ typedef struct supra_sandbox_process {
     int64_t pid;
     /// Tier that actually applied.
     uint8_t tier;
+    /// Backend-owned process handle, stored as an integer for the flat ABI.
+    /// Zero on POSIX and after wait, kill, or release transfers ownership.
+    uintptr_t native_process;
+    /// Backend-owned process-tree handle. Windows stores the job object here;
+    /// zero on POSIX and after wait, kill, or release transfers ownership.
+    uintptr_t native_job;
     /// Diagnostic text on failure. Empty on success.
     char error[SUPRA_SANDBOX_ERROR_LEN];
 } supra_sandbox_process;
@@ -308,6 +314,13 @@ int supra_sandbox_wait(const supra_sandbox_process* process, uint32_t timeout_ms
 ///
 /// @return 1 on success, 0 on failure.
 int supra_sandbox_kill(const supra_sandbox_process* process, uint32_t grace_ms);
+
+/// Release backend-owned handles without terminating the process.
+///
+/// This transfers cleanup responsibility to the caller. On Windows, closing the
+/// kill-on-close job would terminate the tree, so the backend first clears that
+/// limit and then closes its process and job handles. POSIX backends are no-ops.
+void supra_sandbox_release(supra_sandbox_process* process);
 
 /* ------------------------------------------------------------------------- */
 /* Self-identification                                                       */

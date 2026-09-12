@@ -15,6 +15,7 @@
 
 use core::ffi::{c_char, c_int};
 use std::ffi::{CString, NulError, OsStr, OsString};
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 
@@ -30,6 +31,10 @@ pub enum Error {
     /// A path or argument contained an interior NUL, so it cannot cross the C
     /// boundary.
     InteriorNul,
+    /// A path or argument is not valid UTF-8. The Windows C ABI deliberately
+    /// accepts strict UTF-8 only so conversion at the security boundary is never
+    /// lossy.
+    InvalidUtf8,
     /// A path was not absolute. Rejected at construction because resolving a
     /// relative path would depend on the working directory at an unpredictable
     /// moment, and a sandbox whose scope shifts with `chdir` is not a boundary.
@@ -46,6 +51,7 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::InteriorNul => write!(f, "value contains an interior NUL byte"),
+            Self::InvalidUtf8 => write!(f, "value is not valid UTF-8"),
             Self::NotAbsolute(path) => write!(f, "path is not absolute: {}", path.display()),
             Self::TableFull => write!(f, "policy table is full"),
             Self::Refused(message) => write!(f, "sandbox refused to start: {message}"),
@@ -59,6 +65,35 @@ impl std::error::Error for Error {}
 impl From<NulError> for Error {
     fn from(_: NulError) -> Self {
         Self::InteriorNul
+    }
+}
+
+// These helpers deliberately keep one cross-platform signature. Windows can
+// reject non-UTF-8 OS strings while Unix cannot, and splitting every call site
+// by target would make the security-boundary conversion easier to drift.
+// The Windows projections are fallible even though the Unix projections are not.
+#[allow(clippy::unnecessary_wraps)]
+fn os_bytes(value: &OsStr) -> Result<Vec<u8>, Error> {
+    #[cfg(unix)]
+    {
+        Ok(value.as_bytes().to_vec())
+    }
+    #[cfg(windows)]
+    {
+        value.to_str().map(str::as_bytes).map(ToOwned::to_owned).ok_or(Error::InvalidUtf8)
+    }
+}
+
+// Windows rejects bytes that are not strict UTF-8; Unix preserves them exactly.
+#[allow(clippy::unnecessary_wraps)]
+fn os_string(bytes: Vec<u8>) -> Option<OsString> {
+    #[cfg(unix)]
+    {
+        Some(OsString::from_vec(bytes))
+    }
+    #[cfg(windows)]
+    {
+        String::from_utf8(bytes).ok().map(OsString::from)
     }
 }
 
@@ -284,7 +319,7 @@ impl Policy {
             return Err(Error::TableFull);
         }
 
-        let raw = CString::new(path.as_os_str().as_bytes())?;
+        let raw = CString::new(os_bytes(path.as_os_str())?)?;
         self.paths.push((raw, access));
         Ok(self)
     }
@@ -449,7 +484,7 @@ impl Command {
     ///
     /// [`Error::InteriorNul`] when the program path contains a NUL byte.
     pub fn new(program: impl AsRef<Path>) -> Result<Self, Error> {
-        let program_c = CString::new(program.as_ref().as_os_str().as_bytes())?;
+        let program_c = CString::new(os_bytes(program.as_ref().as_os_str())?)?;
         Ok(Self {
             // argv[0] conventionally repeats the program path.
             args: vec![program_c.clone()],
@@ -468,7 +503,7 @@ impl Command {
     ///
     /// [`Error::InteriorNul`] when the argument contains a NUL byte.
     pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> Result<&mut Self, Error> {
-        self.args.push(CString::new(arg.as_ref().as_bytes())?);
+        self.args.push(CString::new(os_bytes(arg.as_ref())?)?);
         Ok(self)
     }
 
@@ -497,10 +532,10 @@ impl Command {
     ///
     /// [`Error::InteriorNul`] when the key or value contains a NUL byte.
     pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Result<&mut Self, Error> {
-        let mut entry = OsString::from(key.as_ref());
-        entry.push("=");
-        entry.push(value.as_ref());
-        self.env.push(CString::new(entry.into_vec())?);
+        let mut entry = os_bytes(key.as_ref())?;
+        entry.push(b'=');
+        entry.extend_from_slice(&os_bytes(value.as_ref())?);
+        self.env.push(CString::new(entry)?);
         Ok(self)
     }
 
@@ -510,7 +545,7 @@ impl Command {
     ///
     /// [`Error::InteriorNul`] when the directory contains a NUL byte.
     pub fn working_dir(&mut self, dir: impl AsRef<Path>) -> Result<&mut Self, Error> {
-        self.working_dir = Some(CString::new(dir.as_ref().as_os_str().as_bytes())?);
+        self.working_dir = Some(CString::new(os_bytes(dir.as_ref().as_os_str())?)?);
         Ok(self)
     }
 
@@ -589,6 +624,10 @@ impl Process {
         match result {
             1 => {
                 self.reaped = true;
+                // Windows releases native process/job handles inside wait. POSIX
+                // has nothing to release, so this is harmless on every backend.
+                // SAFETY: `self.raw` is live and exclusively borrowed.
+                unsafe { sys::supra_sandbox_release(&raw mut self.raw) };
                 Ok(Some(status))
             }
             0 => Ok(None),
@@ -621,6 +660,9 @@ impl Process {
     #[must_use = "the pid is the caller's only handle once the process is detached"]
     pub fn detach(mut self) -> i64 {
         self.reaped = true;
+        // SAFETY: `raw` is live and uniquely owned. The backend invalidates only
+        // its native handle fields and leaves the host-visible pid intact.
+        unsafe { sys::supra_sandbox_release(&raw mut self.raw) };
         self.raw.pid
     }
 }
@@ -729,7 +771,7 @@ pub fn self_path() -> Option<PathBuf> {
     if len == 0 || len >= buffer.len() {
         return None;
     }
-    Some(PathBuf::from(OsStr::from_bytes(&buffer[..len])))
+    os_string(buffer[..len].to_vec()).map(PathBuf::from)
 }
 
 /// Identity of the running executable.
@@ -754,7 +796,7 @@ pub fn self_identity() -> Option<FileIdentity> {
 /// [`Error::InteriorNul`] when the path contains a NUL byte. A path that does not
 /// resolve is `Ok(None)`, not an error: absence is an answer.
 pub fn file_identity(path: impl AsRef<Path>) -> Result<Option<FileIdentity>, Error> {
-    let raw_path = CString::new(path.as_ref().as_os_str().as_bytes())?;
+    let raw_path = CString::new(os_bytes(path.as_ref().as_os_str())?)?;
     let mut device: u64 = 0;
     let mut inode: u64 = 0;
     // SAFETY: `raw_path` is a live NUL-terminated string; both output pointers
