@@ -19,9 +19,10 @@ class through.
 
 | Module | Owns |
 |---|---|
-| `host` | `Host`, `Plugin`, `HostState`: engine, linkers, verify, instantiate, call |
+| `host` | `Host`, `Plugin`, `HostState`: engine, class linkers, verify, instantiate, call |
+| `dispatch` | injectable `HostDispatcher`, closed WIT routes, fail-closed default, limits, audit records |
 | `world` | the WIT world text (`supra.wit`, one source) and the class ladder |
-| `error` | `PluginError`: engine / unlisted import / missing host import / signature / fuel / trap |
+| `error` | `PluginError`: engine / import / signature / dispatch / fuel / guest trap |
 
 ## Decisions
 
@@ -65,18 +66,62 @@ not the argument's pointer: the argument's memory belongs to the caller,
 and a guest returning it traps `string pointer/length out of bounds` -
 three fixture shapes measured that before the fourth landed.
 
-**Component calls own their cleanup.** With the pinned Wasmtime 36 API,
-`TypedFunc::call` lifts the owned result and leaves the instance in a state
-that requires `TypedFunc::post_return` before another component function can
-run. The host performs that cleanup explicitly. A post-return failure returns
-as `PluginError::Trap`; fuel exhaustion during either guest execution or
-cleanup remains `FuelExhausted`. The repeated-call fixture pins that a
-successful call leaves one component instance reusable.
+**`HostState` is the runtime socket.** `Host::with_dispatcher` accepts an
+`Arc<dyn HostDispatcher>` supplied by the runtime. Dispatch receives a closed
+`HostFunction` enum rather than caller-selected path text, so only functions
+registered in the plugin's class linker can reach it. This crate deliberately
+does not execute CLI tools or assemble digest, permission, sandbox, journal,
+or TUI services; the runtime adapter owns that policy and behavior.
 
-**`HostState` is the T23 socket.** One state per component instance, host
-functions closing over it; today it carries the call log the tests and
-the audit read, and T23's dispatch (file reads through the workspace,
-spawns through the sandbox) plugs into the same shape.
+`Host::new` installs `DenyAllDispatcher`: an allowed import is present but its
+call traps as `PluginError::HostDispatch` until the runtime injects behavior.
+It never returns fake success. Dispatcher failures and argument/result/call
+bound refusals use the same distinct error variant; unrelated guest traps stay
+`PluginError::Trap`.
+
+**Host calls and their audit are bounded per instance.** `HostLimits` caps
+argument bytes, result bytes, and the number of attempted dispatches. The call
+cap is also the retained audit cap. Accepted attempts are recorded before the
+dispatcher runs, including dispatcher and oversized-result failures; an
+oversized argument or exhausted call cap is rejected before retaining more
+untrusted text. `Plugin::calls` exposes the ordered `HostCall` records
+read-only.
+
+## Runtime integration
+
+The runtime can inject its supra_tool/permission/sandbox/journal-backed adapter
+without coupling those crates to the component mechanism:
+
+```rust
+use std::sync::Arc;
+use supra_plugin::{DispatchError, Host, HostDispatcher, HostFunction};
+
+struct RuntimeDispatcher;
+
+impl HostDispatcher for RuntimeDispatcher {
+    fn dispatch(
+        &self,
+        _caller: &supra_plugin::PluginIdentity,
+        function: HostFunction,
+        argument: &str,
+    ) -> Result<String, DispatchError> {
+        match function {
+            HostFunction::ReadFile => todo!("workspace-bounded read of {argument}"),
+            HostFunction::Search => todo!("digest-backed search of {argument}"),
+            HostFunction::Spawn => todo!("permission and sandbox-backed spawn of {argument}"),
+            HostFunction::Snapshot => todo!("journal-backed snapshot of {argument}"),
+            HostFunction::AskUser => todo!("TUI-mediated question {argument}"),
+        }
+    }
+}
+
+let host = Host::with_dispatcher(Arc::new(RuntimeDispatcher))?;
+# Ok::<(), supra_plugin::PluginError>(())
+```
+
+The dispatcher is synchronous because the current Wasmtime callbacks are
+synchronous. A future async runtime must deliberately migrate the host to
+Wasmtime's async component API rather than block inside this trait.
 
 ## Mutation results
 
@@ -104,10 +149,10 @@ path.
 
 ## Obligations left to later stages
 
-- **T23** supplies the real dispatch behind `HostState`'s stubs: reads
-  through the digest, spawns through T16's sandbox, snapshots through
-  T16.6 - the stubs answer `host:{path}` today and the call log is the
-  audit trail either way.
+- **T23/runtime assembly** implements the injected dispatcher with
+  workspace-bounded reads, digest search, permission-gated sandbox spawn,
+  journal snapshots, and TUI-mediated user questions. This crate supplies the
+  class-safe routing seam and fail-closed behavior, not those services.
 - **T21/T22** peers run as components through this host; the cohort's
   k is bounded by the fuel budget as much as by the peer limit.
 - **T30** loads plugin components from configuration and hands them to

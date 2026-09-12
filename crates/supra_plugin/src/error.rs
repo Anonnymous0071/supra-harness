@@ -11,7 +11,9 @@
 //! | `MissingHostImport` | the host offers no function the class set needs | the operator (a host bug) |
 //! | `WrongSignature` | a component import's type is not the declared one | the author |
 //! | `FuelExhausted` | the guest burnt its fuel | the author (or the budget) |
-//! | `Trap` | component invocation or canonical cleanup failed | the author |
+//! | `HostDispatch` | an allowed host call or its bounds refused | the runtime/operator |
+//! | `ResourceLimit` | guest memory/table/output exceeded a configured bound | the author/operator |
+//! | `Trap` | the guest trapped | the author |
 
 use thiserror::Error;
 
@@ -76,11 +78,28 @@ pub enum PluginError {
         budget: u64,
     },
 
-    /// Component invocation failed. This includes guest traps, result
-    /// lifting failures, and canonical post-return cleanup failures because
-    /// Wasmtime performs all three inside one typed call. The detail is
-    /// Wasmtime's own message, and the component author owns it.
-    #[error("component {component:?} invocation failed: {detail}")]
+    /// A present and class-allowed host import was refused by dispatch or
+    /// one of its resource bounds.
+    #[error("component {component:?} host dispatch failed: {detail}")]
+    HostDispatch {
+        /// The component, by its configured name.
+        component: String,
+        /// The closed host route and refusal detail.
+        detail: String,
+    },
+
+    /// A configured resource bound refused guest allocation or output.
+    #[error("component {component:?} exceeded a resource limit: {detail}")]
+    ResourceLimit {
+        /// The component, by its configured name.
+        component: String,
+        /// The resource and configured bound.
+        detail: String,
+    },
+
+    /// The guest trapped. The detail is the trap's own message - it names
+    /// the fault, and the author owns it.
+    #[error("component {component:?} trapped: {detail}")]
     Trap {
         /// The component, by its configured name.
         component: String,
