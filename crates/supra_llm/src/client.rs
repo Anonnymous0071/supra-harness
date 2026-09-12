@@ -494,15 +494,16 @@ impl Client {
     /// Send one request through the client, resolving the credential
     /// from the configuration on the way.
     ///
-    /// This is the one-call path a turn drives: provider entry for the
-    /// request's kind, secret from the named source, SDK transport
-    /// underneath. The request's own provider field selects the entry;
-    /// the client's policy still gates thinking and breakpoints.
+    /// This is the one-call path a turn drives: the client-bound provider
+    /// entry, its named secret source, and its SDK transport underneath.
+    /// A request naming another provider is rejected before secret resolution,
+    /// so a credential can never cross provider boundaries.
     ///
     /// # Errors
     ///
-    /// [`LlmError::Credential`] when the named source has nothing to
-    /// give; otherwise as [`Client::send`].
+    /// [`LlmError::ProviderMismatch`] when the request names a provider other
+    /// than this client; [`LlmError::Credential`] when the bound provider's
+    /// named source has nothing to give; otherwise as [`Client::send`].
     pub async fn send_with_config(
         &self,
         config: &supra_config::Config,
@@ -511,7 +512,7 @@ impl Client {
     ) -> Result<Completion, LlmError> {
         self.check_provider(request)?;
         let credential =
-            config.provider_secret(request.provider.name(), manager).map_err(LlmError::Credential)?;
+            config.provider_secret(self.policy.kind.name(), manager).map_err(LlmError::Credential)?;
         self.send(request, &credential).await
     }
 
@@ -902,7 +903,16 @@ fn anthropic_supports_adaptive_thinking(model: &str) -> bool {
         "claude-sonnet-4-6",
     ]
     .iter()
-    .any(|family| model.contains(family))
+    .any(|family| model_family_matches(&model, family))
+}
+
+fn model_family_matches(model: &str, family: &str) -> bool {
+    model.match_indices(family).any(|(start, _)| {
+        let before = model[..start].chars().next_back();
+        let after = model[start + family.len()..].chars().next();
+        !before.is_some_and(|character| character.is_ascii_alphanumeric())
+            && !after.is_some_and(|character| character.is_ascii_alphanumeric())
+    })
 }
 
 /// The endpoint as an SDK base override: `None` when the configuration
@@ -1581,6 +1591,53 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn mismatched_provider_is_refused_before_transport() {
+        let credential = supra_secrets::SecretString::new("must-not-leave-process".to_owned());
+        let providers = [ProviderKind::Anthropic, ProviderKind::OpenAI, ProviderKind::Google];
+
+        for client_kind in providers {
+            let client = test_client(client_kind);
+            for request_kind in providers {
+                if request_kind == client_kind {
+                    continue;
+                }
+                let request = Request {
+                    provider: request_kind,
+                    model: "m".to_owned(),
+                    messages: vec![Message::text(Role::User, "hi")],
+                    tools: Vec::new(),
+                    thinking: Thinking { budget_tokens: 0 },
+                    breakpoints: Vec::new(),
+                };
+                let error = client.send(&request, &credential).await.expect_err("provider mismatch");
+                assert_eq!(
+                    error,
+                    LlmError::ProviderMismatch {
+                        request: request_kind.name().to_owned(),
+                        client: client_kind.name().to_owned(),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_thinking_matches_only_complete_model_family_tokens() {
+        for model in [
+            "claude-opus-4-7-20260219",
+            "anthropic.claude-opus-4-8-v1:0",
+            "claude-sonnet-5-1",
+            "CLAUDE-FABLE-5",
+        ] {
+            assert!(anthropic_supports_adaptive_thinking(model), "{model}");
+        }
+
+        for model in ["claude-opus-4-70", "claude-opus-4-8preview", "claude-sonnet-50", "myclaude-opus-5"] {
+            assert!(!anthropic_supports_adaptive_thinking(model), "{model}");
+        }
     }
 
     #[test]
