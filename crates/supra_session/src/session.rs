@@ -135,14 +135,9 @@ mod tests {
     use super::*;
 
     fn scratch() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "supra-session-l2-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("supra-session-l2-{}", std::process::id()));
+        dir.push(supra_types::SessionId::generate().to_string());
         std::fs::create_dir_all(&dir).expect("dir");
         dir
     }
