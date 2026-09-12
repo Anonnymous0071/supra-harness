@@ -69,6 +69,45 @@ impl Session {
         store::save(directory, self.id, &turns)
     }
 
+    /// Build an additive, lossless checkpoint from this legacy session view.
+    ///
+    /// Existing turns retain their accepted display bodies. Callers that own
+    /// provider protocol blocks can replace these records with
+    /// [`CheckpointTurn`](crate::CheckpointTurn)s before publication.
+    #[must_use]
+    pub fn checkpoint(&self) -> crate::SessionCheckpoint {
+        let mut checkpoint = crate::SessionCheckpoint::new(self.id);
+        for (turn, body) in self.turns.iter().zip(&self.bodies) {
+            // The legacy vectors are kept in lockstep by every constructor and
+            // recorder, so duplicate ids are the only possible refusal. Legacy
+            // Session permitted them; retain the first rather than panic.
+            let _ = checkpoint.push_turn(crate::CheckpointTurn::new(*turn, body.clone(), Vec::new(), None));
+        }
+        checkpoint
+    }
+
+    /// Persist a caller-supplied lossless checkpoint for this session.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Malformed`] when the checkpoint names another session;
+    /// otherwise whatever the checkpoint store refuses.
+    pub fn save_checkpoint(
+        &self,
+        directory: &Path,
+        checkpoint: &crate::SessionCheckpoint,
+        expected_revision: Option<u64>,
+    ) -> Result<(), SessionError> {
+        if checkpoint.session() != self.id {
+            return Err(SessionError::Malformed(format!(
+                "checkpoint names session {} but this session is {}",
+                checkpoint.session(),
+                self.id
+            )));
+        }
+        store::save_checkpoint(directory, checkpoint, expected_revision)
+    }
+
     /// Resume a persisted session, or `None` when it was never saved.
     ///
     /// # Errors
@@ -83,6 +122,29 @@ impl Session {
             bodies.push(body);
         }
         Ok(Some(Self { id, turns: ids, bodies }))
+    }
+
+    /// Resume the lossless checkpoint and its legacy `Session` projection.
+    ///
+    /// Legacy tuple files are upgraded in memory. Structured provider payloads
+    /// remain available in the returned checkpoint while the `Session` keeps
+    /// the accepted display bodies used by existing call sites.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the checkpoint store refuses.
+    pub fn resume_checkpoint(
+        directory: &Path,
+        id: SessionId,
+    ) -> Result<Option<(Self, crate::SessionCheckpoint)>, SessionError> {
+        let Some(checkpoint) = store::load_checkpoint(directory, id)? else { return Ok(None) };
+        let mut turns = Vec::with_capacity(checkpoint.turns().len());
+        let mut bodies = Vec::with_capacity(checkpoint.turns().len());
+        for turn in checkpoint.turns() {
+            turns.push(turn.turn());
+            bodies.push(turn.display_body().to_owned());
+        }
+        Ok(Some((Self { id, turns, bodies }, checkpoint)))
     }
 
     /// Branch: a new session id carrying this session's turns. The

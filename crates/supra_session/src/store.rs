@@ -4,12 +4,28 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
+use serde::{Deserialize, Serialize};
 use supra_types::{SessionId, TurnId};
 
+use crate::checkpoint::{CHECKPOINT_VERSION, CheckpointTurn, SessionCheckpoint};
 use crate::error::SessionError;
 
 const FILE_PREFIX: &str = "session-";
 const FILE_SUFFIX: &str = ".json";
+
+#[derive(Serialize)]
+struct CheckpointDocument<'a> {
+    format: &'static str,
+    version: u32,
+    checkpoint: &'a SessionCheckpoint,
+}
+
+#[derive(Deserialize)]
+struct OwnedCheckpointDocument {
+    format: String,
+    version: u32,
+    checkpoint: serde_json::Value,
+}
 
 fn file_path(directory: &Path, session: SessionId) -> PathBuf {
     directory.join(format!("{FILE_PREFIX}{session}{FILE_SUFFIX}"))
@@ -144,14 +160,70 @@ pub fn load(directory: &Path, session: SessionId) -> Result<Option<Vec<(TurnId, 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let (stored, turns): (SessionId, Vec<(TurnId, String)>) =
-        serde_json::from_slice(&bytes).map_err(|error| SessionError::Malformed(error.to_string()))?;
-    if stored != session {
-        return Err(SessionError::Malformed(format!(
-            "the file names session {stored} but was asked for {session}"
-        )));
+    if let Ok((stored, turns)) = serde_json::from_slice::<(SessionId, Vec<(TurnId, String)>)>(&bytes) {
+        if stored != session {
+            return Err(SessionError::Malformed(format!(
+                "the file names session {stored} but was asked for {session}"
+            )));
+        }
+        return Ok(Some(turns));
     }
-    Ok(Some(turns))
+
+    let checkpoint = decode_checkpoint(&bytes, session)?;
+    Ok(Some(checkpoint.turns().iter().map(|turn| (turn.turn(), turn.display_body().to_owned())).collect()))
+}
+
+/// Persist a versioned, lossless checkpoint under its session directory.
+///
+/// A per-session lock serialises cooperating writers. When `expected_revision`
+/// is present, publication is compare-and-swap: a stale writer refuses instead
+/// of replacing a newer checkpoint.
+///
+/// # Errors
+///
+/// [`SessionError::RevisionConflict`] for a stale expected revision;
+/// [`SessionError::Malformed`] for invalid checkpoint state; otherwise I/O.
+pub fn save_checkpoint(
+    directory: &Path,
+    checkpoint: &SessionCheckpoint,
+    expected_revision: Option<u64>,
+) -> Result<(), SessionError> {
+    checkpoint.validate()?;
+    ensure_private_directory(directory)?;
+    let path = file_path(directory, checkpoint.session());
+    let lock = save_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+
+    if let Some(expected) = expected_revision {
+        let found = current_revision(&path, checkpoint.session())?;
+        if found != expected {
+            return Err(SessionError::RevisionConflict { expected, found });
+        }
+    }
+
+    let document = CheckpointDocument { format: "supra-session", version: CHECKPOINT_VERSION, checkpoint };
+    let bytes = serde_json::to_vec(&document).map_err(|error| SessionError::Malformed(error.to_string()))?;
+    publish_unlocked(directory, &path, checkpoint.session(), &bytes, &RealSaveOperations)
+}
+
+/// Load a versioned checkpoint. Legacy tuple files are upgraded in memory.
+///
+/// # Errors
+///
+/// [`SessionError::Io`] when the read fails for a reason other than absence;
+/// [`SessionError::UnsupportedVersion`] for a newer envelope; and
+/// [`SessionError::Malformed`] for damaged state.
+pub fn load_checkpoint(
+    directory: &Path,
+    session: SessionId,
+) -> Result<Option<SessionCheckpoint>, SessionError> {
+    let path = file_path(directory, session);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(decode_checkpoint(&bytes, session)?))
 }
 
 /// Every persisted session id under the directory, sorted by file name
@@ -184,9 +256,79 @@ pub fn list(directory: &Path) -> Result<Vec<SessionId>, SessionError> {
     Ok(sessions)
 }
 
+fn decode_checkpoint(bytes: &[u8], expected: SessionId) -> Result<SessionCheckpoint, SessionError> {
+    if let Ok(document) = serde_json::from_slice::<OwnedCheckpointDocument>(bytes) {
+        if document.format != "supra-session" {
+            return Err(SessionError::Malformed(format!("unknown checkpoint format {:?}", document.format)));
+        }
+        if document.version != CHECKPOINT_VERSION {
+            return Err(SessionError::UnsupportedVersion { found: document.version });
+        }
+        let checkpoint: SessionCheckpoint = serde_json::from_value(document.checkpoint)
+            .map_err(|error| SessionError::Malformed(error.to_string()))?;
+        if checkpoint.version() != document.version {
+            return Err(SessionError::Malformed(format!(
+                "envelope version {} disagrees with checkpoint version {}",
+                document.version,
+                checkpoint.version()
+            )));
+        }
+        if checkpoint.session() != expected {
+            return Err(SessionError::Malformed(format!(
+                "the file names session {} but was asked for {expected}",
+                checkpoint.session()
+            )));
+        }
+        checkpoint.validate()?;
+        return Ok(checkpoint);
+    }
+
+    let (stored, turns): (SessionId, Vec<(TurnId, String)>) =
+        serde_json::from_slice(bytes).map_err(|error| SessionError::Malformed(error.to_string()))?;
+    if stored != expected {
+        return Err(SessionError::Malformed(format!(
+            "the file names session {stored} but was asked for {expected}"
+        )));
+    }
+    let mut checkpoint = SessionCheckpoint::new(stored);
+    for (turn, body) in turns {
+        checkpoint.push_turn(CheckpointTurn::new(turn, body, Vec::new(), None))?;
+    }
+    Ok(checkpoint)
+}
+
+fn current_revision(path: &Path, session: SessionId) -> Result<u64, SessionError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(decode_checkpoint(&bytes, session)?.revision())
+}
+
+fn publish_unlocked(
+    directory: &Path,
+    path: &Path,
+    session: SessionId,
+    bytes: &[u8],
+    operations: &impl SaveOperations,
+) -> Result<(), SessionError> {
+    let (mut file, temporary_path) = open_temporary(directory, session)?;
+    let mut temporary = TemporaryFile::new(temporary_path);
+
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    operations.rename(&temporary.path, path)?;
+    temporary.published = true;
+    operations.sync_parent(directory)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LifecycleStatus;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn scratch() -> PathBuf {
@@ -258,6 +400,96 @@ mod tests {
         let loaded = load(&nested, session).expect("load").expect("present");
         assert!(loaded.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkpoint_protocol_and_opaque_snapshots_round_trip() {
+        let dir = scratch();
+        let session = SessionId::generate();
+        let turn = TurnId::generate();
+        let mut checkpoint = SessionCheckpoint::new(session);
+        checkpoint
+            .push_turn(CheckpointTurn::new(
+                turn,
+                "accepted",
+                vec![crate::ProtocolMessage::from_payload(serde_json::json!({
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "signature": "opaque"}],
+                    "provider_field": 7
+                }))],
+                Some(serde_json::json!({"usage": {"input": 2}})),
+            ))
+            .expect("turn");
+        checkpoint.set_ledger(Some(serde_json::json!({"generation": 4})));
+        checkpoint.set_config(Some(serde_json::json!({"model": "frozen"})));
+
+        save_checkpoint(&dir, &checkpoint, Some(0)).expect("save");
+        let loaded = load_checkpoint(&dir, session).expect("load").expect("present");
+        assert_eq!(loaded, checkpoint);
+        assert_eq!(loaded.turns()[0].messages()[0].payload()["provider_field"], 7);
+        assert_eq!(
+            load(&dir, session).expect("legacy projection"),
+            Some(vec![(turn, "accepted".to_owned())])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_tuple_files_upgrade_without_rewriting() {
+        let dir = scratch();
+        let session = SessionId::generate();
+        let turn = TurnId::generate();
+        let legacy = serde_json::to_vec(&(session, vec![(turn, "legacy".to_owned())])).expect("encode");
+        std::fs::write(file_path(&dir, session), &legacy).expect("legacy file");
+
+        let loaded = load_checkpoint(&dir, session).expect("load").expect("present");
+        assert_eq!(loaded.turns()[0].display_body(), "legacy");
+        assert!(loaded.turns()[0].messages().is_empty());
+        assert_eq!(std::fs::read(file_path(&dir, session)).expect("unchanged"), legacy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_checkpoint_writer_is_refused() {
+        let dir = scratch();
+        let session = SessionId::generate();
+        let mut first = SessionCheckpoint::new(session);
+        first.set_status(LifecycleStatus::Running);
+        save_checkpoint(&dir, &first, Some(0)).expect("first");
+
+        let mut second = first.clone();
+        second.set_status(LifecycleStatus::Completed);
+        save_checkpoint(&dir, &second, Some(first.revision())).expect("second");
+
+        let mut stale = first;
+        stale.set_status(LifecycleStatus::Interrupted);
+        let error = save_checkpoint(&dir, &stale, Some(stale.revision() - 1)).expect_err("stale");
+        assert!(matches!(error, SessionError::RevisionConflict { .. }), "{error}");
+        assert_eq!(load_checkpoint(&dir, session).expect("load").expect("present"), second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn damaged_and_future_checkpoints_are_refused() {
+        let dir = scratch();
+        let session = SessionId::generate();
+        std::fs::write(file_path(&dir, session), b"{not-json").expect("garbage");
+        assert!(matches!(load_checkpoint(&dir, session), Err(SessionError::Malformed(_))));
+
+        let future = serde_json::json!({
+            "format": "supra-session",
+            "version": CHECKPOINT_VERSION + 1,
+            "checkpoint": {
+                "incompatible_future_shape": true
+            }
+        });
+        std::fs::write(file_path(&dir, session), serde_json::to_vec(&future).expect("encode"))
+            .expect("future");
+        assert!(matches!(
+            load_checkpoint(&dir, session),
+            Err(SessionError::UnsupportedVersion { found }) if found == CHECKPOINT_VERSION + 1
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

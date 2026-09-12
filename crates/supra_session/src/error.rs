@@ -12,6 +12,22 @@ pub enum SessionError {
     #[error("the session file is malformed: {0}")]
     Malformed(String),
 
+    /// A checkpoint was written by a newer, unsupported format.
+    #[error("unsupported session checkpoint version {found}")]
+    UnsupportedVersion {
+        /// Version found in the checkpoint envelope.
+        found: u32,
+    },
+
+    /// A compare-and-swap save observed another committed revision.
+    #[error("session revision conflict: expected {expected}, found {found}")]
+    RevisionConflict {
+        /// Revision the writer based its update on.
+        expected: u64,
+        /// Revision currently committed on disk.
+        found: u64,
+    },
+
     /// A ledger replay hit a segment the builder refused.
     #[error("the ledger refused a replayed segment: {0}")]
     Ledger(#[from] supra_prompt::PromptError),

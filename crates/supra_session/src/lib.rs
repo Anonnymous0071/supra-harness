@@ -24,6 +24,8 @@
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::print_stderr))]
 
+/// Versioned, lossless checkpoint types.
+pub mod checkpoint;
 /// The refusal shapes.
 pub mod error;
 /// The session type.
@@ -31,11 +33,15 @@ pub mod session;
 /// The on-disk store.
 pub mod store;
 
+pub use checkpoint::{
+    CHECKPOINT_VERSION, CheckpointTurn, LifecycleStatus, ProtocolMessage, SessionCheckpoint,
+};
 pub use error::SessionError;
 pub use session::Session;
-pub use store::{list, load, save};
+pub use store::{list, load, load_checkpoint, save, save_checkpoint};
 
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Session>();
+    assert_send_sync::<SessionCheckpoint>();
 };
