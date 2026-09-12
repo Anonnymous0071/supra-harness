@@ -53,9 +53,9 @@ WIT paths and the parser refused them with `#spawn: trailing characters`.
 `set_fuel(DEFAULT_FUEL)` on every store, per instantiation,
 non-refillable. An infinite-loop guest dies in milliseconds as
 `FuelExhausted` (component and budget named), not in minutes as a hang.
-The classification greps the formatted error chain for the word `fuel` -
-cheaper than downcasting through wasmtime's error type, and the
-infinite-loop test pins it.
+Fuel exhaustion is classified by downcasting the Wasmtime error chain to
+`wasmtime::Trap::OutOfFuel`; unrelated guest traps remain
+`PluginError::Trap`. The infinite-loop test pins that distinction.
 
 **The string ABI, learned from the parser.** A lifted `(string) ->
 (string)` needs `(memory ...)` and `(realloc ...)` in the `canon lift` -
@@ -89,16 +89,26 @@ read-only.
 
 ## Runtime integration
 
-The runtime can inject its supra_tool/permission/sandbox/journal-backed adapter
-without coupling those crates to the component mechanism:
+`Host::new()` installs `DenyAllDispatcher`, so host calls fail closed unless an
+embedding injects an `Arc<dyn HostDispatcher>` through `Host::with_dispatcher`.
+The dispatcher receives a verified `PluginIdentity`, a closed `HostFunction`, and
+the guest argument. It may implement selected routes and return `DispatchError`
+for unsupported or policy-refused calls. Tool-class linkers still determine which
+routes a component can reach. Dispatch is synchronous, bounded, and audited per
+plugin instance.
+
+This integration seam does not establish that the repository's executable
+runtime supplies workspace, search, process, snapshot, journal, or user-
+interaction services. The following mechanics-only example implements one fixed
+demo route and refuses every other function:
 
 ```rust
 use std::sync::Arc;
 use supra_plugin::{DispatchError, Host, HostDispatcher, HostFunction};
 
-struct RuntimeDispatcher;
+struct DemoDispatcher;
 
-impl HostDispatcher for RuntimeDispatcher {
+impl HostDispatcher for DemoDispatcher {
     fn dispatch(
         &self,
         _caller: &supra_plugin::PluginIdentity,
@@ -106,26 +116,26 @@ impl HostDispatcher for RuntimeDispatcher {
         argument: &str,
     ) -> Result<String, DispatchError> {
         match function {
-            HostFunction::ReadFile => todo!("workspace-bounded read of {argument}"),
-            HostFunction::Search => todo!("digest-backed search of {argument}"),
-            HostFunction::Spawn => todo!("permission and sandbox-backed spawn of {argument}"),
-            HostFunction::Snapshot => todo!("journal-backed snapshot of {argument}"),
-            HostFunction::AskUser => todo!("TUI-mediated question {argument}"),
+            HostFunction::Search => Ok(format!("demo:{argument}")),
+            _ => Err(DispatchError::new("unsupported by this demo embedding")),
         }
     }
 }
 
-let host = Host::with_dispatcher(Arc::new(RuntimeDispatcher))?;
+let host = Host::with_dispatcher(Arc::new(DemoDispatcher))?;
 # Ok::<(), supra_plugin::PluginError>(())
 ```
 
-The dispatcher is synchronous because the current Wasmtime callbacks are
-synchronous. A future async runtime must deliberately migrate the host to
-Wasmtime's async component API rather than block inside this trait.
+Host callbacks are synchronous today. An embedding that depends on asynchronous
+services needs a deliberate integration strategy compatible with its runtime and
+Wasmtime; migrating to Wasmtime's async component API is one option.
 
 ## Mutation results
 
-Ten mutations; all ten caught, control survived by design.
+These ten mutations covered the original T20 host/import/fuel implementation;
+they do not claim mutation coverage for the later dispatcher injection, denial,
+audit, or resource-bound changes. All ten original mutations were caught, and
+the control survived by design.
 
 | Mutation | Verdict |
 |---|---|
@@ -147,13 +157,16 @@ unobservable. Closed by a test that instantiates an over-classed
 component *without* prior verify - the paranoid path is now the pinned
 path.
 
-## Obligations left to later stages
+## Delivered boundary and remaining integration
 
-- **T23/runtime assembly** implements the injected dispatcher with
-  workspace-bounded reads, digest search, permission-gated sandbox spawn,
-  journal snapshots, and TUI-mediated user questions. This crate supplies the
-  class-safe routing seam and fail-closed behavior, not those services.
-- **T21/T22** peers run as components through this host; the cohort's
-  k is bounded by the fuel budget as much as by the peer limit.
-- **T30** loads plugin components from configuration and hands them to
-  this host; `Plugin::load_file` is the entry it calls.
+- **Delivered in `supra_plugin`:** class-specific import registration, an
+  injected host-dispatch seam, fail-closed defaults, bounded arguments/results/
+  call counts, ordered per-instance audits, and distinct dispatch errors.
+- **Executable integration:** an embedding must provide any desired runtime
+  services and enforce workspace, permission, sandbox, journal, and interaction
+  policy behind the dispatcher. This crate does not establish a production
+  adapter for those services.
+- **T21/T22** peers run as components through this host; the cohort's k is
+  bounded by the fuel budget as much as by the peer limit.
+- **T30** can load plugin components from configuration through
+  `Plugin::load_file`; doing so does not by itself provide a dispatcher adapter.

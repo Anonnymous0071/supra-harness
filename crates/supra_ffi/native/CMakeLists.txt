@@ -10,7 +10,8 @@
 #                         supra_ansi_truncate which cuts to a cell width
 #                         without ever leaking an SGR sequence.
 #   T4  libsupra_sandbox  OS-level process isolation behind one ABI
-#                         (bubblewrap+landlock, sandbox-exec, AppContainer).
+#                         (Linux namespaces+Landlock, macOS sandbox_init+SBPL,
+#                         Windows AppContainer+job object).
 #
 # Targets are added by their own stages. This file only establishes the shared
 # contract: C++20, no exceptions across the ABI, position-independent static

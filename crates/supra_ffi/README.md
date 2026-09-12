@@ -9,7 +9,7 @@ re-allowed only here, so a soundness bug has exactly one crate to hide in.
 |---|---|---|
 | `libsupra_width` | T2 | cell width, grapheme segmentation, Unicode 17 tables |
 | `libsupra_ansi` | T3 | escape parsing, SGR state, style-safe truncation |
-| `libsupra_sandbox` | T4 | namespaces plus Landlock process isolation |
+| `libsupra_sandbox` | T4 | native process isolation: Linux namespaces/Landlock, macOS `sandbox_init`/SBPL, and Windows AppContainer with explicit handle inheritance and a job object |
 
 Nothing above this crate needs `unsafe`. Every `extern` block lives in one
 private `sys` module, every block carries a SAFETY comment, and

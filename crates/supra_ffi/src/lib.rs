@@ -11,7 +11,7 @@
 //! | ------- | ----- | -------- |
 //! | `libsupra_width` | T2 | cell width, grapheme segmentation, Unicode 17 tables |
 //! | `libsupra_ansi` | T3 | escape parsing, SGR state, style-safe truncation |
-//! | `libsupra_sandbox` | T4 | namespaces plus Landlock process isolation |
+//! | `libsupra_sandbox` | T4 | native process isolation: Linux namespaces/Landlock, macOS `sandbox_init`/SBPL, and Windows AppContainer with explicit handle inheritance and a job object |
 //!
 //! This crate wraps all three so that nothing above it needs `unsafe`. That
 //! confinement is a hard rule rather than a preference: `unsafe_code = "warn"` is

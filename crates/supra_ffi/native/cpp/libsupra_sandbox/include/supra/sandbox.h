@@ -291,9 +291,10 @@ typedef struct supra_sandbox_command {
 /// a tier below `required_tier`, a `NET_PORTS` policy on a kernel without
 /// per-port support - no process is started and `out->error` explains why.
 ///
-/// Setup failures inside the forked child are reported through a CLOEXEC pipe,
-/// so the caller learns *which* step failed rather than only that the child
-/// exited. Diagnosing a sandbox that "just fails" is otherwise guesswork.
+/// On Linux and macOS, setup failures inside the forked child are reported
+/// through a CLOEXEC pipe. On Windows, AppContainer, handle-inheritance,
+/// process-creation, and job-object failures are reported directly through
+/// `out->error`, so callers still learn which setup step failed.
 ///
 /// @return 1 when the child started, 0 on failure.
 int supra_sandbox_spawn(const supra_sandbox_policy* policy, const supra_sandbox_command* command,

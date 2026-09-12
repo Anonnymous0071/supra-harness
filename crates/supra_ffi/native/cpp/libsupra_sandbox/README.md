@@ -46,20 +46,25 @@ supra_sandbox_probe(&caps);
 // caps.tier: NONE | NAMESPACES | LANDLOCK | SBPL | APPCONTAINER
 ```
 
-The probe **applies a real ruleset in a forked child and confirms a denial
-occurs**. A reported ABI version proves only that the LSM is compiled in — it can
-still be absent from the boot-time LSM list, in which case every syscall succeeds
-and nothing is enforced. Forked because Landlock is irreversible: an in-process
-check would permanently confine the caller.
+Capability probing is backend-specific and fail-closed. Linux applies a
+throwaway Landlock ruleset in a forked child and confirms a denial; macOS
+performs a behavioral `sandbox_init` denial probe; Windows verifies that an
+AppContainer profile can be created. Unsupported platforms report `NONE`.
+Linux and macOS use behavioral denials rather than trusting reported API or
+kernel availability; if those probes fail, the backend does not claim
+enforcement.
 
 A filesystem policy on a platform that cannot enforce it **refuses to run**. A
 sandbox reporting success while enforcing nothing is worse than no sandbox,
 because the caller stops looking.
 
-## Verified escape attempts
+## Linux verified escape attempts
 
-Every case forks, execs, and inspects real output. Asserting that a policy struct
-was populated proves nothing about enforcement.
+The Linux escape suite forks and execs real payloads and inspects their effects.
+macOS and Windows run corresponding native probe, enforcement, refusal, timeout,
+and process-tree cleanup checks through `sandbox_native_test`; Windows launches
+payloads with native process creation. Asserting that a policy struct was
+populated proves nothing about enforcement.
 
 | Attempt | Outcome |
 |---|---|
@@ -82,9 +87,10 @@ exists to remove. Commands are argv vectors for the same reason.
 Zero-initialising a policy yields the most restrictive setting, so a caller who
 forgets a field gets *less* access rather than more.
 
-Setup failures inside the forked child are reported through a **CLOEXEC pipe**, so
-the caller learns which of nine steps failed rather than only that the child
-exited.
+Linux and macOS report child setup failures through a **CLOEXEC report pipe**.
+Windows reports AppContainer, ACL, explicit-handle, process-creation, and
+job-object setup failures directly through the process error buffer. Each path
+identifies the failed step rather than reporting only that startup failed.
 
 ### What this does not defend against
 
@@ -97,19 +103,23 @@ covered:
 - **Not a resource guarantee.** `rlimit` is scheduling pressure, not cgroup
   accounting. A busy loop still burns CPU.
 - **Not protection against a kernel bug.**
-- **Not isolation from inherited descriptors.** Anything open across `exec` stays
-  usable; the caller must close what it does not intend to pass.
+- **Not isolation from inherited descriptors or handles.** On POSIX,
+  descriptors left open and inheritable remain usable after `exec`, so callers
+  must close them or mark unintended descriptors `CLOEXEC`. Windows passes only
+  the handles explicitly selected for inheritance.
 
 ## Layout
 
 ```
 include/supra/sandbox.h  public ABI
 src/policy.cpp           construction and validation, all platforms
-src/landlock.cpp         Landlock wrapper, ABI 1-7
-src/linux_spawn.cpp      namespaces, uid mapping, rlimits, exec
-src/self_identity.cpp    (device, inode) identity for T12.5 guard layer L4
-src/unsupported.cpp      macOS and Windows: refuse, never run unconfined
-tests/                   four CTest suites
+src/landlock.cpp         Linux Landlock wrapper, ABI 1-7
+src/linux_spawn.cpp      Linux namespaces, uid mapping, rlimits, exec
+src/macos_spawn.cpp      macOS sandbox_init/SBPL backend
+src/windows_spawn.cpp    Windows AppContainer, explicit handles, job object
+src/self_identity.cpp    platform file identity for T12.5 guard layer L4
+src/unsupported.cpp      other platforms: refuse, never run unconfined
+tests/                   platform-specific CTest suites
 ```
 
 ## Two bugs found by testing, not by reading

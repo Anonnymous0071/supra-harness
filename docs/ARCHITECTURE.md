@@ -408,7 +408,7 @@ backtracking.
 | T1 | (root) | workspace, pinning, quality gates, CMake root, CI, this document |
 | T2 | `crates/supra_ffi/native/cpp/libsupra_width` | cell width, grapheme segmentation, EAW + emoji tables |
 | T3 | `crates/supra_ffi/native/cpp/libsupra_ansi` | escape parser/serialiser, SGR-safe truncation |
-| T4 | `crates/supra_ffi/native/cpp/libsupra_sandbox` | Linux user namespaces/Landlock; macOS and Windows fail-closed stubs |
+| T4 | `crates/supra_ffi/native/cpp/libsupra_sandbox` | Linux namespaces/Landlock; macOS `sandbox_init`/SBPL; Windows AppContainer, explicit handle inheritance, and a kill-on-close job object; other platforms fail closed |
 | T5 | `supra_ffi` | safe RAII bindings; the only crate allowed `unsafe` |
 
 ### Layer B - contracts and infrastructure

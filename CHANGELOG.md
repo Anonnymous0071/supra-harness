@@ -374,8 +374,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - **Fuel is the hang containment**: `consume_fuel(true)` + per-store
     `DEFAULT_FUEL` (10M), non-refillable. An infinite-loop guest dies in
     milliseconds as `FuelExhausted` (component and budget named), not in
-    minutes as a hang; the classifier greps the formatted error chain -
-    the same chain the trap test pins.
+    minutes as a hang; the classifier downcasts the Wasmtime error chain to
+    `wasmtime::Trap::OutOfFuel`, while unrelated guest traps remain distinct.
   - **The string ABI, learned from the parser**: a lifted `(string) ->
     (string)` needs `(memory ...)` and `(realloc ...)` in the `canon
     lift` - refused at parse time otherwise. The round-trip guest
@@ -390,8 +390,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     (verify skipped by instantiate) survived first - every test verified
     explicitly, so the skip was unobservable; closed by instantiating an
     over-classed component without prior verify. Four guards in
-    `check-invariants.sh`, one needing `scan_sql` (the classifier's
-    subject is the literal "fuel", which `scan` blanks), probed 4/4.
+    `check-invariants.sh`, including a typed `Trap::OutOfFuel` check, probed
+    4/4.
   - Environment note: /tmp hit 100% again mid-stage (a 788MB wasmtime
     probe build + stale test artifacts); cleaned per the standing /tmp
     practice, and the probe directories removed.
@@ -1127,8 +1127,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     pipe, which also made `kill` untestable; and `readlink` truncated silently,
     where a partial path can resolve to a different file and would make guard
     layer L4 compare the wrong inode.
-  - macOS and Windows refuse rather than running unconfined, which keeps T16.7's
-    `auto` mode safe on platforms whose backend has not landed.
+  - Native fail-closed backends now cover all three supported platform families:
+    Linux namespaces/Landlock; macOS `sandbox_init` with generated SBPL; and
+    Windows AppContainer process creation with explicit handle inheritance and a
+    kill-on-close job object. Each backend executes supported policies and
+    refuses policy dimensions it cannot enforce; only other platforms use the
+    generic unsupported fallback.
 
 ### Fixed
 

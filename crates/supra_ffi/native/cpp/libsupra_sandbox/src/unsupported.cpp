@@ -1,15 +1,7 @@
-// Backend stubs for platforms whose implementation has not landed.
+// Fail-closed fallback for platforms other than Linux, macOS, and Windows.
 //
-// These refuse rather than silently running the command unconfined. A stub that
-// executed anyway would make T16.7's `auto` mode - which permits reversible
-// mutations without asking - unsafe on those platforms, and the failure would be
-// invisible until something escaped.
-//
-// macOS: `sandbox_init` with a generated SBPL profile. The API is deprecated but
-// still the only unprivileged option, and Chromium and others rely on it.
-//
-// Windows: AppContainer via `CreateProcessAsUser` with a capability SID, plus a
-// job object for the process-tree limit.
+// Supported platforms select their native backend in CMakeLists.txt. This
+// fallback refuses rather than silently running a command unconfined.
 
 #if !defined(__linux__) && !defined(__APPLE__) && !defined(_WIN32)
 
@@ -22,15 +14,7 @@
 namespace {
 
 void reportUnsupported(char* dest, std::size_t cap) {
-#if defined(__APPLE__)
-    supra::sandbox::detail::setError(
-        dest, cap, "macOS sandbox backend not implemented (sandbox_init + SBPL profile pending)");
-#elif defined(_WIN32)
-    supra::sandbox::detail::setError(
-        dest, cap, "Windows sandbox backend not implemented (AppContainer + job object pending)");
-#else
     supra::sandbox::detail::setError(dest, cap, "no sandbox backend for this platform");
-#endif
 }
 
 }  // namespace
