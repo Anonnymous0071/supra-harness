@@ -9,7 +9,7 @@
 #include <appmodel.h>
 #include <io.h>
 
-#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -792,7 +792,6 @@ int supra_sandbox_spawn(const supra_sandbox_policy* policy, const supra_sandbox_
 
     out->pid = static_cast<std::int64_t>(info.dwProcessId);
     out->tier = SUPRA_SANDBOX_TIER_APPCONTAINER;
-    state->process = info.hProcess;
     out->native_process = reinterpret_cast<std::uintptr_t>(info.hProcess);
     out->native_job = reinterpret_cast<std::uintptr_t>(state);
     return 1;
