@@ -166,7 +166,7 @@ impl Store {
 
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|error| StoreError::Open {
+                create_private_directory(parent).map_err(|error| StoreError::Open {
                     path: path.clone(),
                     source: rusqlite::Error::ToSqlConversionFailure(Box::new(error)),
                 })?;
@@ -179,6 +179,10 @@ impl Store {
         Self::prepare(&connection, options, true)
             .map_err(|source| StoreError::Open { path: path.clone(), source })?;
         schema::migrate(&mut connection, &path)?;
+        ensure_private_store_files(&path).map_err(|error| StoreError::Open {
+            path: path.clone(),
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(error)),
+        })?;
 
         Ok(Self { connection: Mutex::new(connection), path })
     }
@@ -338,6 +342,42 @@ impl Store {
     }
 }
 
+#[cfg(unix)]
+fn create_private_directory(directory: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::create_dir_all(directory)?;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(directory: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(directory)
+}
+
+#[cfg(unix)]
+fn ensure_private_store_files(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for candidate in [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        match std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_store_files(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Lock-free, and therefore partial: taking the connection mutex to report a row count
 /// would let a `Debug` inside a diagnostic block on a query. The connection is omitted on
 /// purpose rather than by oversight.
@@ -419,6 +459,35 @@ mod tests {
         let store = Store::open(&nested).expect("open");
         assert!(nested.exists());
         assert_eq!(store.path(), nested.as_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_store_directory_database_and_sidecars_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = Scratch::new("private-modes");
+        let directory = scratch.0.join("private");
+        fs::create_dir_all(&directory).expect("precreate parent");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).expect("loosen parent");
+        let database = directory.join("store.db");
+        let store = Store::open(&database).expect("open");
+        store.evict_turn(TurnId::generate(), b"create WAL and SHM").expect("evict");
+
+        assert_eq!(fs::metadata(&directory).expect("directory metadata").permissions().mode() & 0o777, 0o700);
+        for path in [
+            database.clone(),
+            PathBuf::from(format!("{}-wal", database.display())),
+            PathBuf::from(format!("{}-shm", database.display())),
+        ] {
+            if path.exists() {
+                assert_eq!(
+                    fs::metadata(&path).expect("file metadata").permissions().mode() & 0o777,
+                    0o600,
+                    "{path:?}"
+                );
+            }
+        }
     }
 
     #[test]

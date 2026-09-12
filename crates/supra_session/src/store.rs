@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use supra_types::{SessionId, TurnId};
 
@@ -11,6 +15,111 @@ fn file_path(directory: &Path, session: SessionId) -> PathBuf {
     directory.join(format!("{FILE_PREFIX}{session}{FILE_SUFFIX}"))
 }
 
+fn save_locks() -> &'static Mutex<HashMap<PathBuf, Weak<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn save_lock(path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = save_locks().lock().unwrap_or_else(PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+#[cfg(unix)]
+fn ensure_private_directory(directory: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::create_dir_all(directory)?;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn ensure_private_directory(directory: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(directory)
+}
+
+fn open_temporary(directory: &Path, session: SessionId) -> io::Result<(File, PathBuf)> {
+    for _ in 0..16 {
+        let nonce = SessionId::generate();
+        let path = directory.join(format!(".{FILE_PREFIX}{session}-{nonce}.tmp"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not allocate a unique session temporary file"))
+}
+
+struct TemporaryFile {
+    path: PathBuf,
+    published: bool,
+}
+
+impl TemporaryFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, published: false }
+    }
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+trait SaveOperations {
+    fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        std::fs::rename(source, destination)
+    }
+
+    fn sync_parent(&self, directory: &Path) -> io::Result<()> {
+        File::open(directory)?.sync_all()
+    }
+}
+
+struct RealSaveOperations;
+impl SaveOperations for RealSaveOperations {}
+
+fn save_with_operations(
+    directory: &Path,
+    session: SessionId,
+    turns: &[(TurnId, String)],
+    operations: &impl SaveOperations,
+) -> Result<(), SessionError> {
+    let document =
+        serde_json::to_vec(&(session, turns)).map_err(|error| SessionError::Malformed(error.to_string()))?;
+    ensure_private_directory(directory)?;
+    let path = file_path(directory, session);
+    let lock = save_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    let (mut file, temporary_path) = open_temporary(directory, session)?;
+    let mut temporary = TemporaryFile::new(temporary_path);
+
+    file.write_all(&document)?;
+    file.sync_all()?;
+    drop(file);
+    operations.rename(&temporary.path, &path)?;
+    temporary.published = true;
+    operations.sync_parent(directory)?;
+    Ok(())
+}
+
 /// Persist one session's checkpoint under its session directory.
 ///
 /// # Errors
@@ -18,19 +127,7 @@ fn file_path(directory: &Path, session: SessionId) -> PathBuf {
 /// [`SessionError::Io`] when the write fails; [`SessionError::Malformed`]
 /// when serialization fails, which it cannot for this shape.
 pub fn save(directory: &Path, session: SessionId, turns: &[(TurnId, String)]) -> Result<(), SessionError> {
-    std::fs::create_dir_all(directory)?;
-    let document =
-        serde_json::to_vec(&(session, turns)).map_err(|error| SessionError::Malformed(error.to_string()))?;
-    let path = file_path(directory, session);
-    let temporary = directory.join(format!("{FILE_PREFIX}{session}{FILE_SUFFIX}.tmp"));
-    {
-        use std::io::Write as _;
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(&document)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&temporary, &path)?;
-    Ok(())
+    save_with_operations(directory, session, turns, &RealSaveOperations)
 }
 
 /// Load one session's checkpoint. `Ok(None)` when the session file does
@@ -90,6 +187,7 @@ pub fn list(directory: &Path) -> Result<Vec<SessionId>, SessionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -144,10 +242,6 @@ mod tests {
         let session = SessionId::generate();
         let other = SessionId::generate();
         save(&dir, session, &[]).expect("save");
-        // `other` has no file of its own, so the id check cannot fire:
-        // the file never opens. The mismatch refusal needs a file whose
-        // stored id disagrees with the one asked for - so write
-        // `session`'s bytes under `other`'s name.
         let stored = std::fs::read(file_path(&dir, session)).expect("stored bytes");
         std::fs::write(file_path(&dir, other), stored).expect("misfiled");
         let error = load(&dir, other).expect_err("mismatch");
@@ -174,5 +268,115 @@ mod tests {
         let listed = list(&dir).expect("list");
         assert!(listed.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_predictable_temporary_symlink_is_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch();
+        let session = SessionId::generate();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"untouched").expect("victim");
+        let predictable = dir.join(format!("{FILE_PREFIX}{session}{FILE_SUFFIX}.tmp"));
+        symlink(&victim, &predictable).expect("hostile symlink");
+
+        save(&dir, session, &[(TurnId::generate(), "safe".to_owned())]).expect("save");
+
+        assert_eq!(std::fs::read(&victim).expect("victim bytes"), b"untouched");
+        assert!(std::fs::symlink_metadata(&predictable).expect("symlink remains").file_type().is_symlink());
+        assert!(load(&dir, session).expect("load").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_saves_for_one_session_always_publish_valid_json() {
+        let dir = scratch();
+        let session = SessionId::generate();
+        let bodies: Vec<String> = (0..16).map(|index| format!("body-{index}")).collect();
+
+        std::thread::scope(|scope| {
+            for body in &bodies {
+                let dir = &dir;
+                scope.spawn(move || {
+                    save(dir, session, &[(TurnId::generate(), body.clone())]).expect("save");
+                });
+            }
+        });
+
+        let loaded = load(&dir, session).expect("load").expect("present");
+        assert_eq!(loaded.len(), 1);
+        assert!(bodies.contains(&loaded[0].1), "unexpected body: {:?}", loaded[0].1);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files remain: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct FailingRename;
+
+    impl SaveOperations for FailingRename {
+        fn rename(&self, _source: &Path, _destination: &Path) -> io::Result<()> {
+            Err(io::Error::other("injected rename failure"))
+        }
+    }
+
+    #[test]
+    fn a_failed_publish_removes_its_temporary_file() {
+        let dir = scratch();
+        let session = SessionId::generate();
+        let error = save_with_operations(&dir, session, &[], &FailingRename).expect_err("rename must fail");
+        assert!(matches!(error, SessionError::Io(_)), "{error}");
+        assert!(!file_path(&dir, session).exists());
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(names.is_empty(), "failed save left files: {names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct ObservedParentSync<'a>(&'a AtomicBool);
+
+    impl SaveOperations for ObservedParentSync<'_> {
+        fn sync_parent(&self, directory: &Path) -> io::Result<()> {
+            assert!(directory.read_dir()?.any(|entry| {
+                entry.is_ok_and(|entry| entry.file_name().to_string_lossy().ends_with(FILE_SUFFIX))
+            }));
+            self.0.store(true, Ordering::SeqCst);
+            File::open(directory)?.sync_all()
+        }
+    }
+
+    #[test]
+    fn parent_directory_is_synced_after_publish() {
+        let dir = scratch();
+        let synced = AtomicBool::new(false);
+        save_with_operations(&dir, SessionId::generate(), &[], &ObservedParentSync(&synced)).expect("save");
+        assert!(synced.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_directory_and_file_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = scratch();
+        let dir = root.join("private");
+        let session = SessionId::generate();
+        save(&dir, session, &[]).expect("save");
+
+        assert_eq!(std::fs::metadata(&dir).expect("directory metadata").permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(file_path(&dir, session)).expect("file metadata").permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

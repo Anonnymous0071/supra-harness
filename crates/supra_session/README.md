@@ -34,6 +34,8 @@ vacuously.
 the same turns; the original file is untouched. Saving the branch adds
 a file, never rewrites one.
 
+**Save hardens the checkpoint boundary.** Each save serializes before touching disk, then uses an unpredictable sibling temporary created exclusively, syncs its bytes, atomically renames it, and syncs the parent directory. Failed saves remove their temporary. Saves for the same session are serialized in-process so concurrent writers cannot share or corrupt staging files. On Unix, the session directory is forced to `0700` and checkpoint files are created as `0600`; no predictable `.tmp` pathname is opened or followed.
+
 **Save creates the directory it was given.** The first mutation run
 proved the tests had never checked this: every fixture pre-created its
 scratch directory, so dropping `create_dir_all` changed nothing

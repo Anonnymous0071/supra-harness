@@ -69,6 +69,11 @@ migration on purpose.
 and this store holds turns the prefix has **already dropped** — so a lost commit is a lost
 conversation, not a lost cache entry.
 
+File-backed stores also harden their filesystem boundary. On Unix, the immediate parent directory
+is forced to `0700`, and the database plus any WAL/SHM sidecars present during initialization are
+forced to `0600`. SQLite still owns WAL durability and checkpoint behavior; these mode checks are
+privacy controls, not a replacement for `synchronous = FULL`.
+
 It is affordable because eviction is rare: it happens at a generation rewrite, not per turn,
 so the fsync never lands on the hot path.
 
