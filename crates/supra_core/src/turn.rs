@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use supra_blackboard::Blackboard;
 use supra_eventbus::Bus;
 use supra_types::{
@@ -53,7 +55,7 @@ pub struct Turn {
     id: TurnId,
     session: Vec<AgentId>,
     blackboard: Blackboard,
-    bus: Bus,
+    bus: Arc<Bus>,
     claim: ClaimId,
     answer: Option<String>,
     votes_seen: usize,
@@ -78,6 +80,25 @@ impl Turn {
     pub fn start(
         blackboard: Blackboard,
         bus: Bus,
+        task: &str,
+        agents: Vec<AgentId>,
+    ) -> Result<Self, TurnError> {
+        Self::start_shared(blackboard, Arc::new(bus), task, agents)
+    }
+
+    /// Steps 1-4 using a bus shared with the session coordinator.
+    ///
+    /// Unlike [`Self::start`], this keeps the caller's handle alive so one
+    /// subscription can observe every turn in a long-running session. The
+    /// bus remains non-blocking and closes only after the session and all
+    /// turns release their handles.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    pub fn start_shared(
+        blackboard: Blackboard,
+        bus: Arc<Bus>,
         task: &str,
         agents: Vec<AgentId>,
     ) -> Result<Self, TurnError> {
@@ -172,9 +193,10 @@ impl Turn {
             if text.is_empty() {
                 return Err(TurnError::EmptyClaim);
             }
-            if self.answer.replace(text).is_some() {
+            if self.answer.is_some() {
                 return Err(TurnError::NoAnswer("the proposer already submitted an answer".to_owned()));
             }
+            self.answer = Some(text);
             return Ok(Step::Collecting);
         }
 
@@ -448,6 +470,24 @@ mod tests {
     }
 
     #[test]
+    fn one_shared_subscription_observes_multiple_turns() {
+        let bus = Arc::new(Bus::new());
+        let subscription = bus.subscribe(TopicSet::of(Topic::Turn));
+
+        let first = Turn::start_shared(board(), Arc::clone(&bus), "first", agents(1)).expect("first turn");
+        let second = Turn::start_shared(board(), Arc::clone(&bus), "second", agents(1)).expect("second turn");
+        assert_ne!(first.id(), second.id());
+
+        let started = subscription
+            .drain()
+            .into_iter()
+            .filter(|delivery| matches!(delivery.event.as_ref(), Event::TurnStarted { .. }))
+            .count();
+        assert_eq!(started, 2, "the session subscription spans both turns");
+        assert!(!subscription.is_closed(), "the session still owns the bus");
+    }
+
+    #[test]
     fn turn_events_carry_the_turn_topic() {
         let peers = agents(3);
         let bus = Bus::new();
@@ -492,6 +532,7 @@ mod tests {
         turn.record(answer(peers[0], "candidate")).expect("proposal");
         let error = turn.record(answer(peers[0], "me too")).expect_err("second proposal");
         assert!(matches!(error, TurnError::NoAnswer(_)));
+        assert_eq!(turn.answer(), Some("candidate"), "a rejected duplicate cannot replace the candidate");
     }
 
     #[test]
