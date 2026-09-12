@@ -3393,6 +3393,7 @@ dependencies = [
 name = "supra_session"
 version = "0.2.0"
 dependencies = [
+ "fs2",
  "serde",
  "serde_json",
  "supra_eventbus",

@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+
+use fs2::FileExt as _;
 
 use serde::{Deserialize, Serialize};
 use supra_types::{SessionId, TurnId};
@@ -31,20 +31,34 @@ fn file_path(directory: &Path, session: SessionId) -> PathBuf {
     directory.join(format!("{FILE_PREFIX}{session}{FILE_SUFFIX}"))
 }
 
-fn save_locks() -> &'static Mutex<HashMap<PathBuf, Weak<Mutex<()>>>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+fn lock_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{file_name}.lock"))
 }
 
-fn save_lock(path: &Path) -> Arc<Mutex<()>> {
-    let mut locks = save_locks().lock().unwrap_or_else(PoisonError::into_inner);
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
-        return lock;
+struct SessionFileLock {
+    file: File,
+}
+
+impl SessionFileLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(lock_path(path))?;
+        file.lock_exclusive()?;
+        Ok(Self { file })
     }
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
-    lock
+}
+
+impl Drop for SessionFileLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 #[cfg(unix)]
@@ -104,46 +118,82 @@ trait SaveOperations {
         std::fs::rename(source, destination)
     }
 
+    #[cfg(unix)]
     fn sync_parent(&self, directory: &Path) -> io::Result<()> {
         File::open(directory)?.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    fn sync_parent(&self, _directory: &Path) -> io::Result<()> {
+        Ok(())
     }
 }
 
 struct RealSaveOperations;
 impl SaveOperations for RealSaveOperations {}
 
+#[cfg(test)]
 fn save_with_operations(
     directory: &Path,
     session: SessionId,
     turns: &[(TurnId, String)],
     operations: &impl SaveOperations,
 ) -> Result<(), SessionError> {
-    let document =
-        serde_json::to_vec(&(session, turns)).map_err(|error| SessionError::Malformed(error.to_string()))?;
+    validate_legacy_turns(session, turns)?;
     ensure_private_directory(directory)?;
     let path = file_path(directory, session);
-    let lock = save_lock(&path);
-    let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
-    let (mut file, temporary_path) = open_temporary(directory, session)?;
-    let mut temporary = TemporaryFile::new(temporary_path);
+    let _lock = SessionFileLock::acquire(&path)?;
+    save_legacy_unlocked(directory, &path, session, turns, operations)
+}
 
-    file.write_all(&document)?;
-    file.sync_all()?;
-    drop(file);
-    operations.rename(&temporary.path, &path)?;
-    temporary.published = true;
-    operations.sync_parent(directory)?;
-    Ok(())
+fn save_legacy_unlocked(
+    directory: &Path,
+    path: &Path,
+    session: SessionId,
+    turns: &[(TurnId, String)],
+    operations: &impl SaveOperations,
+) -> Result<(), SessionError> {
+    let document =
+        serde_json::to_vec(&(session, turns)).map_err(|error| SessionError::Malformed(error.to_string()))?;
+    publish_unlocked(directory, path, session, &document, operations)
 }
 
 /// Persist one session's checkpoint under its session directory.
 ///
+/// If a versioned checkpoint already exists, this legacy projection is merged
+/// into it: committed structured fields are retained and only newly appended
+/// legacy turns are added. A projection that changes or omits committed turns
+/// is refused rather than destructively downgrading the file.
+///
 /// # Errors
 ///
-/// [`SessionError::Io`] when the write fails; [`SessionError::Malformed`]
-/// when serialization fails, which it cannot for this shape.
+/// [`SessionError::LossyLegacySave`] when the legacy projection would erase or
+/// alter committed checkpoint state; [`SessionError::DuplicateTurn`] for a
+/// repeated turn id; [`SessionError::Io`] when the write fails; and
+/// [`SessionError::Malformed`] when serialization or the stored file is invalid.
 pub fn save(directory: &Path, session: SessionId, turns: &[(TurnId, String)]) -> Result<(), SessionError> {
-    save_with_operations(directory, session, turns, &RealSaveOperations)
+    validate_legacy_turns(session, turns)?;
+    ensure_private_directory(directory)?;
+    let path = file_path(directory, session);
+    let _lock = SessionFileLock::acquire(&path)?;
+
+    match read_versioned_checkpoint_if_present(&path, session)? {
+        None => save_legacy_unlocked(directory, &path, session, turns, &RealSaveOperations),
+        Some(existing) => {
+            let candidate = merge_legacy_projection(&existing, turns)?;
+            if candidate == existing {
+                return Ok(());
+            }
+            let document = CheckpointDocument {
+                format: "supra-session",
+                version: CHECKPOINT_VERSION,
+                checkpoint: &candidate,
+            };
+            let bytes =
+                serde_json::to_vec(&document).map_err(|error| SessionError::Malformed(error.to_string()))?;
+            publish_unlocked(directory, &path, session, &bytes, &RealSaveOperations)
+        }
+    }
 }
 
 /// Load one session's checkpoint. `Ok(None)` when the session file does
@@ -161,6 +211,7 @@ pub fn load(directory: &Path, session: SessionId) -> Result<Option<Vec<(TurnId, 
         Err(error) => return Err(error.into()),
     };
     if let Ok((stored, turns)) = serde_json::from_slice::<(SessionId, Vec<(TurnId, String)>)>(&bytes) {
+        validate_legacy_turns(stored, &turns)?;
         if stored != session {
             return Err(SessionError::Malformed(format!(
                 "the file names session {stored} but was asked for {session}"
@@ -175,14 +226,18 @@ pub fn load(directory: &Path, session: SessionId) -> Result<Option<Vec<(TurnId, 
 
 /// Persist a versioned, lossless checkpoint under its session directory.
 ///
-/// A per-session lock serialises cooperating writers. When `expected_revision`
-/// is present, publication is compare-and-swap: a stale writer refuses instead
-/// of replacing a newer checkpoint.
+/// A portable adjacent file lock serialises cooperating writers across threads
+/// and processes. When `expected_revision` is present, publication is
+/// compare-and-swap: a stale writer refuses instead of replacing a newer
+/// checkpoint. Every checkpoint commit must strictly increase the revision it
+/// observes on disk.
 ///
 /// # Errors
 ///
 /// [`SessionError::RevisionConflict`] for a stale expected revision;
-/// [`SessionError::Malformed`] for invalid checkpoint state; otherwise I/O.
+/// [`SessionError::NonMonotonicRevision`] when the candidate does not advance
+/// the committed revision; [`SessionError::Malformed`] for invalid checkpoint
+/// state; otherwise I/O.
 pub fn save_checkpoint(
     directory: &Path,
     checkpoint: &SessionCheckpoint,
@@ -191,14 +246,16 @@ pub fn save_checkpoint(
     checkpoint.validate()?;
     ensure_private_directory(directory)?;
     let path = file_path(directory, checkpoint.session());
-    let lock = save_lock(&path);
-    let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    let _lock = SessionFileLock::acquire(&path)?;
 
+    let found = current_revision(&path, checkpoint.session())?;
     if let Some(expected) = expected_revision {
-        let found = current_revision(&path, checkpoint.session())?;
         if found != expected {
             return Err(SessionError::RevisionConflict { expected, found });
         }
+    }
+    if checkpoint.revision() <= found {
+        return Err(SessionError::NonMonotonicRevision { incoming: checkpoint.revision(), current: found });
     }
 
     let document = CheckpointDocument { format: "supra-session", version: CHECKPOINT_VERSION, checkpoint };
@@ -285,6 +342,7 @@ fn decode_checkpoint(bytes: &[u8], expected: SessionId) -> Result<SessionCheckpo
 
     let (stored, turns): (SessionId, Vec<(TurnId, String)>) =
         serde_json::from_slice(bytes).map_err(|error| SessionError::Malformed(error.to_string()))?;
+    validate_legacy_turns(stored, &turns)?;
     if stored != expected {
         return Err(SessionError::Malformed(format!(
             "the file names session {stored} but was asked for {expected}"
@@ -297,13 +355,87 @@ fn decode_checkpoint(bytes: &[u8], expected: SessionId) -> Result<SessionCheckpo
     Ok(checkpoint)
 }
 
-fn current_revision(path: &Path, session: SessionId) -> Result<u64, SessionError> {
+fn validate_legacy_turns(session: SessionId, turns: &[(TurnId, String)]) -> Result<(), SessionError> {
+    if session.is_nil() {
+        return Err(SessionError::Malformed("a session file cannot name the nil session".to_owned()));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (turn, _) in turns {
+        if turn.is_nil() {
+            return Err(SessionError::Malformed("a session file cannot contain a nil turn".to_owned()));
+        }
+        if !seen.insert(*turn) {
+            return Err(SessionError::DuplicateTurn { turn: *turn });
+        }
+    }
+    Ok(())
+}
+
+fn read_versioned_checkpoint_if_present(
+    path: &Path,
+    session: SessionId,
+) -> Result<Option<SessionCheckpoint>, SessionError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    Ok(decode_checkpoint(&bytes, session)?.revision())
+    if let Ok((stored, turns)) = serde_json::from_slice::<(SessionId, Vec<(TurnId, String)>)>(&bytes) {
+        validate_legacy_turns(stored, &turns)?;
+        if stored != session {
+            return Err(SessionError::Malformed(format!(
+                "the file names session {stored} but was asked for {session}"
+            )));
+        }
+        return Ok(None);
+    }
+    Ok(Some(decode_checkpoint(&bytes, session)?))
+}
+
+fn read_checkpoint_if_present(
+    path: &Path,
+    session: SessionId,
+) -> Result<Option<SessionCheckpoint>, SessionError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(decode_checkpoint(&bytes, session)?))
+}
+
+fn merge_legacy_projection(
+    existing: &SessionCheckpoint,
+    turns: &[(TurnId, String)],
+) -> Result<SessionCheckpoint, SessionError> {
+    if turns.len() < existing.turns().len() {
+        return Err(SessionError::LossyLegacySave {
+            reason: "the legacy view omits committed turns".to_owned(),
+        });
+    }
+
+    for ((turn, body), committed) in turns.iter().zip(existing.turns()) {
+        if *turn != committed.turn() {
+            return Err(SessionError::LossyLegacySave {
+                reason: "the legacy view changes committed turn identity or order".to_owned(),
+            });
+        }
+        if body != committed.display_body() {
+            return Err(SessionError::LossyLegacySave {
+                reason: format!("the legacy view changes committed turn {turn}"),
+            });
+        }
+    }
+
+    let mut candidate = existing.clone();
+    for (turn, body) in turns.iter().skip(existing.turns().len()) {
+        candidate.push_turn(CheckpointTurn::new(*turn, body.clone(), Vec::new(), None))?;
+    }
+    Ok(candidate)
+}
+
+fn current_revision(path: &Path, session: SessionId) -> Result<u64, SessionError> {
+    Ok(read_checkpoint_if_present(path, session)?.map_or(0, |checkpoint| checkpoint.revision()))
 }
 
 fn publish_unlocked(
@@ -329,6 +461,7 @@ fn publish_unlocked(
 mod tests {
     use super::*;
     use crate::LifecycleStatus;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn scratch() -> PathBuf {
@@ -420,8 +553,8 @@ mod tests {
                 Some(serde_json::json!({"usage": {"input": 2}})),
             ))
             .expect("turn");
-        checkpoint.set_ledger(Some(serde_json::json!({"generation": 4})));
-        checkpoint.set_config(Some(serde_json::json!({"model": "frozen"})));
+        checkpoint.set_ledger(Some(serde_json::json!({"generation": 4}))).expect("ledger");
+        checkpoint.set_config(Some(serde_json::json!({"model": "frozen"}))).expect("config");
 
         save_checkpoint(&dir, &checkpoint, Some(0)).expect("save");
         let loaded = load_checkpoint(&dir, session).expect("load").expect("present");
@@ -454,18 +587,147 @@ mod tests {
         let dir = scratch();
         let session = SessionId::generate();
         let mut first = SessionCheckpoint::new(session);
-        first.set_status(LifecycleStatus::Running);
+        first.set_status(LifecycleStatus::Running).expect("running");
         save_checkpoint(&dir, &first, Some(0)).expect("first");
 
         let mut second = first.clone();
-        second.set_status(LifecycleStatus::Completed);
+        second.set_status(LifecycleStatus::Completed).expect("completed");
         save_checkpoint(&dir, &second, Some(first.revision())).expect("second");
 
         let mut stale = first;
-        stale.set_status(LifecycleStatus::Interrupted);
+        stale.set_status(LifecycleStatus::Interrupted).expect("interrupted");
         let error = save_checkpoint(&dir, &stale, Some(stale.revision() - 1)).expect_err("stale");
         assert!(matches!(error, SessionError::RevisionConflict { .. }), "{error}");
         assert_eq!(load_checkpoint(&dir, session).expect("load").expect("present"), second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn equal_and_lower_checkpoint_revisions_are_refused() {
+        let dir = scratch();
+        let session = SessionId::generate();
+        let mut committed = SessionCheckpoint::new(session);
+        committed.set_status(LifecycleStatus::Running).expect("running");
+        save_checkpoint(&dir, &committed, Some(0)).expect("initial commit");
+
+        let equal = save_checkpoint(&dir, &committed, Some(committed.revision()))
+            .expect_err("equal revision must not publish");
+        assert!(matches!(equal, SessionError::NonMonotonicRevision { incoming: 1, current: 1 }));
+
+        let lower = SessionCheckpoint::new(session);
+        let error = save_checkpoint(&dir, &lower, Some(committed.revision()))
+            .expect_err("lower revision must not publish");
+        assert!(matches!(error, SessionError::NonMonotonicRevision { incoming: 0, current: 1 }));
+
+        let mut next = committed.clone();
+        next.set_status(LifecycleStatus::Completed).expect("advance");
+        save_checkpoint(&dir, &next, None).expect("unconditional save still advances");
+        let replay = save_checkpoint(&dir, &next, None).expect_err("replay must not publish");
+        assert!(matches!(replay, SessionError::NonMonotonicRevision { incoming: 2, current: 2 }));
+        assert_eq!(load_checkpoint(&dir, session).expect("load"), Some(next));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incompatible_legacy_projection_cannot_erase_a_rich_checkpoint() {
+        let dir = scratch();
+        let session = SessionId::generate();
+        let turn = TurnId::generate();
+        let mut checkpoint = SessionCheckpoint::new(session);
+        checkpoint
+            .push_turn(CheckpointTurn::new(
+                turn,
+                "accepted",
+                vec![crate::ProtocolMessage::new(
+                    "assistant",
+                    serde_json::json!([{"type": "text", "text": "accepted"}]),
+                )],
+                Some(serde_json::json!({"stop_reason": "end_turn"})),
+            ))
+            .expect("turn");
+        checkpoint.set_ledger(Some(serde_json::json!({"generation": 4}))).expect("ledger");
+        save_checkpoint(&dir, &checkpoint, Some(0)).expect("checkpoint");
+
+        let error = save(&dir, session, &[]).expect_err("omitting a committed turn must fail");
+        assert!(matches!(error, SessionError::LossyLegacySave { .. }));
+        assert_eq!(load_checkpoint(&dir, session).expect("load"), Some(checkpoint));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_process_checkpoint_cas_allows_one_winner() {
+        const DIRECTORY_ENV: &str = "SUPRA_SESSION_CAS_DIRECTORY";
+        const SESSION_ENV: &str = "SUPRA_SESSION_CAS_ID";
+        const GATE_ENV: &str = "SUPRA_SESSION_CAS_GATE";
+
+        if let (Some(directory), Some(session), Some(gate)) =
+            (std::env::var_os(DIRECTORY_ENV), std::env::var_os(SESSION_ENV), std::env::var_os(GATE_ENV))
+        {
+            let session = session.to_string_lossy().parse::<SessionId>().expect("session id");
+            let gate = PathBuf::from(gate);
+            for _ in 0..10_000 {
+                if gate.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(gate.exists(), "parent never opened the start gate");
+            let candidate = SessionCheckpoint::from_parts(
+                CHECKPOINT_VERSION,
+                session,
+                2,
+                LifecycleStatus::Completed,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+            )
+            .expect("candidate");
+            match save_checkpoint(Path::new(&directory), &candidate, Some(1)) {
+                Ok(()) => std::process::exit(0),
+                Err(SessionError::RevisionConflict { expected: 1, found: 2 }) => {
+                    std::process::exit(2);
+                }
+                Err(error) => panic!("unexpected child result: {error}"),
+            }
+        }
+
+        let dir = scratch();
+        let session = SessionId::generate();
+        let mut initial = SessionCheckpoint::new(session);
+        initial.set_status(LifecycleStatus::Running).expect("initial revision");
+        save_checkpoint(&dir, &initial, Some(0)).expect("initial commit");
+        let gate = dir.join("start-cas");
+        let executable = std::env::current_exe().expect("test executable");
+        let mut children = Vec::new();
+        for _ in 0..16 {
+            children.push(
+                std::process::Command::new(&executable)
+                    .arg("--exact")
+                    .arg("store::tests::cross_process_checkpoint_cas_allows_one_winner")
+                    .arg("--nocapture")
+                    .env(DIRECTORY_ENV, &dir)
+                    .env(SESSION_ENV, session.to_string())
+                    .env(GATE_ENV, &gate)
+                    .spawn()
+                    .expect("spawn CAS contender"),
+            );
+        }
+        std::fs::write(&gate, b"go").expect("open start gate");
+
+        let mut winners = 0;
+        let mut conflicts = 0;
+        for child in &mut children {
+            match child.wait().expect("wait for contender").code() {
+                Some(0) => winners += 1,
+                Some(2) => conflicts += 1,
+                status => panic!("CAS contender failed with {status:?}"),
+            }
+        }
+        assert_eq!(winners, 1, "exactly one process may commit expected revision 1");
+        assert_eq!(conflicts, 15, "every stale process must observe committed revision 2");
+        assert_eq!(load_checkpoint(&dir, session).expect("load").expect("present").revision(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -564,17 +826,21 @@ mod tests {
         let error = save_with_operations(&dir, session, &[], &FailingRename).expect_err("rename must fail");
         assert!(matches!(error, SessionError::Io(_)), "{error}");
         assert!(!file_path(&dir, session).exists());
-        let names: Vec<_> = std::fs::read_dir(&dir)
+        let unexpected: Vec<_> = std::fs::read_dir(&dir)
             .expect("read directory")
             .filter_map(Result::ok)
+            .filter(|entry| entry.path() != lock_path(&file_path(&dir, session)))
             .map(|entry| entry.file_name())
             .collect();
-        assert!(names.is_empty(), "failed save left files: {names:?}");
+        assert!(unexpected.is_empty(), "failed save left temporary files: {unexpected:?}");
+        assert!(lock_path(&file_path(&dir, session)).is_file(), "the stable sidecar lock remains reusable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     struct ObservedParentSync<'a>(&'a AtomicBool);
 
+    #[cfg(unix)]
     impl SaveOperations for ObservedParentSync<'_> {
         fn sync_parent(&self, directory: &Path) -> io::Result<()> {
             assert!(directory.read_dir()?.any(|entry| {
@@ -585,6 +851,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn parent_directory_is_synced_after_publish() {
         let dir = scratch();

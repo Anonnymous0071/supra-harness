@@ -224,9 +224,15 @@ impl SessionCheckpoint {
     }
 
     /// Replace the lifecycle state and advance the revision.
-    pub fn set_status(&mut self, status: LifecycleStatus) {
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::RevisionExhausted`] when the current revision is
+    /// [`u64::MAX`]. The status is unchanged on error.
+    pub fn set_status(&mut self, status: LifecycleStatus) -> Result<(), SessionError> {
+        self.advance_revision()?;
         self.status = status;
-        self.advance_revision();
+        Ok(())
     }
 
     /// Append a completed turn and advance the revision.
@@ -236,23 +242,35 @@ impl SessionCheckpoint {
     /// [`SessionError::Malformed`] when the turn id already exists.
     pub fn push_turn(&mut self, turn: CheckpointTurn) -> Result<(), SessionError> {
         if self.turns.iter().any(|known| known.turn == turn.turn) {
-            return Err(SessionError::Malformed(format!("duplicate turn {}", turn.turn)));
+            return Err(SessionError::DuplicateTurn { turn: turn.turn });
         }
+        self.advance_revision()?;
         self.turns.push(turn);
-        self.advance_revision();
         Ok(())
     }
 
     /// Replace the opaque ledger snapshot and advance the revision.
-    pub fn set_ledger(&mut self, ledger: Option<Value>) {
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::RevisionExhausted`] when the current revision is
+    /// [`u64::MAX`]. The snapshot is unchanged on error.
+    pub fn set_ledger(&mut self, ledger: Option<Value>) -> Result<(), SessionError> {
+        self.advance_revision()?;
         self.ledger = ledger;
-        self.advance_revision();
+        Ok(())
     }
 
     /// Replace the opaque frozen configuration and advance the revision.
-    pub fn set_config(&mut self, config: Option<Value>) {
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::RevisionExhausted`] when the current revision is
+    /// [`u64::MAX`]. The configuration is unchanged on error.
+    pub fn set_config(&mut self, config: Option<Value>) -> Result<(), SessionError> {
+        self.advance_revision()?;
         self.config = config;
-        self.advance_revision();
+        Ok(())
     }
 
     /// Copy this checkpoint under a fresh session id, retaining explicit lineage.
@@ -292,7 +310,7 @@ impl SessionCheckpoint {
                 return Err(SessionError::Malformed("a checkpoint cannot contain a nil turn".to_owned()));
             }
             if !seen.insert(turn.turn) {
-                return Err(SessionError::Malformed(format!("duplicate turn {}", turn.turn)));
+                return Err(SessionError::DuplicateTurn { turn: turn.turn });
             }
             for message in &turn.messages {
                 if !message.payload.is_object() {
@@ -312,8 +330,12 @@ impl SessionCheckpoint {
         Ok(())
     }
 
-    fn advance_revision(&mut self) {
-        self.revision = self.revision.saturating_add(1);
+    fn advance_revision(&mut self) -> Result<(), SessionError> {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(SessionError::RevisionExhausted { revision: self.revision })?;
+        Ok(())
     }
 }
 
@@ -341,7 +363,9 @@ mod tests {
         let session = SessionId::generate();
         let mut checkpoint = SessionCheckpoint::new(session);
         checkpoint.push_turn(turn(TurnId::generate())).expect("append");
-        checkpoint.set_ledger(Some(serde_json::json!({"generation": 3, "segments": [1, 2]})));
+        checkpoint
+            .set_ledger(Some(serde_json::json!({"generation": 3, "segments": [1, 2]})))
+            .expect("ledger");
 
         let encoded = serde_json::to_vec(&checkpoint).expect("encode");
         let decoded: SessionCheckpoint = serde_json::from_slice(&encoded).expect("decode");
@@ -354,7 +378,7 @@ mod tests {
     fn branch_records_the_exact_source_revision() {
         let mut source = SessionCheckpoint::new(SessionId::generate());
         source.push_turn(turn(TurnId::generate())).expect("append");
-        source.set_status(LifecycleStatus::Interrupted);
+        source.set_status(LifecycleStatus::Interrupted).expect("status");
         let branch = source.branch(SessionId::generate());
 
         assert_eq!(branch.parent(), Some(source.session()));
@@ -392,7 +416,48 @@ mod tests {
             None,
             None,
         );
-        assert!(matches!(duplicate, Err(SessionError::Malformed(_))));
+        assert!(matches!(duplicate, Err(SessionError::DuplicateTurn { turn }) if turn == turn_id));
+    }
+
+    #[test]
+    fn revision_exhaustion_is_explicit_and_leaves_state_unchanged() {
+        let session = SessionId::generate();
+        let original_status = LifecycleStatus::Active;
+        let mut checkpoint = SessionCheckpoint::from_parts(
+            CHECKPOINT_VERSION,
+            session,
+            u64::MAX,
+            original_status,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("max revision is readable");
+
+        let status_error =
+            checkpoint.set_status(LifecycleStatus::Completed).expect_err("status cannot saturate");
+        assert!(matches!(status_error, SessionError::RevisionExhausted { revision } if revision == u64::MAX));
+        assert_eq!(checkpoint.status(), original_status);
+        assert_eq!(checkpoint.revision(), u64::MAX);
+
+        let turn_id = TurnId::generate();
+        let turn_error = checkpoint.push_turn(turn(turn_id)).expect_err("turn cannot saturate");
+        assert!(matches!(turn_error, SessionError::RevisionExhausted { revision } if revision == u64::MAX));
+        assert!(checkpoint.turns().is_empty());
+
+        let ledger_error = checkpoint
+            .set_ledger(Some(serde_json::json!({"new": true})))
+            .expect_err("ledger cannot saturate");
+        assert!(matches!(ledger_error, SessionError::RevisionExhausted { revision } if revision == u64::MAX));
+        assert!(checkpoint.ledger().is_none());
+
+        let config_error = checkpoint
+            .set_config(Some(serde_json::json!({"new": true})))
+            .expect_err("config cannot saturate");
+        assert!(matches!(config_error, SessionError::RevisionExhausted { revision } if revision == u64::MAX));
+        assert!(checkpoint.config().is_none());
     }
 
     #[test]
