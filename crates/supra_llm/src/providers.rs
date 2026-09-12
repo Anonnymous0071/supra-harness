@@ -532,35 +532,15 @@ fn openai_request(
     model: &str,
     prompt_cache_key: Option<&str>,
 ) -> Result<async_openai::types::chat::CreateChatCompletionRequest, LlmError> {
-    use async_openai::types::chat::{
-        ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
-    };
+    use async_openai::types::chat::CreateChatCompletionRequest;
 
-    let messages: Vec<ChatCompletionRequestMessage> = request
+    let messages = request
         .messages
         .iter()
-        .map(|message| match message.role {
-            Role::User => ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Text(message.text_content()),
-                name: None,
-            }),
-            Role::Assistant => ChatCompletionRequestMessage::Assistant(
-                async_openai::types::chat::ChatCompletionRequestAssistantMessage {
-                    content: Some(
-                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContent::Text(
-                            message.text_content(),
-                        ),
-                    ),
-                    refusal: None,
-                    name: None,
-                    audio: None,
-                    tool_calls: None,
-                    #[allow(deprecated)]
-                    function_call: None,
-                },
-            ),
-        })
+        .map(openai_message)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .collect();
 
     let sdk_request = CreateChatCompletionRequest {
@@ -579,6 +559,129 @@ fn openai_request(
         ..Default::default()
     };
     Ok(sdk_request)
+}
+
+fn openai_message(
+    message: &crate::client::Message,
+) -> Result<Vec<async_openai::types::chat::ChatCompletionRequestMessage>, LlmError> {
+    match message.role {
+        Role::Assistant => Ok(vec![openai_assistant_message(message)?]),
+        Role::User => openai_user_messages(message),
+    }
+}
+
+fn openai_assistant_message(
+    message: &crate::client::Message,
+) -> Result<async_openai::types::chat::ChatCompletionRequestMessage, LlmError> {
+    use async_openai::types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage, FunctionCall,
+    };
+
+    let mut tool_calls = Vec::new();
+    let mut text = String::new();
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { text: part, citations } if citations.is_empty() => text.push_str(part),
+            ContentBlock::ToolUse { id, name, input } => {
+                let arguments = canonical_tool_value(input)?.as_str().to_owned();
+                tool_calls.push(ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                    id: id.clone(),
+                    function: FunctionCall { name: name.clone(), arguments },
+                }));
+            }
+            block => return Err(non_replayable_openai_block("assistant", block)),
+        }
+    }
+    if text.is_empty() && tool_calls.is_empty() {
+        return Err(empty_openai_message("assistant"));
+    }
+    Ok(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+        content: (!text.is_empty()).then_some(ChatCompletionRequestAssistantMessageContent::Text(text)),
+        refusal: None,
+        name: None,
+        audio: None,
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+        #[allow(deprecated)]
+        function_call: None,
+    }))
+}
+
+fn openai_user_messages(
+    message: &crate::client::Message,
+) -> Result<Vec<async_openai::types::chat::ChatCompletionRequestMessage>, LlmError> {
+    use async_openai::types::chat::{
+        ChatCompletionRequestMessage, ChatCompletionRequestToolMessage,
+        ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent,
+    };
+
+    let mut messages = Vec::new();
+    let mut text = String::new();
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { text: part, citations } if citations.is_empty() => text.push_str(part),
+            ContentBlock::ToolResult { tool_use_id, content, is_error: _ } => {
+                if !text.is_empty() {
+                    messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text(std::mem::take(&mut text)),
+                        name: None,
+                    }));
+                }
+                messages.push(ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+                    content: ChatCompletionRequestToolMessageContent::Text(tool_result_text(content)?),
+                    tool_call_id: tool_use_id.clone(),
+                }));
+            }
+            block => return Err(non_replayable_openai_block("user", block)),
+        }
+    }
+    if !text.is_empty() {
+        messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(text),
+            name: None,
+        }));
+    }
+    if messages.is_empty() {
+        return Err(empty_openai_message("user"));
+    }
+    Ok(messages)
+}
+
+fn non_replayable_openai_block(role: &str, block: &ContentBlock) -> LlmError {
+    let kind = match block {
+        ContentBlock::Text { .. } => "text with citations",
+        ContentBlock::Thinking { .. } => "thinking",
+        ContentBlock::RedactedThinking { .. } => "redacted thinking",
+        ContentBlock::ToolUse { .. } => "tool use",
+        ContentBlock::ToolResult { .. } => "tool result",
+        ContentBlock::Unknown { .. } => "unknown",
+    };
+    LlmError::BadResponse {
+        provider: ProviderKind::OpenAI.name().to_owned(),
+        detail: format!("cannot replay {kind} block in an OpenAI {role} message"),
+    }
+}
+
+fn empty_openai_message(role: &str) -> LlmError {
+    LlmError::BadResponse {
+        provider: ProviderKind::OpenAI.name().to_owned(),
+        detail: format!("cannot replay an empty OpenAI {role} message"),
+    }
+}
+
+fn canonical_tool_value(value: &serde_json::Value) -> Result<supra_types::CanonicalJson, LlmError> {
+    crate::canonicalize_value(value).map_err(|error| LlmError::BadResponse {
+        provider: ProviderKind::OpenAI.name().to_owned(),
+        detail: format!("tool value is not canonical JSON: {error}"),
+    })
+}
+
+fn tool_result_text(content: &serde_json::Value) -> Result<String, LlmError> {
+    match content {
+        serde_json::Value::String(text) => Ok(text.clone()),
+        value => Ok(canonical_tool_value(value)?.as_str().to_owned()),
+    }
 }
 
 /// Read one blocking `OpenAI` answer into a [`Completion`].
@@ -876,6 +979,142 @@ mod tests {
         assert_eq!(
             openai_stop_reason(async_openai::types::chat::FinishReason::ToolCalls),
             StopReason::ToolUse
+        );
+    }
+
+    #[test]
+    fn openai_replays_tool_calls_and_results_without_losing_ids_or_order() {
+        let request = Request {
+            messages: vec![
+                crate::client::Message::text(Role::User, "inspect"),
+                crate::client::Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::text("checking"),
+                        ContentBlock::ToolUse {
+                            id: "call_b".to_owned(),
+                            name: "lookup".to_owned(),
+                            input: serde_json::json!({"z": 2, "a": 1}),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call_a".to_owned(),
+                            name: "read".to_owned(),
+                            input: serde_json::json!({"path": "x"}),
+                        },
+                    ],
+                },
+                crate::client::Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call_b".to_owned(),
+                            content: serde_json::json!({"z": 2, "a": 1}),
+                            is_error: false,
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call_a".to_owned(),
+                            content: serde_json::Value::String("done".to_owned()),
+                            is_error: false,
+                        },
+                    ],
+                },
+            ],
+            ..sample_request(ProviderKind::OpenAI)
+        };
+
+        let rendered = openai_request(&request, "m", None).expect("request renders");
+        let wire = serde_json::to_value(rendered).expect("SDK request serializes");
+        assert_eq!(wire["messages"].as_array().expect("messages").len(), 4);
+        assert_eq!(wire["messages"][1]["content"], "checking");
+        assert_eq!(wire["messages"][1]["tool_calls"][0]["id"], "call_b");
+        assert_eq!(wire["messages"][1]["tool_calls"][0]["function"]["arguments"], "{\"a\":1,\"z\":2}");
+        assert_eq!(wire["messages"][1]["tool_calls"][1]["id"], "call_a");
+        assert_eq!(
+            wire["messages"][2],
+            serde_json::json!({
+                "role": "tool",
+                "content": "{\"a\":1,\"z\":2}",
+                "tool_call_id": "call_b",
+            })
+        );
+        assert_eq!(
+            wire["messages"][3],
+            serde_json::json!({
+                "role": "tool",
+                "content": "done",
+                "tool_call_id": "call_a",
+            })
+        );
+    }
+
+    #[test]
+    fn openai_preserves_user_and_tool_result_block_order() {
+        let request = Request {
+            messages: vec![crate::client::Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::text("before"),
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_owned(),
+                        content: serde_json::Value::String("result".to_owned()),
+                        is_error: true,
+                    },
+                    ContentBlock::text("after"),
+                ],
+            }],
+            ..sample_request(ProviderKind::OpenAI)
+        };
+
+        let rendered = openai_request(&request, "m", None).expect("request renders");
+        let wire = serde_json::to_value(rendered).expect("SDK request serializes");
+        assert_eq!(wire["messages"][0], serde_json::json!({"role": "user", "content": "before"}));
+        assert_eq!(wire["messages"][1]["role"], "tool");
+        assert_eq!(wire["messages"][1]["tool_call_id"], "call_1");
+        assert_eq!(wire["messages"][2], serde_json::json!({"role": "user", "content": "after"}));
+    }
+
+    #[test]
+    fn openai_replay_refuses_protocol_blocks_it_cannot_encode() {
+        let request = Request {
+            messages: vec![crate::client::Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    thinking: "private".to_owned(),
+                    signature: "signature".to_owned(),
+                }],
+            }],
+            ..sample_request(ProviderKind::OpenAI)
+        };
+
+        let error = openai_request(&request, "m", None).expect_err("thinking must not disappear");
+        assert!(matches!(error, LlmError::BadResponse { .. }), "{error}");
+        assert!(error.to_string().contains("thinking"), "{error}");
+    }
+
+    #[test]
+    fn openai_tool_argument_json_is_canonical() {
+        let first = crate::client::Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call".to_owned(),
+                name: "lookup".to_owned(),
+                input: serde_json::json!({"z": 2, "a": {"y": 1, "b": 0}}),
+            }],
+        };
+        let second = crate::client::Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call".to_owned(),
+                name: "lookup".to_owned(),
+                input: serde_json::from_str(r#"{"a":{"b":0,"y":1},"z":2}"#).expect("JSON"),
+            }],
+        };
+
+        let first = openai_assistant_message(&first).expect("first renders");
+        let second = openai_assistant_message(&second).expect("second renders");
+        assert_eq!(
+            serde_json::to_value(first).expect("serialize"),
+            serde_json::to_value(second).expect("serialize")
         );
     }
 
