@@ -14,6 +14,7 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::print_stderr, unsafe_code)]
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use supra_secrets::{Backend, SecretManager, SecretsError, file_store::MASTER_KEY_ENV};
@@ -22,7 +23,15 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_path() -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("supra-secrets-manager-{n}.enc"))
+    let directory = std::env::temp_dir().join(format!("supra-secrets-manager-{n}"));
+    let _ = std::fs::remove_dir_all(&directory);
+    directory.join("secrets.enc")
+}
+
+fn remove_scratch(path: &std::path::Path) {
+    if let Some(directory) = path.parent() {
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }
 
 fn with_key(value: &str, body: impl FnOnce()) {
@@ -34,6 +43,53 @@ fn with_key(value: &str, body: impl FnOnce()) {
         body();
         std::env::remove_var(MASTER_KEY_ENV);
     }
+}
+
+#[test]
+fn concurrent_process_writes_preserve_every_record() {
+    if let (Some(path), Some(account)) =
+        (std::env::var_os("SUPRA_CONCURRENCY_VAULT"), std::env::var_os("SUPRA_CONCURRENCY_ACCOUNT"))
+    {
+        let manager = SecretManager::open_with_file_store(PathBuf::from(path));
+        if manager.primary_backend() == Backend::EncryptedFile {
+            manager.unlock_file_store("concurrency-test-key");
+            manager.set("svc", &account.to_string_lossy(), "opaque-test-value").expect("child set");
+        }
+        return;
+    }
+
+    let path = scratch_path();
+    remove_scratch(&path);
+    let executable = std::env::current_exe().expect("test executable");
+    let mut children = Vec::new();
+    for index in 0..8 {
+        let child = Command::new(&executable)
+            .arg("--exact")
+            .arg("concurrent_process_writes_preserve_every_record")
+            .arg("--nocapture")
+            .env("SUPRA_CONCURRENCY_VAULT", &path)
+            .env("SUPRA_CONCURRENCY_ACCOUNT", format!("account-{index}"))
+            .spawn()
+            .expect("spawn child");
+        children.push(child);
+    }
+    for child in &mut children {
+        assert!(child.wait().expect("wait for child").success(), "child failed");
+    }
+
+    let manager = SecretManager::open_with_file_store(path.clone());
+    if manager.primary_backend() != Backend::EncryptedFile {
+        remove_scratch(&path);
+        return;
+    }
+    manager.unlock_file_store("concurrency-test-key");
+    for index in 0..8 {
+        assert_eq!(
+            manager.get("svc", &format!("account-{index}")).expect("record survives"),
+            "opaque-test-value"
+        );
+    }
+    remove_scratch(&path);
 }
 
 #[test]
@@ -54,7 +110,7 @@ fn the_manager_reports_which_backend_is_primary() {
 #[test]
 fn a_secret_round_trips_through_the_fallback() {
     let path = scratch_path();
-    let _ = std::fs::remove_file(&path);
+    remove_scratch(&path);
     with_key("manager-test-key", || {
         let manager = SecretManager::open_with_file_store(path.clone());
         // Force the fallback even where a keyring exists: the point is the file rung, not the
@@ -68,14 +124,14 @@ fn a_secret_round_trips_through_the_fallback() {
         assert_eq!(manager.get("svc", "acct").expect("get"), "s3cr3t");
         assert!(manager.delete("svc", "acct").expect("delete"));
         assert!(!manager.delete("svc", "acct").expect("delete again"));
-        let _ = std::fs::remove_file(&path);
+        remove_scratch(&path);
     });
 }
 
 #[test]
 fn a_missing_entry_names_where_it_looked() {
     let path = scratch_path();
-    let _ = std::fs::remove_file(&path);
+    remove_scratch(&path);
     with_key("manager-test-key", || {
         let manager = SecretManager::open_with_file_store(path.clone());
         if manager.primary_backend() != Backend::EncryptedFile {
@@ -86,14 +142,14 @@ fn a_missing_entry_names_where_it_looked() {
         // remedy - not a bare "not found" - is what the user hears.
         assert!(matches!(error, SecretsError::NoStore { .. }), "{error}");
         assert!(error.to_string().contains(MASTER_KEY_ENV), "{error}");
-        let _ = std::fs::remove_file(&path);
+        remove_scratch(&path);
     });
 }
 
 #[test]
 fn a_vault_that_exists_but_lacks_the_entry_is_not_found_not_nostore() {
     let path = scratch_path();
-    let _ = std::fs::remove_file(&path);
+    remove_scratch(&path);
     with_key("manager-test-key", || {
         let manager = SecretManager::open_with_file_store(path.clone());
         if manager.primary_backend() != Backend::EncryptedFile {
@@ -102,7 +158,7 @@ fn a_vault_that_exists_but_lacks_the_entry_is_not_found_not_nostore() {
         manager.set("svc", "present", "value").expect("seed");
         let error = manager.get("svc", "absent").expect_err("must be missing");
         assert!(matches!(error, SecretsError::NotFound { .. }), "{error}");
-        let _ = std::fs::remove_file(&path);
+        remove_scratch(&path);
     });
 }
 
@@ -110,7 +166,7 @@ fn a_vault_that_exists_but_lacks_the_entry_is_not_found_not_nostore() {
 fn unlock_supplies_the_passphrase_without_the_environment() {
     // The CLI prompts once and unlocks for the session; later reads must not need the variable.
     let path = scratch_path();
-    let _ = std::fs::remove_file(&path);
+    remove_scratch(&path);
     with_key("seed-key", || {
         let seeder = SecretManager::open_with_file_store(path.clone());
         if seeder.primary_backend() != Backend::EncryptedFile {
@@ -126,7 +182,7 @@ fn unlock_supplies_the_passphrase_without_the_environment() {
     manager.unlock_file_store("seed-key");
     assert_eq!(manager.get("svc", "acct").expect("get"), "value");
     manager.lock_file_store();
-    let _ = std::fs::remove_file(&path);
+    remove_scratch(&path);
 }
 
 #[test]
@@ -136,7 +192,7 @@ fn a_provider_supplies_the_passphrase_when_nothing_else_does() {
     use zeroize::Zeroizing;
 
     let path = scratch_path();
-    let _ = std::fs::remove_file(&path);
+    remove_scratch(&path);
     // The whole body runs under the module's environment lock, not just the
     // seed: this test's `get` reads a file unlocked by a *provider*, so it
     // must not race another test's `remove_var` between the seeding and the
@@ -157,7 +213,7 @@ fn a_provider_supplies_the_passphrase_when_nothing_else_does() {
         manager.set_passphrase_provider(provider);
         assert_eq!(manager.get("svc", "acct").expect("get"), "value");
     });
-    let _ = std::fs::remove_file(&path);
+    remove_scratch(&path);
 }
 
 #[test]
@@ -175,7 +231,7 @@ fn a_keyring_miss_falls_through_to_the_file() {
     // Gated on the file rung being primary: on a keyring machine the manager below would
     // write to the OS store, and no test may touch real credentials.
     let path = scratch_path();
-    let _ = std::fs::remove_file(&path);
+    remove_scratch(&path);
     with_key("fallthrough-key", || {
         let manager = SecretManager::open_with_file_store(path.clone());
         if manager.primary_backend() != Backend::EncryptedFile {
@@ -188,7 +244,7 @@ fn a_keyring_miss_falls_through_to_the_file() {
         let text = error.to_string();
         assert!(matches!(error, SecretsError::NotFound { .. }), "{text}");
     });
-    let _ = std::fs::remove_file(&path);
+    remove_scratch(&path);
 }
 
 #[test]

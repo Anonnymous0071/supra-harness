@@ -165,6 +165,7 @@ pbkdf2 = "0.13.0"
 sha2 = "0.11.0"
 zeroize = { version = "1.9.0", features = ["derive"] }
 getrandom = "0.4.3"
+fs2 = "=0.4.3"
 
 # guard (T12.5): HMAC-SHA256 for the environment marker
 hmac = "0.13.0"

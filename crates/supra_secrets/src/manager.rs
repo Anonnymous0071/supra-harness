@@ -247,13 +247,15 @@ impl SecretManager {
     ///
     /// # Errors
     ///
-    /// As the store that is primary.
+    /// Any error from either store. Deletion checks both stores when the keyring is available so
+    /// a fallback copy cannot silently survive a reported success.
     pub fn delete(&self, service: &str, account: &str) -> Result<bool, SecretsError> {
         if self.keyring_available {
             let removed = self.keyring_delete(service, account)?;
             // Also remove from the file, in case a previous headless session wrote it there.
-            let file_removed = self.file.delete(service, account).unwrap_or(false);
-            Ok(removed || file_removed)
+            // A corrupt or inaccessible fallback must remain visible: reporting success while a
+            // credential copy survives would violate the deletion contract.
+            combine_delete_results(removed, self.file.delete(service, account))
         } else {
             self.file.delete(service, account)
         }
@@ -291,5 +293,32 @@ impl SecretManager {
             Err(error) if is_no_entry(&error) => Ok(false),
             Err(error) => Err(SecretsError::Keyring(error.to_string())),
         }
+    }
+}
+
+fn combine_delete_results(
+    primary_removed: bool,
+    fallback_removed: Result<bool, SecretsError>,
+) -> Result<bool, SecretsError> {
+    fallback_removed.map(|removed| primary_removed || removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_delete_errors_are_not_suppressed_after_primary_success() {
+        let fallback_error = SecretsError::Crypto { detail: "fallback vault could not be opened".to_owned() };
+        let error =
+            combine_delete_results(true, Err(fallback_error)).expect_err("fallback error must propagate");
+        assert!(matches!(error, SecretsError::Crypto { .. }));
+    }
+
+    #[test]
+    fn deletion_reports_a_record_found_in_either_store() {
+        assert!(combine_delete_results(true, Ok(false)).expect("primary result"));
+        assert!(combine_delete_results(false, Ok(true)).expect("fallback result"));
+        assert!(!combine_delete_results(false, Ok(false)).expect("miss result"));
     }
 }
