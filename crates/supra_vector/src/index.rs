@@ -168,8 +168,12 @@ impl VectorIndex {
             }
         };
 
-        let codes = load_codes(&store, &meta)?;
-        let revision = read_revision(&store)?;
+        let (codes, revision) =
+            store.with_transaction::<_, VectorError>(TransactionBehavior::Deferred, |transaction| {
+                let revision = read_revision(transaction)?;
+                let codes = load_codes(transaction, &meta)?;
+                Ok((codes, revision))
+            })?;
         Ok(Self {
             store,
             meta,
@@ -317,7 +321,6 @@ impl VectorIndex {
     /// [`VectorError::WrongWidth`] or [`VectorError::Degenerate`] for an unusable query,
     /// [`VectorError::Malformed`] when a stored vector is not the width the schema promised.
     pub fn search_semantic(&self, query: &[f32], limit: usize) -> Result<Vec<Hit>, VectorError> {
-        self.sync_if_stale()?;
         codes::validate(query, self.meta.dims)?;
         if limit == 0 {
             return Ok(Vec::new());
@@ -326,20 +329,25 @@ impl VectorIndex {
         let query_code = codes::encode(query, &self.meta.threshold)?;
         let width = self.options.rerank_width.max(limit);
 
-        let candidates = self.state().codes.nearest(&query_code, width);
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
+        self.store.with_transaction::<_, VectorError>(TransactionBehavior::Deferred, |transaction| {
+            self.sync_if_stale(transaction)?;
 
-        let mut scored = Vec::with_capacity(candidates.len());
-        for candidate in &candidates {
-            let vector = self.exact(candidate.slot)?;
-            scored.push(Scored { slot: candidate.slot, similarity: codes::similarity(query, &vector) });
-        }
+            let candidates = self.state().codes.nearest(&query_code, width);
+            if candidates.is_empty() {
+                return Ok(Vec::new());
+            }
+            run_before_exact_hook();
 
-        let mut ordered = search::order_exact(scored);
-        ordered.truncate(limit);
-        self.name(&ordered)
+            let mut scored = Vec::with_capacity(candidates.len());
+            for candidate in &candidates {
+                let vector = self.exact(transaction, candidate.slot)?;
+                scored.push(Scored { slot: candidate.slot, similarity: codes::similarity(query, &vector) });
+            }
+
+            let mut ordered = search::order_exact(scored);
+            ordered.truncate(limit);
+            Self::name(transaction, &ordered)
+        })
     }
 
     /// Best by term match, ranked by `bm25()`.
@@ -464,17 +472,14 @@ impl VectorIndex {
     }
 
     /// Read one exact vector, through the cache.
-    fn exact(&self, slot: i64) -> Result<Vec<f32>, VectorError> {
+    fn exact(&self, connection: &Connection, slot: i64) -> Result<Vec<f32>, VectorError> {
         if let Some(cached) = self.state().cache.get(slot) {
             return Ok(cached);
         }
 
-        let blob: Option<Vec<u8>> = self.store.with_connection(|connection| {
-            connection
-                .query_row("SELECT embedding FROM vector_entry WHERE slot = ?1", [slot], |row| row.get(0))
-                .optional()
-                .map_err(VectorError::Sqlite)
-        })?;
+        let blob: Option<Vec<u8>> = connection
+            .query_row("SELECT embedding FROM vector_entry WHERE slot = ?1", [slot], |row| row.get(0))
+            .optional()?;
 
         // A slot in the resident tier with no row behind it means the two disagree, which is a
         // damaged index rather than a missing entry: every slot in the tier was put there by a
@@ -489,21 +494,17 @@ impl VectorIndex {
     }
 
     /// Attach locators to scored slots, in one query rather than one per hit.
-    fn name(&self, scored: &[Scored]) -> Result<Vec<Hit>, VectorError> {
+    fn name(connection: &Connection, scored: &[Scored]) -> Result<Vec<Hit>, VectorError> {
         let mut hits = Vec::with_capacity(scored.len());
-        self.store.with_connection(|connection| {
-            let mut statement =
-                connection.prepare_cached("SELECT locator FROM vector_entry WHERE slot = ?1")?;
-            for entry in scored {
-                let locator: Option<String> =
-                    statement.query_row([entry.slot], |row| row.get(0)).optional()?;
-                let locator = locator.ok_or_else(|| VectorError::Malformed {
-                    detail: format!("slot {} is in the resident tier but has no row", entry.slot),
-                })?;
-                hits.push(Hit { slot: entry.slot, locator, similarity: Some(entry.similarity), bm25: None });
-            }
-            Ok(hits)
-        })
+        let mut statement = connection.prepare_cached("SELECT locator FROM vector_entry WHERE slot = ?1")?;
+        for entry in scored {
+            let locator: Option<String> = statement.query_row([entry.slot], |row| row.get(0)).optional()?;
+            let locator = locator.ok_or_else(|| VectorError::Malformed {
+                detail: format!("slot {} is in the resident tier but has no row", entry.slot),
+            })?;
+            hits.push(Hit { slot: entry.slot, locator, similarity: Some(entry.similarity), bm25: None });
+        }
+        Ok(hits)
     }
 
     /// Poisoning is ignored, as in T10: a panic inside a lookup leaves both tiers structurally
@@ -520,12 +521,12 @@ impl VectorIndex {
     /// through its resident tier or its exact cache. The revision the
     /// writer bumped is the signal: when it moved, the codes are reloaded
     /// and the cache dropped before the query reads either.
-    fn sync_if_stale(&self) -> Result<(), VectorError> {
-        let current = read_revision(&self.store)?;
+    fn sync_if_stale(&self, connection: &Connection) -> Result<(), VectorError> {
+        let current = read_revision(connection)?;
         if self.state().revision == current {
             return Ok(());
         }
-        let codes = load_codes(&self.store, &self.meta)?;
+        let codes = load_codes(connection, &self.meta)?;
         let mut state = self.state();
         if state.revision == current {
             return Ok(());
@@ -627,13 +628,11 @@ fn push_term(terms: &mut Vec<String>, term: &str) {
 }
 
 /// The store's current revision, as writers bumped it.
-fn read_revision(store: &Store) -> Result<u64, VectorError> {
-    store.with_connection(|connection| {
-        let revision: Option<i64> = connection
-            .query_row("SELECT revision FROM vector_meta WHERE id = 1", [], |row| row.get(0))
-            .optional()?;
-        Ok(u64::try_from(revision.unwrap_or(0)).unwrap_or(0))
-    })
+fn read_revision(connection: &Connection) -> Result<u64, VectorError> {
+    let revision: Option<i64> = connection
+        .query_row("SELECT revision FROM vector_meta WHERE id = 1", [], |row| row.get(0))
+        .optional()?;
+    Ok(u64::try_from(revision.unwrap_or(0)).unwrap_or(0))
 }
 
 /// Bump the revision inside a write transaction and return the new value.
@@ -683,34 +682,49 @@ fn write_meta(
 ///
 /// One pass, with the row count read first so the buffer is allocated once: growing a 9.6 MB
 /// buffer by doubling copies it about seventeen times on the way up.
-fn load_codes(store: &Store, meta: &Meta) -> Result<CodeTable, VectorError> {
-    store.with_connection(|connection| {
-        let count: i64 = connection.query_row("SELECT count(*) FROM vector_entry", [], |row| row.get(0))?;
-        let capacity = usize::try_from(count).unwrap_or(0);
-        let mut table = CodeTable::with_capacity(meta.code_bytes(), capacity);
+fn load_codes(connection: &Connection, meta: &Meta) -> Result<CodeTable, VectorError> {
+    let count: i64 = connection.query_row("SELECT count(*) FROM vector_entry", [], |row| row.get(0))?;
+    let capacity = usize::try_from(count).unwrap_or(0);
+    let mut table = CodeTable::with_capacity(meta.code_bytes(), capacity);
 
-        let mut statement = connection.prepare("SELECT slot, code FROM vector_entry ORDER BY slot")?;
-        let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+    let mut statement = connection.prepare("SELECT slot, code FROM vector_entry ORDER BY slot")?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
 
-        for row in rows {
-            let (slot, code) = row?;
-            if !table.upsert(slot, &code) {
-                // The schema ties a row's code and embedding widths to each other, but nothing
-                // in SQL ties them to `vector_meta.dims`. This is where that gap is closed, and
-                // it is a refusal rather than a skip: an index missing an arbitrary subset of
-                // its entries would answer every query slightly wrongly and never say so.
-                return Err(VectorError::Malformed {
-                    detail: format!(
-                        "slot {slot} holds a {}-byte code where this index uses {}",
-                        code.len(),
-                        meta.code_bytes()
-                    ),
-                });
-            }
+    for row in rows {
+        let (slot, code) = row?;
+        if !table.upsert(slot, &code) {
+            // The schema ties a row's code and embedding widths to each other, but nothing
+            // in SQL ties them to `vector_meta.dims`. This is where that gap is closed, and
+            // it is a refusal rather than a skip: an index missing an arbitrary subset of
+            // its entries would answer every query slightly wrongly and never say so.
+            return Err(VectorError::Malformed {
+                detail: format!(
+                    "slot {slot} holds a {}-byte code where this index uses {}",
+                    code.len(),
+                    meta.code_bytes()
+                ),
+            });
         }
-        Ok(table)
-    })
+    }
+    Ok(table)
 }
+
+#[cfg(test)]
+type BeforeExactHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static BEFORE_EXACT_HOOK: Mutex<Option<BeforeExactHook>> = Mutex::new(None);
+
+#[cfg(test)]
+fn run_before_exact_hook() {
+    let hook = BEFORE_EXACT_HOOK.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+const fn run_before_exact_hook() {}
 
 /// Milliseconds since the Unix epoch, or 0 for a clock set before it - which the schema's
 /// `CHECK (updated_at >= 0)` requires, and which is a better outcome than refusing to index
@@ -719,4 +733,75 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+
+    const TEST_DIMS: usize = 8;
+    const TEST_MODEL: &str = "snapshot-test";
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "supra-vector-snapshot-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("scratch directory");
+            Self(path)
+        }
+
+        fn store(&self) -> Arc<Store> {
+            Arc::new(Store::open(self.0.join("store.db")).expect("open store"))
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_index(store: Arc<Store>) -> VectorIndex {
+        VectorIndex::open(store, TEST_MODEL, TEST_DIMS, &[0.0; TEST_DIMS], IndexOptions::default())
+            .expect("open index")
+    }
+
+    #[test]
+    fn semantic_search_keeps_one_snapshot_during_a_concurrent_remove() {
+        let scratch = Scratch::new();
+        let seed = test_index(scratch.store());
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        seed.upsert("entry", "body", &query).expect("seed entry");
+
+        let reader = test_index(scratch.store());
+        let writer = test_index(scratch.store());
+        let (candidates_ready, wait_for_candidates) = mpsc::channel();
+        let (remove_done, wait_for_remove) = mpsc::channel();
+        *BEFORE_EXACT_HOOK.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(move || {
+            candidates_ready.send(()).expect("signal selected candidates");
+            wait_for_remove.recv().expect("wait for committed remove");
+        }));
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                wait_for_candidates.recv().expect("wait for selected candidates");
+                assert!(writer.remove("entry").expect("remove entry"));
+                remove_done.send(()).expect("signal committed remove");
+            });
+
+            let hits = reader.search_semantic(&query, 1).expect("search one snapshot");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].locator, "entry");
+        });
+
+        assert!(reader.search_semantic(&query, 1).expect("search current revision").is_empty());
+    }
 }
