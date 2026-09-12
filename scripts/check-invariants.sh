@@ -844,7 +844,10 @@ if [ -d "$secrets" ]; then
     # The temporary vault file is born 0600 before it is opened. `OpenOptionsExt::mode`
     # applies the creation mode atomically, avoiding the world-readable window that a
     # create-then-chmod sequence introduces. The destination is re-asserted after rename.
-    segment=$(sed -n '/fn save(/,/^    }/p' "$secrets/file_store.rs" |
+    # `save_with_temp_suffixes` owns the temp-file allocation while `save` owns the
+    # transaction lock. Extract the helper through its closing brace so the check follows
+    # the code that actually opens the encrypted vault.
+    segment=$(sed -n '/fn save_with_temp_suffixes(/,/^    }/p' "$secrets/file_store.rs" |
         sed -n '/let mut options = fs::OpenOptions::new/,/write_all/p')
     if ! printf '%s\n' "$segment" | grep -q 'create_new(true)'; then
         fail "the vault temp file is no longer created exclusively" "$segment" \
