@@ -1185,22 +1185,12 @@ fn parse_usage(json: &serde_json::Value) -> Option<Usage> {
         .or_else(|| usage.get("completion_tokens"))
         .or_else(|| usage.get("candidatesTokenCount"))
         .and_then(serde_json::Value::as_u64)?;
-<<<<<<< HEAD
     let cached = usage
         .get("cache_read_input_tokens")
         .or_else(|| usage.get("cachedContentTokenCount"))
         .or_else(|| usage.get("prompt_tokens_details").and_then(|details| details.get("cached_tokens")))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-||||||| parent of ccad8fb (fix(llm): harden provider response boundaries)
-    let cached = usage.get("cache_read_input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
-=======
-    let cached = usage
-        .get("cache_read_input_tokens")
-        .or_else(|| usage.get("prompt_tokens_details").and_then(|details| details.get("cached_tokens")))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
->>>>>>> ccad8fb (fix(llm): harden provider response boundaries)
     Some(Usage { input_tokens: input, output_tokens: output, cached_tokens: cached })
 }
 
