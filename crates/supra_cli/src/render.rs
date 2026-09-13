@@ -81,4 +81,19 @@ mod tests {
         assert!(lines[0].contains("cache broke"), "{}", lines[0]);
         assert!(lines[0].contains("mode yolo"), "{}", lines[0]);
     }
+
+    #[test]
+    fn a_dropped_delivery_reaches_the_frame_through_the_drain() {
+        use supra_eventbus::TopicSet;
+        let bus = supra_eventbus::Bus::new();
+        let watcher = bus.subscribe_with_capacity(TopicSet::all(), 1);
+        bus.publish(supra_types::Event::StreamDelta { chars: 1 });
+        bus.publish(supra_types::Event::StreamDelta { chars: 1 });
+        let frame_deliveries = watcher.drain();
+        assert_eq!(frame_deliveries.len(), 1, "the ring keeps the newest");
+        let mut frame = supra_tui::FrameState::default();
+        let _ = render_drain(&mut frame, &frame_deliveries, "auto", "sonnet", &theme(), 120);
+        assert_eq!(frame.missed_events, 1, "the gap rides the surviving delivery");
+        assert_eq!(frame.streamed_chars, 1, "only the surviving delta counts");
+    }
 }

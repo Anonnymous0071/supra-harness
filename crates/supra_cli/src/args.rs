@@ -216,7 +216,7 @@ mod tests {
             "supra",
             "run",
             "--resume",
-            "01J0000000000000000000000",
+            "01J00000000000000000000000",
             "task",
         ]);
         assert!(resumed.is_ok(), "resume accepts a session id: {resumed:?}");
