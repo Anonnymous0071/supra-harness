@@ -113,22 +113,22 @@ async fn execute_turn_resuming_with_backend<B: ProviderBackend>(
     backend: Arc<B>,
     task: &str,
 ) -> anyhow::Result<TurnResult> {
-    let (mut session, prior_turns) = match resume {
-        None => (supra_session::Session::new(), 0u64),
+    let (mut session, prior_turns, resumed) = match resume {
+        None => (supra_session::Session::new(), 0u64, false),
         Some(id) => match supra_session::Session::resume(session_dir, id)? {
             None => anyhow::bail!("no saved session {id}"),
             Some(session) => {
                 let turns = session.turns().len() as u64;
-                (session, turns)
+                (session, turns, true)
             }
         },
     };
-    let _ = fire_hooks(
-        hooks,
-        supra_hook::HookPoint::SessionStart,
-        supra_types::Event::SessionStarted { session: session.id() },
-        prior_turns,
-    )?;
+    let session_event = if resumed {
+        supra_types::Event::SessionResumed { session: session.id() }
+    } else {
+        supra_types::Event::SessionStarted { session: session.id() }
+    };
+    let _ = fire_hooks(hooks, supra_hook::HookPoint::SessionStart, session_event, prior_turns)?;
     let mut result = execute_turn_with_backend(config, hooks, prior_turns, task, backend).await?;
     result.session = session.id();
     session.record_turn_with_body(result.turn, &result.answer);
@@ -918,6 +918,56 @@ mod tests {
             .expect("resume")
             .expect("saved session");
         assert_eq!(resumed.bodies(), &["first answer", "second answer"]);
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_turn_fires_session_resumed_not_started() {
+        let config = config_with_limit(1);
+        let first = Arc::new(MockProvider::new([
+            text_reply("first answer", Duration::ZERO),
+            yes_reply(Duration::ZERO),
+        ]));
+        let session_dir = scratch("resumed-event");
+        let secrets = supra_secrets::SecretManager::open();
+        let mut hooks = supra_hook::Registry::new();
+        let log = session_dir.join("hooks.log");
+        let log_text = log.to_str().expect("utf8").to_owned();
+        hooks
+            .register_named("session-start", &format!("sh -c 'cat >> {log_text}'"))
+            .expect("session-start is prefix-safe");
+        let first_result = execute_turn_resuming_with_backend(
+            &config,
+            &secrets,
+            &session_dir,
+            &hooks,
+            None,
+            Arc::clone(&first),
+            "explain",
+        )
+        .await
+        .expect("first turn");
+        let second = Arc::new(MockProvider::new([
+            text_reply("second answer", Duration::ZERO),
+            yes_reply(Duration::ZERO),
+        ]));
+        execute_turn_resuming_with_backend(
+            &config,
+            &secrets,
+            &session_dir,
+            &hooks,
+            Some(first_result.session),
+            Arc::clone(&second),
+            "explain",
+        )
+        .await
+        .expect("second turn");
+        let logged = std::fs::read_to_string(&log).expect("hook log");
+        assert!(logged.contains("SessionStarted"), "the fresh turn fires SessionStarted: {logged:?}");
+        assert!(
+            logged.contains("SessionResumed"),
+            "the resumed turn fires SessionResumed, not Started again: {logged:?}"
+        );
         let _ = std::fs::remove_dir_all(session_dir);
     }
 
