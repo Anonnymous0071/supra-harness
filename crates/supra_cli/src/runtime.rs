@@ -178,9 +178,12 @@ async fn execute_turn_with_backend<B: ProviderBackend>(
     let store = Arc::new(supra_store::Store::open_in_memory()?);
     let board = supra_blackboard::Blackboard::open(store)?;
     let bus = Arc::new(supra_eventbus::Bus::new());
-    let mut turn = supra_core::Turn::start_shared(board, bus, task, agents.clone())?;
+    let mut turn = supra_core::Turn::start_shared(board, Arc::clone(&bus), task, agents.clone())?;
 
-    let proposal = terminal_text(send_with_retry(backend.as_ref(), request(backend.as_ref(), task)).await?)?;
+    let completion = send_with_retry(backend.as_ref(), request(backend.as_ref(), task)).await?;
+    emit_usage(&bus, agents[0], &completion);
+    emit_text_deltas(&bus, &completion);
+    let proposal = terminal_text(completion)?;
     turn.record(supra_core::PeerAnswer::proposal(agents[0], proposal.clone()))?;
 
     let validators: &[supra_types::AgentId] = if cohort_size == 1 { &agents[..1] } else { &agents[1..] };
@@ -190,9 +193,11 @@ async fn execute_turn_with_backend<B: ProviderBackend>(
         let backend = Arc::clone(&backend);
         let request = request(backend.as_ref(), &prompt);
         let agent = *agent;
+        let bus = Arc::clone(&bus);
         tasks.spawn(async move {
             let result = async {
                 let completion = send_with_retry(backend.as_ref(), request).await?;
+                emit_usage(&bus, agent, &completion);
                 let text = terminal_text(completion)?;
                 parse_verdict(&text)
             }
@@ -256,6 +261,44 @@ async fn execute_turn_with_backend<B: ProviderBackend>(
 async fn abort_and_drain<T: 'static>(tasks: &mut tokio::task::JoinSet<T>) {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+}
+
+/// Publish this completion's usage to the bus as reconciled provider events.
+///
+/// The stream is already complete here, so the usage is final and the cost
+/// is exact, not an estimate. Absent usage reads as zero tokens - Google's
+/// implicit caching omits the fields, and absence is an answer, not an error.
+fn emit_usage(bus: &supra_eventbus::Bus, agent: supra_types::AgentId, completion: &Completion) {
+    let (input, output, cached) = match &completion.usage {
+        Some(usage) => (usage.input_tokens, usage.output_tokens, usage.cached_tokens),
+        None => (0, 0, 0),
+    };
+    let input32 = u32::try_from(input).unwrap_or(u32::MAX);
+    let output32 = u32::try_from(output).unwrap_or(u32::MAX);
+    let cached32 = u32::try_from(cached).unwrap_or(u32::MAX);
+    let mills = supra_eval::estimate_mills(input32, cached32, output32);
+    let micros = i64::try_from(mills.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    bus.publish(supra_types::Event::UsageReported {
+        agent,
+        cached_read: cached32,
+        cached_write: 0,
+        uncached: input32.saturating_sub(cached32),
+        output: output32,
+        cost: supra_types::MicroUsd::from_micros(micros),
+    });
+}
+
+/// Publish the completion's visible length as one text delta.
+///
+/// The provider call already returned, so the stream offsets are known
+/// exactly and one event carries the total. A consumer that only counts
+/// characters - the status line's live delta, the viewport's scroll -
+/// learns as much from one total as from a thousand fragments.
+fn emit_text_deltas(bus: &supra_eventbus::Bus, completion: &Completion) {
+    let chars = u32::try_from(completion.text().chars().count()).unwrap_or(u32::MAX);
+    if chars > 0 {
+        bus.publish(supra_types::Event::StreamDelta { chars });
+    }
 }
 
 fn select_provider<'a>(config: &'a Config, requested: Option<&'a str>) -> anyhow::Result<&'a str> {
@@ -734,6 +777,55 @@ mod tests {
         assert_eq!(backend.completed(), 4, "the slow request is cancelled at quorum");
         assert!(!result.turn.is_nil(), "the turn id is recorded");
         let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn usage_and_stream_deltas_reach_the_bus() {
+        use supra_eventbus::TopicSet;
+        let backend = Arc::new(MockProvider::new([
+            text_reply("hello world", Duration::ZERO),
+            yes_reply(Duration::ZERO),
+        ]));
+        let session_dir = scratch("bus-deltas");
+        let hooks = supra_hook::Registry::new();
+        let config = config_with_limit(1);
+        let store = Arc::new(supra_store::Store::open_in_memory().expect("store"));
+        let board = supra_blackboard::Blackboard::open(store).expect("board");
+        let bus = Arc::new(supra_eventbus::Bus::new());
+        let watcher = bus.subscribe(
+            TopicSet::of(supra_types::Topic::Provider).union(TopicSet::of(supra_types::Topic::Turn)),
+        );
+        let agents = vec![supra_types::AgentId::generate()];
+        let mut turn =
+            supra_core::Turn::start_shared(board, Arc::clone(&bus), "explain", agents.clone()).expect("turn");
+        let completion =
+            send_with_retry(backend.as_ref(), request(backend.as_ref(), "explain")).await.expect("send");
+        emit_usage(&bus, agents[0], &completion);
+        emit_text_deltas(&bus, &completion);
+        turn.record(supra_core::PeerAnswer::proposal(agents[0], completion.text())).expect("record");
+        let frame = watcher.drain();
+        assert!(
+            frame
+                .iter()
+                .any(|delivery| matches!(delivery.event.as_ref(), supra_types::Event::UsageReported { .. })),
+            "usage is published"
+        );
+        assert!(
+            frame
+                .iter()
+                .any(|delivery| matches!(delivery.event.as_ref(), supra_types::Event::StreamDelta { .. })),
+            "stream length is published"
+        );
+        assert!(
+            frame.iter().any(|delivery| matches!(
+                delivery.event.as_ref(),
+                supra_types::Event::TurnStarted { .. } | supra_types::Event::VoteCast { .. }
+            )),
+            "turn events share the same bus"
+        );
+        let _ = std::fs::remove_dir_all(session_dir);
+        let _ = config;
+        let _ = hooks;
     }
 
     #[tokio::test(start_paused = true)]
