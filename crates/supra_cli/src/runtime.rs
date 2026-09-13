@@ -60,8 +60,8 @@ pub(crate) struct TurnResult {
 /// Fire one lifecycle hook point and honor a stop request.
 ///
 /// A hook is an observer, not a gate: a command failure is reported
-/// but does not fail the turn. Exit 42 requests [`HookOutcome::Stop`]
-/// and the caller stops what it was doing.
+/// but does not fail the turn. Exit 42 requests a stop and the caller
+/// stops what it was doing.
 fn fire_hooks(
     hooks: &supra_hook::Registry,
     point: supra_hook::HookPoint,

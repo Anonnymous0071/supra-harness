@@ -367,15 +367,26 @@ mod tests {
     use super::*;
     use supra_types::Confidence;
 
+    fn scratch_tag() -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = DefaultHasher::new();
+        std::process::id().hash(&mut hasher);
+        std::thread::current().id().hash(&mut hasher);
+        std::time::SystemTime::now().hash(&mut hasher);
+        let slot = 0u8;
+        std::ptr::from_ref(&slot).hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
     fn board() -> Blackboard {
-        let dir = std::env::temp_dir().join(format!(
-            "supra-bb-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = std::env::temp_dir().join(format!("supra-bb-{}", scratch_tag()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            let dir = std::env::temp_dir().join(format!("supra-bb-{}", scratch_tag()));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let store = Store::open(dir.join("bb.db")).expect("store");
+            return Blackboard::open(Arc::new(store)).expect("board");
+        }
         let store = Store::open(dir.join("bb.db")).expect("store");
         Blackboard::open(Arc::new(store)).expect("board")
     }
@@ -385,14 +396,12 @@ mod tests {
     }
 
     fn store_path() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "supra-bb-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = std::env::temp_dir().join(format!("supra-bb-{}", scratch_tag()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            let dir = std::env::temp_dir().join(format!("supra-bb-{}", scratch_tag()));
+            std::fs::create_dir_all(&dir).expect("dir");
+            return dir.join("bb.db");
+        }
         dir.join("bb.db")
     }
 

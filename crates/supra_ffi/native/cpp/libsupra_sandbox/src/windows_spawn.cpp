@@ -4,6 +4,7 @@
 #ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <aclapi.h>
 #include <appmodel.h>
@@ -321,7 +322,22 @@ void destroyState(ProcessState* state, bool terminate_tree) {
     }
     restoreAcls(state);
     if (state->profile_name[0] != L'\0') {
-        static_cast<void>(::DeleteAppContainerProfile(state->profile_name));
+        // Dynamically resolved: DeleteAppContainerProfile ships in
+        // userenv.dll from Windows 8 on, but the import library the
+        // runner links does not export it under every SDK - a static
+        // call fails the build (C3861) rather than the run. Absence at
+        // runtime leaks the profile name, which the next spawn reuses.
+        using DeleteProfile = HRESULT(WINAPI*)(PCWSTR);
+        HMODULE userenv =
+            ::LoadLibraryExW(L"userenv.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (userenv != nullptr) {
+            auto remove = reinterpret_cast<DeleteProfile>(
+                reinterpret_cast<void*>(::GetProcAddress(userenv, "DeleteAppContainerProfile")));
+            if (remove != nullptr) {
+                static_cast<void>(remove(state->profile_name));
+            }
+            ::FreeLibrary(userenv);
+        }
     }
     ::HeapFree(::GetProcessHeap(), 0, state);
 }

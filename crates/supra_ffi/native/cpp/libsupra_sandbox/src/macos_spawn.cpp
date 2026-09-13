@@ -3,6 +3,14 @@
 
 #if defined(__APPLE__)
 
+// `sandbox_init` has been deprecated since macOS 10.8, but it remains the
+// only enforcement API a plain user-space process may call: the replacement
+// (Seatbelt entitlements) requires an Apple-signed profile the harness
+// cannot ship. The two call sites below are the enforcement boundary, so
+// the deprecation warning is silenced locally rather than globally.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -575,5 +583,7 @@ void supra_sandbox_release(supra_sandbox_process* process) {
 }
 
 }  // extern "C"
+
+#pragma clang diagnostic pop
 
 #endif  // __APPLE__
