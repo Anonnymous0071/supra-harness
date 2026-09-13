@@ -74,7 +74,9 @@ pub enum Command {
     Run {
         #[arg(long, value_name = "NAME", help = "Use the configured provider NAME")]
         provider: Option<String>,
-        #[arg(required = true, trailing_var_arg = true, help = "Task to send to the provider cohort")]
+        #[arg(long, value_name = "ID", help = "Resume a saved session instead of starting one")]
+        resume: Option<String>,
+        #[arg(trailing_var_arg = true, help = "Task to send to the provider cohort")]
         task: Vec<String>,
     },
     #[command(about = "Run the offline evaluation suite")]
@@ -208,7 +210,19 @@ mod tests {
         let mut run = Cli::command().find_subcommand_mut("run").expect("run command").clone();
         let run_help = run.render_long_help().to_string();
         assert!(run_help.contains("configured provider"), "{run_help}");
-        assert!(run_help.contains("Task to send"), "{run_help}");
+        assert!(run_help.contains("Resume a saved session"), "{run_help}");
+
+        let resumed = <Cli as clap::Parser>::try_parse_from([
+            "supra",
+            "run",
+            "--resume",
+            "01J0000000000000000000000",
+            "task",
+        ]);
+        assert!(resumed.is_ok(), "resume accepts a session id: {resumed:?}");
+
+        let bare = <Cli as clap::Parser>::try_parse_from(["supra", "run"]);
+        assert!(bare.is_ok(), "run without a task parses; the turn refuses it, not the parser");
 
         let mut update = Cli::command().find_subcommand_mut("update").expect("update command").clone();
         let update_help = update.render_long_help().to_string();

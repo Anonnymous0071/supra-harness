@@ -27,29 +27,36 @@ fn main() -> anyhow::Result<()> {
         .take()
         .ok_or_else(|| anyhow::anyhow!("a command is required; run `supra run --help` to execute a task"))?;
     match command {
-        Command::Run { provider, task } => run(cli, provider.as_deref(), &task.join(" ")),
+        Command::Run { provider, resume, task } => {
+            run(cli, provider.as_deref(), resume.as_deref(), &task.join(" "))
+        }
         Command::Eval { live } => eval_cmd(live),
         Command::Update { action } => update_cmd(action),
         Command::Config { action } => config_cmd(&cli, action),
     }
 }
 
-fn run(cli: Cli, provider: Option<&str>, task: &str) -> anyhow::Result<()> {
+fn run(cli: Cli, provider: Option<&str>, resume: Option<&str>, task: &str) -> anyhow::Result<()> {
     let config = startup::discover_resolve(&cli)?;
     let log = startup::init_logging(&cli)?;
     let secrets = startup::open_secrets(&cli);
     let sandbox_off = cli.sandbox == SandboxArg::Off;
     let wired = registry::wire(&config);
     let assembled = startup::assemble(config, log, sandbox_off);
+    let resume = resume
+        .map(str::parse::<supra_types::SessionId>)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("--resume is not a session id: {error}"))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("tokio runtime: {error}"))?;
-    let result = runtime.block_on(runtime::execute_turn(
+    let result = runtime.block_on(runtime::execute_turn_resuming(
         &assembled.config,
         &secrets,
         &wired.session_dir,
         &wired.hooks,
+        resume,
         provider,
         task,
     ))?;

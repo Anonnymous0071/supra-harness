@@ -84,17 +84,6 @@ fn fire_hooks(
 /// be sealed. Tool use is rejected because the CLI has no executable tool
 /// dispatch loop yet; returning it as terminal text would certify an
 /// unexecuted action.
-pub(crate) async fn execute_turn(
-    config: &Config,
-    secrets: &supra_secrets::SecretManager,
-    session_dir: &Path,
-    hooks: &supra_hook::Registry,
-    requested_provider: Option<&str>,
-    task: &str,
-) -> anyhow::Result<TurnResult> {
-    execute_turn_resuming(config, secrets, session_dir, hooks, None, requested_provider, task).await
-}
-
 pub(crate) async fn execute_turn_resuming(
     config: &Config,
     secrets: &supra_secrets::SecretManager,
