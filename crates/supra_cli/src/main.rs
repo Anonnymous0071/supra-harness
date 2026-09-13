@@ -13,6 +13,7 @@ mod args;
 mod registry;
 mod render;
 mod runtime;
+mod slash;
 mod startup;
 
 use args::{Cli, Command, ConfigAction, SandboxArg, UpdateAction};
@@ -51,17 +52,124 @@ fn run(cli: Cli, provider: Option<&str>, resume: Option<&str>, task: &str) -> an
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("tokio runtime: {error}"))?;
-    let result = runtime.block_on(runtime::execute_turn_resuming(
-        &assembled.config,
-        &secrets,
-        &wired.session_dir,
-        &wired.hooks,
-        resume,
-        provider,
-        task,
-    ))?;
-    println!("session {}", result.session);
-    println!("{}", result.answer);
+    if !task.trim().is_empty() {
+        let result = runtime.block_on(runtime::execute_turn_resuming(
+            &assembled.config,
+            &secrets,
+            &wired.session_dir,
+            &wired.hooks,
+            resume,
+            provider,
+            task,
+        ))?;
+        println!("session {}", result.session);
+        println!("{}", result.answer);
+        return Ok(());
+    }
+    if resume.is_some() {
+        anyhow::bail!("--resume needs a task: `supra run --resume ID <task>` runs one turn on it");
+    }
+    repl(&assembled, &secrets, &wired, provider, &runtime)
+}
+
+fn repl(
+    assembled: &startup::Startup,
+    secrets: &supra_secrets::SecretManager,
+    wired: &registry::Wired,
+    provider: Option<&str>,
+    runtime: &tokio::runtime::Runtime,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead as _, Write as _};
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mut session: Option<supra_types::SessionId> = None;
+    loop {
+        print!("supra> ");
+        std::io::stdout().flush().map_err(|error| anyhow::anyhow!("stdout: {error}"))?;
+        let Some(line) = lines.next() else { break };
+        let line = line.map_err(|error| anyhow::anyhow!("stdin: {error}"))?;
+        let action = slash::dispatch(&wired.commands, slash::parse_line(&line))
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        match action {
+            slash::Action::Exit => break,
+            slash::Action::Help => {
+                for command in wired.commands.all() {
+                    println!("/{}\t{}", command.name, command.description);
+                }
+            }
+            slash::Action::Clear => {
+                print!("\x1b[2J\x1b[H");
+            }
+            slash::Action::Mode | slash::Action::Permissions => {
+                println!("mode {}", assembled.config.permission_mode().label());
+            }
+            slash::Action::Sandbox => {
+                println!("sandbox {}", if assembled.sandbox_off { "off" } else { "on" });
+            }
+            slash::Action::Telemetry => {
+                println!(
+                    "telemetry {}",
+                    wired.consent.map_or("off", |consent| match consent {
+                        supra_telemetry::Consent::Off => "off",
+                        supra_telemetry::Consent::On => "on",
+                    })
+                );
+            }
+            slash::Action::Model(current) => {
+                println!("model {}", current.as_deref().unwrap_or("(configured)"));
+            }
+            slash::Action::New => {
+                session = None;
+                println!("new session");
+            }
+            slash::Action::Resume(id) => {
+                let id = id
+                    .parse::<supra_types::SessionId>()
+                    .map_err(|error| anyhow::anyhow!("resume needs a session id, got {id:?}: {error}"))?;
+                session = Some(id);
+                println!("resumed {id}");
+            }
+            slash::Action::Branch => {
+                let Some(id) = session else {
+                    anyhow::bail!("branch needs a live session: run a task first");
+                };
+                let Some(saved) = supra_session::Session::resume(&wired.session_dir, id)? else {
+                    anyhow::bail!("no saved session {id}");
+                };
+                let branched = saved.branch();
+                let branched_id = branched.id();
+                branched.save(&wired.session_dir)?;
+                session = Some(branched_id);
+                println!("branched {id} -> {branched_id}");
+            }
+            slash::Action::Export => {
+                let Some(id) = session else {
+                    anyhow::bail!("export needs a live session: run a task first");
+                };
+                let Some(saved) = supra_session::Session::resume(&wired.session_dir, id)? else {
+                    anyhow::bail!("no saved session {id}");
+                };
+                println!("{}", saved.export_markdown());
+            }
+            slash::Action::Task(task) => {
+                if task.trim().is_empty() {
+                    continue;
+                }
+                let result = runtime.block_on(runtime::execute_turn_resuming(
+                    &assembled.config,
+                    secrets,
+                    &wired.session_dir,
+                    &wired.hooks,
+                    session,
+                    provider,
+                    &task,
+                ))?;
+                session = Some(result.session);
+                println!("session {}", result.session);
+                println!("{}", result.answer);
+            }
+        }
+    }
     Ok(())
 }
 
