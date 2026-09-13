@@ -58,6 +58,13 @@ fn branch_and_export_without_a_session_refuse() {
 }
 
 #[test]
+fn blank_lines_are_skipped_never_billed() {
+    let (ok, out, err) = repl_output("\n   \n\t\n/exit\n");
+    assert!(ok, "blank lines must not fail the run: {out} {err}");
+    assert!(!out.contains("session "), "no turn ran: {out}");
+}
+
+#[test]
 fn resume_without_a_task_refuses_before_any_provider_call() {
     let output = std::process::Command::new(supra())
         .args(["run", "--resume", "01J00000000000000000000000"])
