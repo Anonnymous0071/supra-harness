@@ -48,6 +48,7 @@ fn run(cli: Cli, provider: Option<&str>, task: &str) -> anyhow::Result<()> {
         &assembled.config,
         &secrets,
         &wired.session_dir,
+        &wired.hooks,
         provider,
         task,
     ))?;

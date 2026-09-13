@@ -47,11 +47,33 @@ impl ProviderBackend for LiveProvider {
 }
 
 /// The durable result of one executable CLI turn.
+#[derive(Debug)]
 pub(crate) struct TurnResult {
     /// The persisted session that owns the accepted turn.
     pub(crate) session: supra_types::SessionId,
     /// The provider answer accepted by the turn state machine.
     pub(crate) answer: String,
+    /// The completed turn's id, for hook context and telemetry.
+    pub(crate) turn: supra_types::TurnId,
+}
+
+/// Fire one lifecycle hook point and honor a stop request.
+///
+/// A hook is an observer, not a gate: a command failure is reported
+/// but does not fail the turn. Exit 42 requests [`HookOutcome::Stop`]
+/// and the caller stops what it was doing.
+fn fire_hooks(
+    hooks: &supra_hook::Registry,
+    point: supra_hook::HookPoint,
+    event: supra_types::Event,
+    turn_count: u64,
+) -> anyhow::Result<bool> {
+    let context = supra_hook::HookContext { event, turn_count };
+    match hooks.fire(point, &context) {
+        Ok(supra_hook::HookOutcome::Continue) => Ok(false),
+        Ok(supra_hook::HookOutcome::Stop) => Ok(true),
+        Err(error) => Err(anyhow::anyhow!("{error}")),
+    }
 }
 
 /// Execute one provider-backed turn and persist its accepted answer.
@@ -66,6 +88,19 @@ pub(crate) async fn execute_turn(
     config: &Config,
     secrets: &supra_secrets::SecretManager,
     session_dir: &Path,
+    hooks: &supra_hook::Registry,
+    requested_provider: Option<&str>,
+    task: &str,
+) -> anyhow::Result<TurnResult> {
+    execute_turn_resuming(config, secrets, session_dir, hooks, None, requested_provider, task).await
+}
+
+pub(crate) async fn execute_turn_resuming(
+    config: &Config,
+    secrets: &supra_secrets::SecretManager,
+    session_dir: &Path,
+    hooks: &supra_hook::Registry,
+    resume: Option<supra_types::SessionId>,
     requested_provider: Option<&str>,
     task: &str,
 ) -> anyhow::Result<TurnResult> {
@@ -76,12 +111,52 @@ pub(crate) async fn execute_turn(
     let provider = select_provider(config, requested_provider)?;
     let client = supra_llm::Client::from_config(config, provider)?;
     let credential = config.provider_secret(provider, secrets)?;
-    execute_turn_with_backend(config, session_dir, task, Arc::new(LiveProvider { client, credential })).await
+    let backend = Arc::new(LiveProvider { client, credential });
+    execute_turn_resuming_with_backend(config, secrets, session_dir, hooks, resume, backend, task).await
+}
+
+async fn execute_turn_resuming_with_backend<B: ProviderBackend>(
+    config: &Config,
+    _secrets: &supra_secrets::SecretManager,
+    session_dir: &Path,
+    hooks: &supra_hook::Registry,
+    resume: Option<supra_types::SessionId>,
+    backend: Arc<B>,
+    task: &str,
+) -> anyhow::Result<TurnResult> {
+    let (mut session, prior_turns) = match resume {
+        None => (supra_session::Session::new(), 0u64),
+        Some(id) => match supra_session::Session::resume(session_dir, id)? {
+            None => anyhow::bail!("no saved session {id}"),
+            Some(session) => {
+                let turns = session.turns().len() as u64;
+                (session, turns)
+            }
+        },
+    };
+    let _ = fire_hooks(
+        hooks,
+        supra_hook::HookPoint::SessionStart,
+        supra_types::Event::SessionStarted { session: session.id() },
+        prior_turns,
+    )?;
+    let mut result = execute_turn_with_backend(config, hooks, prior_turns, task, backend).await?;
+    result.session = session.id();
+    session.record_turn_with_body(result.turn, &result.answer);
+    session.save(session_dir)?;
+    let _ = fire_hooks(
+        hooks,
+        supra_hook::HookPoint::SessionEnd,
+        supra_types::Event::SessionEnded { session: session.id() },
+        prior_turns.saturating_add(1),
+    )?;
+    Ok(result)
 }
 
 async fn execute_turn_with_backend<B: ProviderBackend>(
     config: &Config,
-    session_dir: &Path,
+    hooks: &supra_hook::Registry,
+    turn_count: u64,
     task: &str,
     backend: Arc<B>,
 ) -> anyhow::Result<TurnResult> {
@@ -90,6 +165,15 @@ async fn execute_turn_with_backend<B: ProviderBackend>(
         .ok_or_else(|| anyhow::anyhow!("cohort limit leaves no admissible turn"))?;
     let agents: Vec<supra_types::AgentId> =
         (0..cohort_size).map(|_| supra_types::AgentId::generate()).collect();
+
+    if fire_hooks(
+        hooks,
+        supra_hook::HookPoint::TurnStart,
+        supra_types::Event::TurnStarted { turn: supra_types::TurnId::generate() },
+        turn_count,
+    )? {
+        anyhow::bail!("a turn-start hook requested a stop");
+    }
 
     let store = Arc::new(supra_store::Store::open_in_memory()?);
     let board = supra_blackboard::Blackboard::open(store)?;
@@ -157,10 +241,16 @@ async fn execute_turn_with_backend<B: ProviderBackend>(
     let turn_id = turn.id();
     let mut ledger = supra_prompt::PromptLedger::new();
     turn.finish(&mut ledger)?;
-    let mut session = supra_session::Session::new();
-    session.record_turn_with_body(turn_id, &proposal);
-    session.save(session_dir)?;
-    Ok(TurnResult { session: session.id(), answer: proposal })
+    let stop = fire_hooks(
+        hooks,
+        supra_hook::HookPoint::TurnEnd,
+        supra_types::Event::TurnCompleted { turn: turn_id },
+        turn_count,
+    )?;
+    if stop {
+        anyhow::bail!("a turn-end hook requested a stop");
+    }
+    Ok(TurnResult { session: supra_types::SessionId::generate(), answer: proposal, turn: turn_id })
 }
 
 async fn abort_and_drain<T: 'static>(tasks: &mut tokio::task::JoinSet<T>) {
@@ -628,9 +718,11 @@ mod tests {
             yes_reply(Duration::from_millis(20)),
         ]));
         let session_dir = scratch("quorum-cancel");
+        let hooks = supra_hook::Registry::new();
         let result = execute_turn_with_backend(
             &config_with_limit(5),
-            &session_dir,
+            &hooks,
+            0,
             "compare src/a.rs tests/a.rs",
             Arc::clone(&backend),
         )
@@ -640,10 +732,123 @@ mod tests {
         assert_eq!(result.answer, "accepted answer");
         assert_eq!(backend.calls(), 5, "all validator requests fan out together");
         assert_eq!(backend.completed(), 4, "the slow request is cancelled at quorum");
-        let resumed = supra_session::Session::resume(&session_dir, result.session)
+        assert!(!result.turn.is_nil(), "the turn id is recorded");
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_turns_accumulate_in_one_session_file() {
+        let config = config_with_limit(1);
+        let first = Arc::new(MockProvider::new([
+            text_reply("first answer", Duration::ZERO),
+            yes_reply(Duration::ZERO),
+        ]));
+        let second = Arc::new(MockProvider::new([
+            text_reply("second answer", Duration::ZERO),
+            yes_reply(Duration::ZERO),
+        ]));
+        let session_dir = scratch("two-turns-one-file");
+        let secrets = supra_secrets::SecretManager::open();
+        let hooks = supra_hook::Registry::new();
+        let first_result = execute_turn_resuming_with_backend(
+            &config,
+            &secrets,
+            &session_dir,
+            &hooks,
+            None,
+            Arc::clone(&first),
+            "explain",
+        )
+        .await
+        .expect("first turn");
+        let second_result = execute_turn_resuming_with_backend(
+            &config,
+            &secrets,
+            &session_dir,
+            &hooks,
+            Some(first_result.session),
+            Arc::clone(&second),
+            "explain",
+        )
+        .await
+        .expect("second turn");
+        assert_eq!(first_result.session, second_result.session, "one file, not one per turn");
+        let resumed = supra_session::Session::resume(&session_dir, first_result.session)
             .expect("resume")
             .expect("saved session");
-        assert_eq!(resumed.bodies(), &["accepted answer"]);
+        assert_eq!(resumed.bodies(), &["first answer", "second answer"]);
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resuming_an_unknown_session_is_a_named_error_not_an_empty_file() {
+        let config = config_with_limit(1);
+        let backend = Arc::new(MockProvider::new([text_reply("unused", Duration::ZERO)]));
+        let session_dir = scratch("resume-unknown");
+        let secrets = supra_secrets::SecretManager::open();
+        let hooks = supra_hook::Registry::new();
+        let missing = supra_types::SessionId::generate();
+        let error = execute_turn_resuming_with_backend(
+            &config,
+            &secrets,
+            &session_dir,
+            &hooks,
+            Some(missing),
+            Arc::clone(&backend),
+            "explain",
+        )
+        .await
+        .expect_err("unknown resume must fail");
+        assert!(error.to_string().contains(&missing.to_string()), "{error}");
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_start_hook_stop_aborts_before_any_provider_call() {
+        let backend = Arc::new(MockProvider::new([text_reply("never sent", Duration::ZERO)]));
+        let session_dir = scratch("hook-stop-start");
+        let mut hooks = supra_hook::Registry::new();
+        hooks.register_named("turn-start", "sh -c 'exit 42'").expect("turn-start is prefix-safe");
+        let error =
+            execute_turn_with_backend(&config_with_limit(1), &hooks, 2, "explain", Arc::clone(&backend))
+                .await
+                .expect_err("a stop must abort the turn");
+        assert!(error.to_string().contains("turn-start hook"), "{error}");
+        assert_eq!(backend.calls(), 0, "no provider call after a stop");
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_end_hook_stop_fails_the_turn_after_persistence() {
+        let backend = Arc::new(MockProvider::new([
+            text_reply("accepted answer", Duration::ZERO),
+            yes_reply(Duration::ZERO),
+        ]));
+        let session_dir = scratch("hook-stop-end");
+        let mut hooks = supra_hook::Registry::new();
+        hooks.register_named("turn-end", "sh -c 'exit 42'").expect("turn-end is prefix-safe");
+        let error =
+            execute_turn_with_backend(&config_with_limit(1), &hooks, 3, "explain", Arc::clone(&backend))
+                .await
+                .expect_err("a stop must fail the turn");
+        assert!(error.to_string().contains("turn-end hook"), "{error}");
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_hook_command_fails_the_turn_loudly() {
+        let backend = Arc::new(MockProvider::new([
+            text_reply("accepted answer", Duration::ZERO),
+            yes_reply(Duration::ZERO),
+        ]));
+        let session_dir = scratch("hook-command-fails");
+        let mut hooks = supra_hook::Registry::new();
+        hooks.register_named("turn-start", "definitely-missing-supra-hook-binary").expect("registers");
+        let error =
+            execute_turn_with_backend(&config_with_limit(1), &hooks, 0, "explain", Arc::clone(&backend))
+                .await
+                .expect_err("a hook failure must not pass silently");
+        assert!(error.to_string().contains("definitely-missing-supra-hook-binary"), "{error}");
         let _ = std::fs::remove_dir_all(session_dir);
     }
 }
