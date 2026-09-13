@@ -181,11 +181,7 @@ async fn execute_turn_with_backend<B: ProviderBackend>(
     let mut turn = supra_core::Turn::start_shared(board, Arc::clone(&bus), task, agents.clone())?;
     let mut frame = supra_tui::FrameState::default();
 
-    let completion = send_with_retry(backend.as_ref(), request(backend.as_ref(), task)).await?;
-    emit_usage(&bus, agents[0], &completion);
-    emit_text_deltas(&bus, &completion);
-    let proposal = terminal_text(completion)?;
-    turn.record(supra_core::PeerAnswer::proposal(agents[0], proposal.clone()))?;
+    let proposal = run_proposal(Arc::clone(&backend), &bus, &mut turn, &agents, task).await?;
 
     let validators: &[supra_types::AgentId] = if cohort_size == 1 { &agents[..1] } else { &agents[1..] };
     let prompt = validation_prompt(task, &proposal);
@@ -239,6 +235,27 @@ async fn execute_turn_with_backend<B: ProviderBackend>(
 async fn abort_and_drain<T: 'static>(tasks: &mut tokio::task::JoinSet<T>) {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+}
+
+/// Run the proposer call: fetch the candidate, publish its usage and length,
+/// and record it as the claim the validators judge.
+///
+/// One function because the proposal path is exercised twice: once by the
+/// turn itself, once by the bus test asserting the same events reach a
+/// subscriber. Two copies would drift; a shared helper cannot.
+async fn run_proposal<B: ProviderBackend>(
+    backend: Arc<B>,
+    bus: &Arc<supra_eventbus::Bus>,
+    turn: &mut supra_core::Turn,
+    agents: &[supra_types::AgentId],
+    task: &str,
+) -> anyhow::Result<String> {
+    let completion = send_with_retry(backend.as_ref(), request(backend.as_ref(), task)).await?;
+    emit_usage(bus, agents[0], &completion);
+    emit_text_deltas(bus, &completion);
+    let proposal = terminal_text(completion)?;
+    turn.record(supra_core::PeerAnswer::proposal(agents[0], proposal.clone()))?;
+    Ok(proposal)
 }
 
 struct ValidationOutcome {
@@ -604,6 +621,14 @@ mod tests {
         ScriptedReply { delay, result: Ok(Completion::end_turn(text, None, Thinking { budget_tokens: 0 })) }
     }
 
+    fn usage_reply(text: &str, delay: Duration) -> ScriptedReply {
+        let usage = supra_llm::Usage { input_tokens: 1000, output_tokens: 50, cached_tokens: 900 };
+        ScriptedReply {
+            delay,
+            result: Ok(Completion::end_turn(text, Some(usage), Thinking { budget_tokens: 0 })),
+        }
+    }
+
     fn yes_reply(delay: Duration) -> ScriptedReply {
         text_reply(r#"{"vote":"yes","confidence":"high","reason":"checked"}"#, delay)
     }
@@ -816,7 +841,7 @@ mod tests {
     async fn usage_and_stream_deltas_reach_the_bus() {
         use supra_eventbus::TopicSet;
         let backend = Arc::new(MockProvider::new([
-            text_reply("hello world", Duration::ZERO),
+            usage_reply("hello world", Duration::ZERO),
             yes_reply(Duration::ZERO),
         ]));
         let session_dir = scratch("bus-deltas");
@@ -831,18 +856,20 @@ mod tests {
         let agents = vec![supra_types::AgentId::generate()];
         let mut turn =
             supra_core::Turn::start_shared(board, Arc::clone(&bus), "explain", agents.clone()).expect("turn");
-        let completion =
-            send_with_retry(backend.as_ref(), request(backend.as_ref(), "explain")).await.expect("send");
-        emit_usage(&bus, agents[0], &completion);
-        emit_text_deltas(&bus, &completion);
-        turn.record(supra_core::PeerAnswer::proposal(agents[0], completion.text())).expect("record");
+        run_proposal(Arc::clone(&backend), &bus, &mut turn, &agents, "explain").await.expect("proposal");
         let frame = watcher.drain();
-        assert!(
-            frame
-                .iter()
-                .any(|delivery| matches!(delivery.event.as_ref(), supra_types::Event::UsageReported { .. })),
-            "usage is published"
-        );
+        let Some(reported) = frame.iter().find_map(|delivery| match delivery.event.as_ref() {
+            supra_types::Event::UsageReported { cached_read, uncached, output, cost, .. } => {
+                Some((*cached_read, *uncached, *output, *cost))
+            }
+            _ => None,
+        }) else {
+            panic!("usage is published");
+        };
+        assert_eq!(reported.0, 900, "cached tokens pass through");
+        assert_eq!(reported.1, 100, "uncached is input minus cached");
+        assert_eq!(reported.2, 50, "output passes through");
+        assert!(reported.3.micros() > 0, "a priced completion costs micros");
         assert!(
             frame
                 .iter()
