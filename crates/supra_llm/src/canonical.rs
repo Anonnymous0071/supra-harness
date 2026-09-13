@@ -5,7 +5,7 @@
 //! Provider documentation names unstable `tool_use` key ordering as a cache breaker: two
 //! requests with the same tool calls in different key orders are different prefixes, so
 //! the second pays a full cache write for bytes that are semantically identical. T6 holds
-//! the canonical *text* ([`CanonicalJson`]) but cannot verify canonicity - doing so would
+//! the canonical *text* ([`supra_types::CanonicalJson`]) but cannot verify canonicity - doing so would
 //! mean parsing JSON there, duplicating this serialiser, and giving I7 two
 //! implementations that can disagree. This module is the single implementation.
 //!
@@ -291,11 +291,27 @@ impl<'a> Scanner<'a> {
                     // the scanner must decode the same key the parser will decode - a
                     // lone surrogate is not a JSON string at all.
                     if (0xD800..0xDC00).contains(&code) {
-                        if self.text[self.position + 1..].starts_with("\\u") {
-                            let low_hex = &self.text[self.position + 3..self.position + 7];
-                            let low = u32::from_str_radix(low_hex, 16).unwrap_or(0);
+                        let Some(tail) = self.text.get(self.position + 1..) else {
+                            return Err(CanonicalError::Invalid { detail: "lone high surrogate".to_owned() });
+                        };
+                        if tail.starts_with("\\u") {
+                            let low_hex =
+                                self.text.get(self.position + 3..self.position + 7).ok_or_else(|| {
+                                    CanonicalError::Invalid {
+                                        detail: "truncated low surrogate escape".to_owned(),
+                                    }
+                                })?;
+                            let low =
+                                u32::from_str_radix(low_hex, 16).map_err(|_| CanonicalError::Invalid {
+                                    detail: "malformed low surrogate escape".to_owned(),
+                                })?;
+                            if !(0xDC00..0xE000).contains(&low) {
+                                return Err(CanonicalError::Invalid {
+                                    detail: "high surrogate not followed by low surrogate".to_owned(),
+                                });
+                            }
                             self.position += 6;
-                            let combined = 0x1_0000 + ((code - 0xD800) << 10) + (low.saturating_sub(0xDC00));
+                            let combined = 0x1_0000 + ((code - 0xD800) << 10) + (low - 0xDC00);
                             text.push(char::from_u32(combined).unwrap_or('\u{FFFD}'));
                             self.position += 1;
                             continue;
@@ -507,6 +523,25 @@ mod tests {
     fn lone_surrogate_escapes_are_invalid() {
         assert!(matches!(canonicalize("{\"\\uD834\":1}"), Err(CanonicalError::Invalid { .. })));
         assert!(matches!(canonicalize("{\"\\uDD1E\":1}"), Err(CanonicalError::Invalid { .. })));
+    }
+
+    #[test]
+    fn truncated_or_malformed_low_surrogates_are_errors_not_panics() {
+        for input in [
+            "{\"\\uD834\\u",
+            "{\"\\uD834\\u\"}",
+            "{\"\\uD834\\uD\"}",
+            "{\"\\uD834\\uDD\"}",
+            "{\"\\uD834\\uDD1\"}",
+            "{\"\\uD834\\uZZZZ\":1}",
+            "{\"\\uD834\\uD834\":1}",
+            "{\"\\uD834\\uE000\":1}",
+        ] {
+            assert!(
+                matches!(canonicalize(input), Err(CanonicalError::Invalid { .. })),
+                "malformed surrogate input must be refused: {input:?}"
+            );
+        }
     }
 
     #[test]

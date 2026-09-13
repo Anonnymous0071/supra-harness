@@ -9,7 +9,7 @@ re-allowed only here, so a soundness bug has exactly one crate to hide in.
 |---|---|---|
 | `libsupra_width` | T2 | cell width, grapheme segmentation, Unicode 17 tables |
 | `libsupra_ansi` | T3 | escape parsing, SGR state, style-safe truncation |
-| `libsupra_sandbox` | T4 | namespaces plus Landlock process isolation |
+| `libsupra_sandbox` | T4 | native process isolation: Linux namespaces/Landlock, macOS `sandbox_init`/SBPL, and Windows AppContainer with explicit handle inheritance and a job object |
 
 Nothing above this crate needs `unsafe`. Every `extern` block lives in one
 private `sys` module, every block carries a SAFETY comment, and
@@ -61,9 +61,10 @@ a static linker resolves left to right). Two overrides:
 
 - `SUPRA_CPP_BUILD_DIR` - reuse an existing configured tree (such as the one
   `just build-cpp` maintains) and skip the second build;
-- `SUPRA_CXX` - override the compiler, which defaults to `clang++` to match
-  `just build-cpp`, so Cargo links archives built by the same frontend the C++
-  suites were verified with.
+- `SUPRA_CXX` - override the compiler. Native builds default to `clang++` to
+  match `just build-cpp`; cross builds select the target C++ compiler
+  (`x86_64-linux-musl-g++` or `aarch64-linux-gnu-g++`) and link the matching
+  runtime.
 
 ## Mutation results
 

@@ -26,10 +26,15 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
+use wasmtime::component::types::{ComponentItem, Type};
 use wasmtime::component::{Component, Instance, Linker};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
+use crate::dispatch::{
+    DenyAllDispatcher, HostCall, HostDispatcher, HostFunction, HostLimits, PluginIdentity,
+};
 use crate::error::PluginError;
 use crate::world::imports_for;
 
@@ -44,21 +49,86 @@ pub const DEFAULT_FUEL: u64 = 10_000_000;
 pub struct Host {
     engine: Engine,
     linkers: BTreeMap<supra_types::ToolClass, Linker<HostState>>,
+    dispatcher: Arc<dyn HostDispatcher>,
+    limits: HostLimits,
 }
 
-/// What the host functions can see. Deliberately minimal today: the call
-/// log is what tests assert on, and T23 supplies the real dispatch (file
-/// reads through the workspace, spawns through the sandbox) later. The
-/// shape - one state per component instance, host functions closing over
-/// it - is what that dispatch plugs into.
-#[derive(Debug, Default)]
+/// Per-component state shared with host-import callbacks.
 pub struct HostState {
-    /// Every host-function call this instance made, in order.
-    pub calls: Vec<(String, String)>,
+    dispatcher: Arc<dyn HostDispatcher>,
+    identity: PluginIdentity,
+    calls: Vec<HostCall>,
+    limits: HostLimits,
+    store_limits: StoreLimits,
 }
+
+impl std::fmt::Debug for HostState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostState")
+            .field("identity", &self.identity)
+            .field("calls", &self.calls)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostState {
+    fn new(dispatcher: Arc<dyn HostDispatcher>, identity: PluginIdentity, limits: HostLimits) -> Self {
+        let store_limits = StoreLimitsBuilder::new()
+            .memory_size(limits.max_memory_bytes)
+            .table_elements(limits.max_table_elements)
+            .instances(limits.max_instances)
+            .tables(limits.max_tables)
+            .memories(limits.max_memories)
+            .build();
+        Self { dispatcher, identity, calls: Vec::new(), limits, store_limits }
+    }
+
+    fn dispatch(&mut self, function: HostFunction, argument: &str) -> wasmtime::Result<(String,)> {
+        let path = function.path();
+        if self.calls.len() >= self.limits.max_calls {
+            return Err(wasmtime::Error::new(HostDispatchFailure(format!(
+                "host dispatch {path} refused: call limit {} exhausted",
+                self.limits.max_calls
+            ))));
+        }
+        if argument.len() > self.limits.max_argument_bytes {
+            return Err(wasmtime::Error::new(HostDispatchFailure(format!(
+                "host dispatch {path} refused: argument is {} bytes, limit is {}",
+                argument.len(),
+                self.limits.max_argument_bytes
+            ))));
+        }
+
+        self.calls.push(HostCall { caller: self.identity.clone(), function, argument: argument.to_owned() });
+        let result = self.dispatcher.dispatch(&self.identity, function, argument).map_err(|error| {
+            wasmtime::Error::new(HostDispatchFailure(format!("host dispatch {path} failed: {error}")))
+        })?;
+        if result.len() > self.limits.max_result_bytes {
+            return Err(wasmtime::Error::new(HostDispatchFailure(format!(
+                "host dispatch {path} refused: result is {} bytes, limit is {}",
+                result.len(),
+                self.limits.max_result_bytes
+            ))));
+        }
+        Ok((result,))
+    }
+}
+
+#[derive(Debug)]
+struct HostDispatchFailure(String);
+
+impl std::fmt::Display for HostDispatchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostDispatchFailure {}
 
 impl Host {
-    /// Build the engine and the three class linkers.
+    /// Build the engine, class linkers, and default fail-closed dispatcher.
     ///
     /// # Errors
     ///
@@ -67,6 +137,28 @@ impl Host {
     /// under a known-good name is infallible by construction, and the
     /// test below pins that no registration was skipped.
     pub fn new() -> Result<Self, PluginError> {
+        Self::with_dispatcher(Arc::new(DenyAllDispatcher))
+    }
+
+    /// Build the host with runtime-supplied behavior and default bounds.
+    ///
+    /// # Errors
+    ///
+    /// [`PluginError::Engine`] when wasmtime refuses the configuration.
+    pub fn with_dispatcher(dispatcher: Arc<dyn HostDispatcher>) -> Result<Self, PluginError> {
+        Self::with_dispatcher_and_limits(dispatcher, HostLimits::default())
+    }
+
+    /// Build the host with runtime-supplied behavior and explicit bounds.
+    ///
+    /// # Errors
+    ///
+    /// [`PluginError::Engine`] when wasmtime refuses the configuration, or
+    /// [`PluginError::MissingHostImport`] if the WIT routes disagree.
+    pub fn with_dispatcher_and_limits(
+        dispatcher: Arc<dyn HostDispatcher>,
+        limits: HostLimits,
+    ) -> Result<Self, PluginError> {
         let mut config = Config::new();
         config.consume_fuel(true);
         let engine = Engine::new(&config)?;
@@ -76,39 +168,53 @@ impl Host {
             [supra_types::ToolClass::Agent, supra_types::ToolClass::Host, supra_types::ToolClass::User]
         {
             let mut linker = Linker::new(&engine);
-            for (interface, function) in imports_for(class) {
-                let path = format!("{interface}#{function}");
-                let stub = {
-                    let path = path.clone();
-                    move |mut store: wasmtime::StoreContextMut<'_, HostState>, (argument,): (String,)| {
-                        let state = store.data_mut();
-                        state.calls.push((path.clone(), argument.clone()));
-                        // The stub answer: the dispatch (T23) answers
-                        // for real; the host's contract today is that
-                        // the call happened, was logged, and returned
-                        // a string the guest can continue from.
-                        Ok((format!("host:{path}"),))
+            let allowed = imports_for(class);
+            for interface in
+                allowed.iter().map(|(interface, _)| *interface).collect::<std::collections::BTreeSet<_>>()
+            {
+                for instance_name in [interface.to_string(), format!("{interface}@0.1.0")] {
+                    let mut instance =
+                        linker.instance(&instance_name).map_err(|error| PluginError::MissingHostImport {
+                            import: format!("registering {instance_name}: {error}"),
+                        })?;
+                    for (_, function) in allowed.iter().filter(|(candidate, _)| *candidate == interface) {
+                        let path = format!("{interface}#{function}");
+                        let Some(host_function) = HostFunction::from_wit(interface, function) else {
+                            return Err(PluginError::MissingHostImport {
+                                import: format!("no dispatcher route for {path}"),
+                            });
+                        };
+                        let route = move |mut store: wasmtime::StoreContextMut<'_, HostState>,
+                                          (argument,): (String,)| {
+                            store.data_mut().dispatch(host_function, &argument)
+                        };
+                        instance.func_wrap(function, route).map_err(|error| {
+                            PluginError::MissingHostImport {
+                                import: format!("registering {instance_name}#{function}: {error}"),
+                            }
+                        })?;
                     }
+                }
+            }
+            for (interface, function) in allowed {
+                let path = format!("{interface}#{function}");
+                let Some(host_function) = HostFunction::from_wit(interface, function) else {
+                    return Err(PluginError::MissingHostImport {
+                        import: format!("no dispatcher route for {path}"),
+                    });
                 };
-                linker.root().func_wrap(&path, stub.clone()).map_err(|error| {
-                    PluginError::MissingHostImport { import: format!("registering {path}: {error}") }
-                })?;
-                // Register under the plain function name as well: WIT
-                // worlds name imports both ways (`interface#func` in the
-                // text format, `(instance, func)` after resolution), and a
-                // component may declare either. One registration, both
-                // spellings - the alternative is a component that links on
-                // one toolchain and refuses on another. The stub is
-                // Clone (a move closure over an owned String clones
-                // cheaply), so both registrations share one answer.
-                linker.root().func_wrap(function, stub).map_err(|error| PluginError::MissingHostImport {
+                let route = move |mut store: wasmtime::StoreContextMut<'_, HostState>,
+                                  (argument,): (String,)| {
+                    store.data_mut().dispatch(host_function, &argument)
+                };
+                linker.root().func_wrap(function, route).map_err(|error| PluginError::MissingHostImport {
                     import: format!("registering {function}: {error}"),
                 })?;
             }
             linkers.insert(class, linker);
         }
 
-        Ok(Self { engine, linkers })
+        Ok(Self { engine, linkers, dispatcher, limits })
     }
 
     /// The engine, for compiling components the host will run.
@@ -182,21 +288,56 @@ impl Host {
                 import: format!("no linker registered for {class:?}"),
             });
         };
-        let mut store = Store::new(&self.engine, HostState::default());
+
+        validate_run_export(component)?;
+        let pre = linker
+            .instantiate_pre(component)
+            .map_err(|error| classify_engine_error(name, DEFAULT_FUEL, error))?;
+        let identity = PluginIdentity { component: name.to_owned(), class };
+        let mut store =
+            Store::new(&self.engine, HostState::new(Arc::clone(&self.dispatcher), identity, self.limits));
+        store.limiter(|state| &mut state.store_limits);
         store.set_fuel(DEFAULT_FUEL)?;
 
-        let instance = linker.instantiate(&mut store, component)?;
-
-        // The export check: `run` must exist with the world's shape.
-        // `get_typed_func` type-checks rather than trusting, so a guest
-        // that exports `run() -> string` (zero params) or `run(string) ->
-        // u32` is refused here with both sides named.
-        let typed = instance.get_typed_func::<(String,), (String,)>(&mut store, "run");
-        if let Err(error) = typed {
-            return Err(PluginError::WrongSignature { import: "run".to_owned(), detail: error.to_string() });
-        }
+        let instance =
+            pre.instantiate(&mut store).map_err(|error| classify_engine_error(name, DEFAULT_FUEL, error))?;
 
         Ok(Plugin { name: name.to_owned(), instance, store, fuel: DEFAULT_FUEL })
+    }
+}
+
+fn validate_run_export(component: &Component) -> Result<(), PluginError> {
+    let Some((item, _)) = component.get_export(None, "run") else {
+        return Err(PluginError::WrongSignature {
+            import: "run".to_owned(),
+            detail: "required export is missing".to_owned(),
+        });
+    };
+    let ComponentItem::ComponentFunc(function) = item else {
+        return Err(PluginError::WrongSignature {
+            import: "run".to_owned(),
+            detail: "required export is not a component function".to_owned(),
+        });
+    };
+    let params = function.params().map(|(_, ty)| ty).collect::<Vec<_>>();
+    let results = function.results().collect::<Vec<_>>();
+    if params == [Type::String] && results == [Type::String] {
+        Ok(())
+    } else {
+        Err(PluginError::WrongSignature {
+            import: "run".to_owned(),
+            detail: format!("expected (string) -> string, found ({params:?}) -> {results:?}"),
+        })
+    }
+}
+
+fn classify_engine_error(component: &str, budget: u64, error: wasmtime::Error) -> PluginError {
+    if error.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
+        PluginError::FuelExhausted { component: component.to_owned(), budget }
+    } else if let Some(failure) = error.downcast_ref::<HostDispatchFailure>() {
+        PluginError::HostDispatch { component: component.to_owned(), detail: failure.0.clone() }
+    } else {
+        PluginError::Engine(error)
     }
 }
 
@@ -241,26 +382,24 @@ impl Plugin {
             |error| PluginError::WrongSignature { import: "run".to_owned(), detail: error.to_string() },
         )?;
         match typed.call(&mut self.store, (arguments.to_owned(),)) {
-            Ok((answer,)) => Ok(answer),
-            Err(error) => {
-                let message = format!("{error:#}");
-                // wasmtime's fuel trap renders with `fuel` / `out of fuel`
-                // in its chain; other traps render as backtraces without
-                // that word. Grepping the formatted chain is cheaper than
-                // downcasting through wasmtime's error type.
-                if message.contains("fuel") || message.contains("out of fuel") {
-                    Err(PluginError::FuelExhausted { component: self.name.clone(), budget: self.fuel })
+            Ok((answer,)) => {
+                let limit = self.store.data().limits.max_plugin_result_bytes;
+                if answer.len() > limit {
+                    Err(PluginError::ResourceLimit {
+                        component: self.name.clone(),
+                        detail: format!("run result is {} bytes, limit is {limit}", answer.len()),
+                    })
                 } else {
-                    Err(PluginError::Trap { component: self.name.clone(), detail: message })
+                    Ok(answer)
                 }
             }
+            Err(error) => Err(classify_call_error(&self.name, self.fuel, &error)),
         }
     }
 
-    /// The host-function calls this instance made, in order - what tests
-    /// and the turn loop's audit read.
+    /// The bounded host-function calls this instance attempted, in order.
     #[must_use]
-    pub fn calls(&self) -> &[(String, String)] {
+    pub fn calls(&self) -> &[HostCall] {
         &self.store.data().calls
     }
 
@@ -283,6 +422,16 @@ impl Plugin {
         let bytes =
             std::fs::read(path.as_ref()).map_err(|error| PluginError::Engine(wasmtime::Error::msg(error)))?;
         Self::load_bytes(host, &bytes)
+    }
+}
+
+fn classify_call_error(component: &str, budget: u64, error: &wasmtime::Error) -> PluginError {
+    if error.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
+        PluginError::FuelExhausted { component: component.to_owned(), budget }
+    } else if let Some(failure) = error.downcast_ref::<HostDispatchFailure>() {
+        PluginError::HostDispatch { component: component.to_owned(), detail: failure.0.clone() }
+    } else {
+        PluginError::Trap { component: component.to_owned(), detail: format!("{error:#}") }
     }
 }
 
@@ -311,8 +460,9 @@ fn import_in_set(import: &str, allowed: &[(&str, &str)]) -> bool {
             return true;
         }
     }
-    // The bare interface spelling: the class owns the whole namespace.
-    if allowed.iter().any(|(interface, _)| import == *interface) {
+    // The interface spelling: the class owns the whole namespace. Compiled
+    // WIT imports qualify it with the ABI version registered by `Host::new`.
+    if allowed.iter().any(|(interface, _)| import == *interface || import == format!("{interface}@0.1.0")) {
         return true;
     }
     // The bare function spelling: the name without its namespace, after
@@ -326,6 +476,86 @@ fn import_in_set(import: &str, allowed: &[(&str, &str)]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::DispatchError;
+
+    struct TestDispatcher {
+        result: Result<String, DispatchError>,
+    }
+
+    impl HostDispatcher for TestDispatcher {
+        fn dispatch(
+            &self,
+            _caller: &PluginIdentity,
+            _function: HostFunction,
+            _argument: &str,
+        ) -> Result<String, DispatchError> {
+            self.result.clone()
+        }
+    }
+
+    struct EchoDispatcher;
+
+    impl HostDispatcher for EchoDispatcher {
+        fn dispatch(
+            &self,
+            _caller: &PluginIdentity,
+            _function: HostFunction,
+            argument: &str,
+        ) -> Result<String, DispatchError> {
+            Ok(argument.to_owned())
+        }
+    }
+
+    fn dispatch_host(result: Result<String, DispatchError>, limits: HostLimits) -> Host {
+        Host::with_dispatcher_and_limits(Arc::new(TestDispatcher { result }), limits).expect("host")
+    }
+
+    /// A component whose `run` forwards its string to one imported host
+    /// function and returns the host's string unchanged.
+    fn calling_component(interface: &str, function: &str) -> String {
+        format!(
+            r#"(component
+                (type $host-interface
+                    (instance
+                        (type $host-type (func (param "argument" string) (result string)))
+                        (export "{function}" (func (type $host-type)))))
+                (import "{interface}" (instance $host-interface-instance (type $host-interface)))
+                (alias export $host-interface-instance "{function}" (func $host))
+                (core module $memory
+                    (memory (export "memory") 1)
+                    (global $heap (mut i32) (i32.const 16))
+                    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                        (local $pointer i32)
+                        global.get $heap
+                        local.tee $pointer
+                        local.get 3
+                        i32.add
+                        global.set $heap
+                        local.get $pointer))
+                (core instance $memory-instance (instantiate $memory))
+                (alias core export $memory-instance "memory" (core memory $memory-export))
+                (alias core export $memory-instance "realloc" (core func $realloc))
+                (core func $host-lowered
+                    (canon lower (func $host) (memory $memory-export) (realloc $realloc) string-encoding=utf8))
+                (core module $guest
+                    (type $host-type (func (param i32 i32 i32)))
+                    (import "env" "memory" (memory 1))
+                    (import "env" "host" (func $host (type $host-type)))
+                    (func (export "run") (param i32 i32) (result i32)
+                        local.get 0
+                        local.get 1
+                        i32.const 0
+                        call $host
+                        i32.const 0))
+                (core instance $env
+                    (export "memory" (memory $memory-export))
+                    (export "host" (func $host-lowered)))
+                (core instance $guest-instance (instantiate $guest (with "env" (instance $env))))
+                (alias core export $guest-instance "run" (core func $run))
+                (func (export "run") (param "arguments" string) (result string)
+                    (canon lift (core func $run) (memory $memory-export) (realloc $realloc) string-encoding=utf8)))"#
+        )
+    }
 
     /// Compile a component from text. The text format is wasmtime's own
     /// `(component ...)` syntax - no WAT toolchain, no fixture binary, no
@@ -368,6 +598,31 @@ mod tests {
 
     fn host() -> Host {
         Host::new().expect("host")
+    }
+
+    #[test]
+    #[ignore = "requires SUPRA_COMPONENT_ARTIFACT from scripts/build-wasm.sh"]
+    fn component_contract_accepts() {
+        const SENTINEL: &str = "supra-component-contract-smoke";
+
+        let path = std::env::var_os("SUPRA_COMPONENT_ARTIFACT")
+            .map(std::path::PathBuf::from)
+            .expect("SUPRA_COMPONENT_ARTIFACT names the built component");
+        let name = path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("component");
+        let host = Host::with_dispatcher(Arc::new(EchoDispatcher)).expect("host");
+        let component = Plugin::load_file(&host, &path).expect("component artifact loads");
+        let mut plugin = host
+            .instantiate(name, &component, supra_types::ToolClass::Agent)
+            .expect("component links and exports run(string) -> string");
+        let answer = plugin.call(SENTINEL).expect("component run export executes");
+        assert_eq!(answer, SENTINEL, "contract-smoke must echo the sentinel unchanged");
+    }
+
+    #[test]
+    fn an_unknown_interface_version_is_not_in_a_class_set() {
+        let allowed = imports_for(supra_types::ToolClass::Agent);
+        assert!(import_in_set("supra:plugin/agent-tools@0.1.0", allowed));
+        assert!(!import_in_set("supra:plugin/agent-tools@999.0.0", allowed));
     }
 
     #[test]
@@ -501,42 +756,115 @@ mod tests {
     }
 
     #[test]
-    fn a_guest_calling_a_host_import_is_logged() {
-        // The guest imports read-file, calls it, and the host logs the
-        // call. This is the import set working end to end: the guest had
-        // a name to call through, the host answered, and the audit trail
-        // recorded it.
-        let host = host();
-        let component = Component::new(
-            host.engine(),
-            r#"(component
-                (import "read-file" (func (param "path" string) (result string)))
-                (core module $m
-                    (memory (export "memory") 1)
-                    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
-                        local.get 0)
-                    (func (export "do-read") (param i32 i32) (result i32)
-                        local.get 0)
-                )
-                (core instance $i (instantiate $m))
-                (alias core export $i "memory" (core memory $memory))
-                (alias core export $i "realloc" (core func $realloc))
-                (func (export "run") (param "arguments" string) (result string)
-                    (canon lift (core func $i "do-read") (memory $memory) (realloc $realloc) string-encoding=utf8))
-            )"#,
-        )
-        .expect("component");
-
-        host.verify("reader", &component, supra_types::ToolClass::Agent)
-            .expect("read-file is in the agent set");
+    fn dispatch_result_and_attempt_are_returned_and_logged() {
+        let host = dispatch_host(Ok("file contents".to_owned()), HostLimits::default());
+        let component =
+            Component::new(host.engine(), calling_component("supra:plugin/agent-tools", "read-file"))
+                .expect("component");
         let mut plugin =
             host.instantiate("reader", &component, supra_types::ToolClass::Agent).expect("instantiate");
-        let _ = plugin.call("x").expect("call");
-        // The guest never called back in this fixture (its do-read
-        // ignores the import); the host log stays empty, and the
-        // assertion is that the call *succeeded* - the import was
-        // linked, the guest ran, the fuel was spent.
-        assert!(plugin.calls().is_empty(), "no host calls in this fixture: {:?}", plugin.calls());
+
+        assert_eq!(plugin.call("notes.txt").expect("call"), "file contents");
+        assert_eq!(
+            plugin.calls(),
+            &[HostCall {
+                caller: PluginIdentity {
+                    component: "reader".to_owned(),
+                    class: supra_types::ToolClass::Agent,
+                },
+                function: HostFunction::ReadFile,
+                argument: "notes.txt".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn dispatch_errors_surface_as_plugin_errors_without_losing_the_audit() {
+        let host = dispatch_host(Err(DispatchError::new("workspace refused path")), HostLimits::default());
+        let component =
+            Component::new(host.engine(), calling_component("supra:plugin/agent-tools", "read-file"))
+                .expect("component");
+        let mut plugin =
+            host.instantiate("reader", &component, supra_types::ToolClass::Agent).expect("instantiate");
+
+        match plugin.call("../secret") {
+            Err(PluginError::HostDispatch { component, detail }) => {
+                assert_eq!(component, "reader");
+                assert!(detail.contains("read-file"), "{detail}");
+                assert!(detail.contains("workspace refused path"), "{detail}");
+            }
+            other => panic!("dispatch refusal must stay distinct from a guest trap: {other:?}"),
+        }
+        assert_eq!(plugin.calls().len(), 1, "the failed attempt remains auditable");
+    }
+
+    #[test]
+    fn default_dispatch_is_fail_closed() {
+        let host = host();
+        let component =
+            Component::new(host.engine(), calling_component("supra:plugin/agent-tools", "read-file"))
+                .expect("component");
+        let mut plugin =
+            host.instantiate("reader", &component, supra_types::ToolClass::Agent).expect("instantiate");
+
+        match plugin.call("notes.txt") {
+            Err(PluginError::HostDispatch { detail, .. }) => {
+                assert!(detail.contains("no runtime dispatcher configured"), "{detail}");
+            }
+            other => panic!("the default host must not fake success: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn class_isolation_still_refuses_present_dispatch_routes() {
+        let host = dispatch_host(Ok("spawned".to_owned()), HostLimits::default());
+        let component = Component::new(host.engine(), calling_component("supra:plugin/host-tools", "spawn"))
+            .expect("component");
+
+        assert!(
+            matches!(
+                host.instantiate("agent", &component, supra_types::ToolClass::Agent),
+                Err(PluginError::UnlistedImport { .. })
+            ),
+            "an injected dispatcher must not widen the Agent linker"
+        );
+        let mut plugin =
+            host.instantiate("host", &component, supra_types::ToolClass::Host).expect("Host may spawn");
+        assert_eq!(plugin.call("tool --flag").expect("call"), "spawned");
+        assert_eq!(plugin.calls()[0].function, HostFunction::Spawn);
+    }
+
+    #[test]
+    fn argument_result_and_call_bounds_trap_without_unbounded_logs() {
+        let argument_limits = HostLimits { max_argument_bytes: 3, ..HostLimits::default() };
+        let host = dispatch_host(Ok("ok".to_owned()), argument_limits);
+        let component =
+            Component::new(host.engine(), calling_component("supra:plugin/agent-tools", "search"))
+                .expect("component");
+        let mut plugin =
+            host.instantiate("searcher", &component, supra_types::ToolClass::Agent).expect("instantiate");
+        assert!(matches!(plugin.call("four"), Err(PluginError::HostDispatch { .. })));
+        assert!(plugin.calls().is_empty(), "oversized arguments are not retained");
+
+        let result_limits = HostLimits { max_result_bytes: 2, ..HostLimits::default() };
+        let host = dispatch_host(Ok("long".to_owned()), result_limits);
+        let component =
+            Component::new(host.engine(), calling_component("supra:plugin/agent-tools", "search"))
+                .expect("component");
+        let mut plugin =
+            host.instantiate("searcher", &component, supra_types::ToolClass::Agent).expect("instantiate");
+        assert!(matches!(plugin.call("q"), Err(PluginError::HostDispatch { .. })));
+        assert_eq!(plugin.calls().len(), 1, "the bounded attempt remains auditable");
+
+        let call_limits = HostLimits { max_calls: 0, ..HostLimits::default() };
+        let host = dispatch_host(Ok("ok".to_owned()), call_limits);
+        let component =
+            Component::new(host.engine(), calling_component("supra:plugin/agent-tools", "search"))
+                .expect("component");
+        let mut plugin =
+            host.instantiate("searcher", &component, supra_types::ToolClass::Agent).expect("instantiate");
+        assert!(matches!(plugin.call("q"), Err(PluginError::HostDispatch { .. })));
+        assert!(plugin.calls().is_empty(), "the call cap is also the log cap");
     }
 
     #[test]

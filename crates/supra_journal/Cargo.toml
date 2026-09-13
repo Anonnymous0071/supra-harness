@@ -23,6 +23,10 @@ supra_types = { workspace = true }
 # dependency of every second owner of tables in the store.
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
+# Unix snapshot safety uses openat/fstatat-style no-follow descriptor checks;
+# libc exposes the kernel flags and identity fields without another runtime.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [lints]
 workspace = true

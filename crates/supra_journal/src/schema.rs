@@ -36,10 +36,9 @@ pub const MIGRATIONS: &[ComponentMigration] = &[ComponentMigration {
             -- readable in an incident shell.
             snapshot_id TEXT    PRIMARY KEY NOT NULL
                         CHECK (length(snapshot_id) = 26),
-            -- The file the snapshot belongs to, verbatim as the caller named
-            -- it. Two snapshots of one file are two rows; undo picks one by
-            -- id, never by \"the latest for the path\", because which snapshot
-            -- to undo is a decision, not a position.
+            -- Absolute, symlink-resolved UTF-8 path. Snapshot refuses paths
+            -- that cannot be represented losslessly, rather than storing a
+            -- lossy spelling that undo might resolve to another file.
             path        TEXT    NOT NULL
                         CHECK (length(path) > 0),
             -- The file's bytes before the edit. BLOB, not TEXT: TEXT invites

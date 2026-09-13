@@ -11,7 +11,7 @@
 //!   filesystem policy that does not also audit descriptors is a policy
 //!   that the child can defeat by reading the host's pipes.
 //!
-//! - **The host-side spawn** ([`spawn`]) composes the audit, the guard
+//! - **The host-side spawn** ([`spawn()`]) composes the audit, the guard
 //!   (T12.5), and the FFI in that order. A refusal at any step returns
 //!   without touching the next; a future contributor who reorders the
 //!   steps is removing a layer the design says must hold.

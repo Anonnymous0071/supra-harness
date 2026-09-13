@@ -35,6 +35,11 @@
 //!
 //! # What undo does not promise
 //!
+//! Undo restores file content only. The schema does not store permissions,
+//! ownership, timestamps, ACLs, extended attributes, or hard-link identity;
+//! the replacement is a new private regular file (`0600` on Unix). Callers
+//! that need metadata recovery must provide it separately.
+//!
 //! Undo restores **this snapshot's** bytes, not "the file as it was before
 //! whatever you did last". A file may have been edited several times since
 //! the snapshot; undoing an old snapshot discards those edits, deliberately
@@ -43,8 +48,9 @@
 //! undo of the same row would revert whatever legitimate edit landed after
 //! the first one restored the older bytes.
 
-use std::io::Write as _;
-use std::path::Path;
+use std::fs::File;
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
 
 use rusqlite::TransactionBehavior;
 use supra_store::Store;
@@ -130,12 +136,10 @@ impl Journal {
     /// [`JournalError::Io`] when the file cannot be read or resolved.
     /// [`JournalError::Store`] when the snapshot row cannot be committed.
     pub fn snapshot(&self, path: impl AsRef<Path>) -> Result<SnapshotId, JournalError> {
-        let path = path.as_ref();
-        let bytes = std::fs::read(path)?;
-        let canonical = std::fs::canonicalize(path)?;
+        let SnapshotSource { bytes, resolved_path } = SnapshotSource::read(path.as_ref())?;
         let digest = snapshot_digest(&bytes);
         let id = SnapshotId::generate();
-        let path_text = canonical.to_string_lossy().into_owned();
+        let path_text = path_text(&resolved_path)?;
 
         self.store.with_transaction::<_, JournalError>(TransactionBehavior::Immediate, |transaction| {
             schema::insert(transaction, id, &path_text, &bytes, &digest)?;
@@ -173,6 +177,10 @@ impl Journal {
     /// [`JournalError::Io`] when the file cannot be written or flushed.
     /// [`JournalError::Store`] when the store refuses.
     pub fn undo(&self, snapshot: SnapshotId) -> Result<(), JournalError> {
+        self.undo_with_fault(snapshot, UndoFault::None)
+    }
+
+    fn undo_with_fault(&self, snapshot: SnapshotId, fault: UndoFault) -> Result<(), JournalError> {
         self.store.with_transaction::<_, JournalError>(TransactionBehavior::Immediate, |transaction| {
             let (bytes, stored_digest, undone, path) =
                 schema::read_row(transaction, snapshot)?.ok_or(JournalError::NotFound { snapshot })?;
@@ -186,26 +194,15 @@ impl Journal {
                 return Err(JournalError::Corrupt { snapshot, stored: stored_digest, computed });
             }
 
-            let target = std::path::PathBuf::from(&path);
-            let directory = target.parent().map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf);
-            let file_name = target
-                .file_name()
-                .map_or_else(|| std::ffi::OsString::from("supra-restore"), std::ffi::OsString::from);
-            let temporary = directory.join(format!(".supra-undo-{snapshot}-{}", file_name.to_string_lossy()));
-
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                let mut file =
-                    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
-                file.write_all(&bytes)?;
-                file.sync_all()?;
+            let target = PathBuf::from(&path);
+            restore_bytes(&target, snapshot, &bytes, fault)?;
+            #[cfg(test)]
+            if fault == UndoFault::Mark {
+                return Err(injected_fault("injected database mark failure"));
             }
-            // A rename replaces whatever sits at the target - a symlink
-            // included - without following it, so a swapped link cannot
-            // turn the restore into a write outside the workspace.
-            std::fs::rename(&temporary, &target)?;
-
-            schema::mark_undone(transaction, snapshot)?;
+            if !schema::mark_undone(transaction, snapshot)? {
+                return Err(JournalError::AlreadyUndone { snapshot });
+            }
             Ok(())
         })
     }
@@ -238,7 +235,7 @@ impl Journal {
     ///
     /// A budget the operator can watch: an unbounded stack is a disk cost
     /// nobody asked for, and later stages prune on this number. Resolved
-    /// like [`newest_for_path`] for the same reason.
+    /// like [`Journal::newest_for_path`] for the same reason.
     ///
     /// # Errors
     ///
@@ -257,7 +254,163 @@ impl Journal {
 /// two different keys in the table - macOS `$TMPDIR` proves it.
 fn resolved_path_text(path: impl AsRef<Path>) -> Result<String, JournalError> {
     let canonical = std::fs::canonicalize(path)?;
-    Ok(canonical.to_string_lossy().into_owned())
+    path_text(&canonical)
+}
+
+fn path_text(path: &Path) -> Result<String, JournalError> {
+    path.to_str().map(str::to_owned).ok_or_else(|| JournalError::NonUtf8Path { path: path.to_path_buf() })
+}
+
+struct SnapshotSource {
+    bytes: Vec<u8>,
+    resolved_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl SnapshotSource {
+    fn read(path: &Path) -> Result<Self, JournalError> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let opened = file.metadata()?;
+        if !opened.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "journal snapshots require a regular file",
+            )
+            .into());
+        }
+        let resolved_path = std::fs::canonicalize(path)?;
+        let named = std::fs::symlink_metadata(&resolved_path)?;
+        if opened.dev() != named.dev() || opened.ino() != named.ino() || !named.file_type().is_file() {
+            return Err(JournalError::PathIdentityChanged { path: path.to_path_buf() });
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        if opened.dev() != after.dev() || opened.ino() != after.ino() {
+            return Err(JournalError::PathIdentityChanged { path: path.to_path_buf() });
+        }
+        let named_after = std::fs::symlink_metadata(&resolved_path)?;
+        if after.dev() != named_after.dev() || after.ino() != named_after.ino() {
+            return Err(JournalError::PathIdentityChanged { path: path.to_path_buf() });
+        }
+        Ok(Self { bytes, resolved_path })
+    }
+}
+
+#[cfg(not(unix))]
+impl SnapshotSource {
+    fn read(_path: &Path) -> Result<Self, JournalError> {
+        Err(JournalError::UnsupportedPathSafety)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UndoFault {
+    None,
+    #[cfg(test)]
+    Create,
+    #[cfg(test)]
+    Write,
+    #[cfg(test)]
+    Sync,
+    #[cfg(test)]
+    Rename,
+    #[cfg(test)]
+    Mark,
+}
+
+struct TemporaryRestore {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl TemporaryRestore {
+    fn create(
+        directory: &Path,
+        target_name: &std::ffi::OsStr,
+        snapshot: SnapshotId,
+    ) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        for attempt in 0u32..128 {
+            let path =
+                directory.join(format!(".supra-undo-{snapshot}-{}-{attempt}", target_name.to_string_lossy()));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&path) {
+                Ok(file) => return Ok(Self { path, file: Some(file) }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique undo temporary file",
+        ))
+    }
+
+    fn file_mut(&mut self) -> std::io::Result<&mut File> {
+        self.file.as_mut().ok_or_else(|| std::io::Error::other("temporary restore file is closed"))
+    }
+
+    fn close(&mut self) {
+        self.file.take();
+    }
+}
+
+impl Drop for TemporaryRestore {
+    fn drop(&mut self) {
+        self.file.take();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+fn injected_fault(message: &'static str) -> JournalError {
+    std::io::Error::other(message).into()
+}
+
+fn restore_bytes(
+    target: &Path,
+    snapshot: SnapshotId,
+    bytes: &[u8],
+    fault: UndoFault,
+) -> Result<(), JournalError> {
+    #[cfg(not(test))]
+    let _ = fault;
+    let directory = target.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let target_name = target.file_name().unwrap_or_else(|| std::ffi::OsStr::new("supra-restore"));
+    #[cfg(test)]
+    if fault == UndoFault::Create {
+        return Err(injected_fault("injected create failure"));
+    }
+    let mut temporary = TemporaryRestore::create(&directory, target_name, snapshot)?;
+    #[cfg(test)]
+    if fault == UndoFault::Write {
+        return Err(injected_fault("injected write failure"));
+    }
+    temporary.file_mut()?.write_all(bytes)?;
+    #[cfg(test)]
+    if fault == UndoFault::Sync {
+        return Err(injected_fault("injected file sync failure"));
+    }
+    temporary.file_mut()?.sync_all()?;
+    temporary.close();
+    #[cfg(test)]
+    if fault == UndoFault::Rename {
+        return Err(injected_fault("injected rename failure"));
+    }
+    std::fs::rename(&temporary.path, target)?;
+    File::open(&directory)?.sync_all()?;
+    Ok(())
 }
 
 impl core::fmt::Debug for Journal {
@@ -354,17 +507,104 @@ mod tests {
         let (journal, dir) = journal();
         let file = dir.join("target.rs");
         let outside = dir.join("outside.txt");
-        let link = dir.join("link.rs");
         write_file(&file, b"original");
         write_file(&outside, b"do not touch");
-
         let id = journal.snapshot(&file).expect("snapshot");
-        write_file(&file, b"edited");
-        std::os::unix::fs::symlink(&outside, &link).expect("swap in a symlink at the snapshotted path");
+        std::fs::remove_file(&file).expect("remove the snapshotted target");
+        std::os::unix::fs::symlink(&outside, &file).expect("swap in a symlink at the snapshotted path");
 
         journal.undo(id).expect("undo");
         assert_eq!(std::fs::read(&file).expect("read"), b"original", "the path holds the restored bytes");
-        assert_eq!(std::fs::read(&link).expect("read"), b"do not touch", "the symlink target is untouched");
+        assert!(!std::fs::symlink_metadata(&file).expect("metadata").file_type().is_symlink());
+        assert_eq!(
+            std::fs::read(&outside).expect("read"),
+            b"do not touch",
+            "the symlink target is untouched"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_refuses_a_final_component_symlink() {
+        let (journal, dir) = journal();
+        let target = dir.join("target.rs");
+        let link = dir.join("link.rs");
+        write_file(&target, b"target");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        assert!(matches!(journal.snapshot(&link), Err(JournalError::Io(_))));
+        assert_eq!(journal.count_for_path(&target).expect("count"), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_rejects_a_non_utf8_path_before_creating_a_row() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let (journal, dir) = journal();
+        let file = dir.join(std::ffi::OsString::from_vec(b"bad-\xff.rs".to_vec()));
+        write_file(&file, b"original");
+        assert!(matches!(journal.snapshot(&file), Err(JournalError::NonUtf8Path { .. })));
+    }
+
+    fn undo_temporary_paths(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(".supra-undo-"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pre_rename_faults_clean_temporary_files_and_allow_retry() {
+        for fault in [UndoFault::Create, UndoFault::Write, UndoFault::Sync, UndoFault::Rename] {
+            let (journal, dir) = journal();
+            let file = dir.join("a.rs");
+            write_file(&file, b"original");
+            let id = journal.snapshot(&file).expect("snapshot");
+            write_file(&file, b"edited");
+
+            assert!(journal.undo_with_fault(id, fault).is_err(), "{fault:?} must fail");
+            assert_eq!(std::fs::read(&file).expect("read"), b"edited", "{fault:?} leaves target alone");
+            assert!(undo_temporary_paths(&dir).is_empty(), "{fault:?} leaves no stale temporary");
+            journal.undo(id).expect("retry succeeds");
+            assert_eq!(std::fs::read(&file).expect("read"), b"original");
+        }
+    }
+
+    #[test]
+    fn a_database_mark_fault_leaves_no_temp_and_remains_retryable() {
+        let (journal, dir) = journal();
+        let file = dir.join("a.rs");
+        write_file(&file, b"original");
+        let id = journal.snapshot(&file).expect("snapshot");
+        write_file(&file, b"edited");
+
+        assert!(journal.undo_with_fault(id, UndoFault::Mark).is_err());
+        assert_eq!(std::fs::read(&file).expect("read"), b"original", "rename completed before mark failed");
+        assert!(undo_temporary_paths(&dir).is_empty());
+        journal.undo(id).expect("an unmarked restore can be retried");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn undo_is_explicitly_content_only() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let (journal, dir) = journal();
+        let file = dir.join("script.sh");
+        write_file(&file, b"original");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let id = journal.snapshot(&file).expect("snapshot");
+        write_file(&file, b"edited");
+
+        journal.undo(id).expect("undo");
+        assert_eq!(std::fs::read(&file).expect("read"), b"original");
+        assert_eq!(std::fs::metadata(&file).expect("metadata").mode() & 0o777, 0o600);
     }
 
     #[test]

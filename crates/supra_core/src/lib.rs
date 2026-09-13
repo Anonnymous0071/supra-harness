@@ -18,7 +18,7 @@
 //! use supra_blackboard::Blackboard;
 //! use supra_core::{PeerAnswer, Step, Turn};
 //! use supra_eventbus::Bus;
-//! use supra_types::AgentId;
+//! use supra_types::{AgentId, Confidence, Verdict, Vote};
 //!
 //! let store = Arc::new(supra_store::Store::open_in_memory().expect("store"));
 //! let board = Blackboard::open(store).expect("board");
@@ -26,10 +26,14 @@
 //!
 //! let mut turn =
 //!     Turn::start(board, Bus::new(), "the fix", agents.to_vec()).expect("turn");
-//! let step = turn
-//!     .record(PeerAnswer { agent: agents[1], text: "fix it in place".to_owned() })
-//!     .expect("vote");
-//! assert_eq!(step, Step::Collecting);
+//! assert_eq!(
+//!     turn.record(PeerAnswer::proposal(agents[0], "fix it in place"))?,
+//!     Step::Collecting
+//! );
+//! let verdict = Verdict::new(Vote::Yes, Confidence::Medium, "checked independently", None)
+//!     .expect("valid verdict");
+//! let step = turn.record(PeerAnswer::validation(agents[1], verdict))?;
+//! assert_eq!(step, Step::Reached);
 //! # Ok::<(), supra_core::TurnError>(())
 //! ```
 

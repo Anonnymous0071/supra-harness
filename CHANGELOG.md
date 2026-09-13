@@ -9,23 +9,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-- Official provider SDKs (`supra_llm::providers`): `OpenAI` travels
-  through `async-openai` (chat-completion surface only), `Anthropic`
-  through `anthropic-sdk-rust` Messages streaming. Policy, canonical
+- Provider transports (`supra_llm::providers`): `OpenAI` travels
+  through `async-openai` (chat-completion surface only), while `Anthropic`
+  sends canonical Messages API bytes directly over rustls. Policy, canonical
   rendering, and the `LlmError` recoverability contract are unchanged;
   `Google` keeps the hand-rolled transport.
 - `Client::from_config` / `Client::send_with_config`: endpoint, model,
   and budget from `[providers.<name>]`; empty model selects the cheapest
-  default (`gpt-4o-mini` / `claude-3-5-haiku-20241022`); credential
+  active default (`gpt-4o-mini` / `claude-haiku-4-5-20251001`); credential
   resolves per request and is never stored.
-- `supra eval --live` probes every configured SDK provider through
-  `Client` instead of refusing.
+- `supra eval --live` probes configured Anthropic and OpenAI providers through
+  `Client`; Google live probing is not implemented.
 - Ignored live-probe tests for both SDK paths
   (`SUPRA_LIVE_{ANTHROPIC,OPENAI}_{BASE,KEY,MODEL}`), validated against
   live gateways.
 
 ### Fixed
 
+- Validation now enforces structural invariants, warning-free rustdoc, and the
+  Rust 1.86 MSRV in hosted CI; the authoritative `just ci` gate also builds,
+  links, and executes a real WASI component contract. Removed the unimplemented
+  `wasm32-wasip1` fallback claim so setup names only the exercised target.
 - Full-repo audit (62 verified bugs with regression tests): CLI
   help/enums, turn lifecycle, LSP/DAP framing, journal/session
   persistence, config, log, skills, TUI, money, secrets vault, hooks,
@@ -370,8 +374,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - **Fuel is the hang containment**: `consume_fuel(true)` + per-store
     `DEFAULT_FUEL` (10M), non-refillable. An infinite-loop guest dies in
     milliseconds as `FuelExhausted` (component and budget named), not in
-    minutes as a hang; the classifier greps the formatted error chain -
-    the same chain the trap test pins.
+    minutes as a hang; the classifier downcasts the Wasmtime error chain to
+    `wasmtime::Trap::OutOfFuel`, while unrelated guest traps remain distinct.
   - **The string ABI, learned from the parser**: a lifted `(string) ->
     (string)` needs `(memory ...)` and `(realloc ...)` in the `canon
     lift` - refused at parse time otherwise. The round-trip guest
@@ -386,8 +390,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     (verify skipped by instantiate) survived first - every test verified
     explicitly, so the skip was unobservable; closed by instantiating an
     over-classed component without prior verify. Four guards in
-    `check-invariants.sh`, one needing `scan_sql` (the classifier's
-    subject is the literal "fuel", which `scan` blanks), probed 4/4.
+    `check-invariants.sh`, including a typed `Trap::OutOfFuel` check, probed
+    4/4.
   - Environment note: /tmp hit 100% again mid-stage (a 788MB wasmtime
     probe build + stale test artifacts); cleaned per the standing /tmp
     practice, and the probe directories removed.
@@ -1090,7 +1094,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   compile" is reported BUILD_FAIL (not a verdict) and only a compiled-then-
   failed run counts as CAUGHT.
 
-- **T4** `cpp/libsupra_sandbox`: OS-level process isolation behind one C ABI.
+- **T4** `crates/supra_ffi/native/cpp/libsupra_sandbox`: OS-level process isolation behind one C ABI.
   - Linux backend is native rather than a bubblewrap wrapper, decided by
     measurement: applying a Landlock ruleset and then exec'ing `bwrap` fails with
     "Failed to make / slave: Operation not permitted", and still fails under a
@@ -1123,8 +1127,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     pipe, which also made `kill` untestable; and `readlink` truncated silently,
     where a partial path can resolve to a different file and would make guard
     layer L4 compare the wrong inode.
-  - macOS and Windows refuse rather than running unconfined, which keeps T16.7's
-    `auto` mode safe on platforms whose backend has not landed.
+  - Native fail-closed backends now cover all three supported platform families:
+    Linux namespaces/Landlock; macOS `sandbox_init` with generated SBPL; and
+    Windows AppContainer process creation with explicit handle inheritance and a
+    kill-on-close job object. Each backend executes supported policies and
+    refuses policy dimensions it cannot enforce; only other platforms use the
+    generic unsupported fallback.
 
 ### Fixed
 
@@ -1249,7 +1257,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   for *older* kernels untested. `supra_sandbox_force_tier_for_testing` pins the
   tier downward to reach them.
 
-- **T3** `cpp/libsupra_ansi`: escape sequence parsing, SGR state, style-safe
+- **T3** `crates/supra_ffi/native/cpp/libsupra_ansi`: escape sequence parsing, SGR state, style-safe
   truncation.
   - Resumable state machine over the DEC STD 070 / VT500 grammar, covering the
     cases a regex cannot: both OSC terminators (`ESC \` and `BEL`), colon
@@ -1274,10 +1282,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - Eight deliberate mutations introduced, all eight caught. One initially
     survived - the byte-wise C1 test - proving no test actually exercised the
     invariant; a split-boundary regression test now does.
-  - `cpp/testing`: shared assertion helpers, extracted from
+  - `crates/supra_ffi/native/cpp/testing`: shared assertion helpers, extracted from
     `libsupra_width/tests` when libsupra_ansi became the second consumer.
 
-- **T2** `cpp/libsupra_width`: terminal cell width and grapheme segmentation.
+- **T2** `crates/supra_ffi/native/cpp/libsupra_width`: terminal cell width and grapheme segmentation.
   - Flat C ABI: UTF-8 decoding, per-code-point width, UAX #29 grapheme cluster
     segmentation, string measurement, cluster-safe truncation, validation, and a
     startup glyph probe.

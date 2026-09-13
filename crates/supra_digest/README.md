@@ -137,5 +137,7 @@ asserts the `tokens > SUFFIX_TOKENS` comparison.
 - **T15.7** owns call-graph precision (cross-file name resolution), byte-range
   splice, and the reparse gate. Locators already name bytes (`path:start-end`),
   which is what the splicer consumes.
-- **T23** supplies `embed`, sets the rescan interval to seconds, drives the
-  watcher into `apply_event`, and renders anchors into the suffix T14 hashes.
+- **Executable integration** is pending: a future turn driver must supply
+  `embed`, set the rescan interval, drive watcher events into `apply_event`, and
+  render anchors into prompt suffixes. The current `supra run` path does none of
+  these.

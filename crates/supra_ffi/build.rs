@@ -37,16 +37,15 @@ fn main() {
         env::var_os("CARGO_MANIFEST_DIR")
             .expect("CARGO_MANIFEST_DIR is unset; this file only runs as a Cargo build script"),
     );
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("crate must live at <workspace-root>/crates/<name>")
-        .to_path_buf();
+    let native_root = manifest_dir.join("native");
+    let cpp_root = native_root.join("cpp");
+    assert!(
+        cpp_root.is_dir(),
+        "native/cpp/ not found at {}; the crate package is incomplete",
+        cpp_root.display()
+    );
 
-    let cpp_root = workspace_root.join("cpp");
-    assert!(cpp_root.is_dir(), "cpp/ not found at {}; the workspace layout changed", cpp_root.display());
-
-    emit_rerun_directives(&workspace_root, &manifest_dir);
+    emit_rerun_directives(&native_root, &manifest_dir);
 
     let lib_dir = match env::var_os("SUPRA_CPP_BUILD_DIR") {
         Some(dir) => {
@@ -58,7 +57,7 @@ fn main() {
             );
             dir
         }
-        None => build_with_cmake(&workspace_root),
+        None => build_with_cmake(&native_root),
     };
 
     // One search directory per distinct archive parent: single-config
@@ -94,19 +93,19 @@ fn main() {
 /// Enumerated rather than left to Cargo's default, which watches only the crate
 /// directory - so an edit to a header two directories up would not trigger a
 /// rebuild, and the Rust side would link a stale archive.
-fn emit_rerun_directives(workspace_root: &Path, manifest_dir: &Path) {
+fn emit_rerun_directives(native_root: &Path, manifest_dir: &Path) {
     println!("cargo:rerun-if-changed={}", manifest_dir.join("build.rs").display());
     println!("cargo:rerun-if-changed={}", manifest_dir.join("abi_sizes.rs").display());
     println!("cargo:rerun-if-changed={}", manifest_dir.join("abi_check.cpp").display());
-    println!("cargo:rerun-if-changed={}", workspace_root.join("CMakeLists.txt").display());
-    println!("cargo:rerun-if-changed={}", workspace_root.join("cmake").display());
-    println!("cargo:rerun-if-changed={}", workspace_root.join("cpp").display());
+    println!("cargo:rerun-if-changed={}", native_root.join("CMakeLists.txt").display());
+    println!("cargo:rerun-if-changed={}", native_root.join("cmake").display());
+    println!("cargo:rerun-if-changed={}", native_root.join("cpp").display());
     println!("cargo:rerun-if-env-changed=SUPRA_CPP_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=SUPRA_CXX");
 }
 
-fn build_with_cmake(workspace_root: &Path) -> PathBuf {
-    let mut config = cmake::Config::new(workspace_root);
+fn build_with_cmake(native_root: &Path) -> PathBuf {
+    let mut config = cmake::Config::new(native_root);
 
     // The C++ test executables are CTest's concern, not Cargo's. Skipping them
     // roughly halves this build.
@@ -119,10 +118,8 @@ fn build_with_cmake(workspace_root: &Path) -> PathBuf {
     // C++ suites are built with it too - pinning clang++ there fights the
     // generator.
     let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
-    if let Some(cxx) = env::var_os("SUPRA_CXX") {
+    if let Some(cxx) = selected_cxx(msvc) {
         config.define("CMAKE_CXX_COMPILER", cxx);
-    } else if !msvc {
-        config.define("CMAKE_CXX_COMPILER", "clang++");
     }
 
     // No default build target: the cmake crate's default is `install`, and
@@ -137,6 +134,21 @@ fn build_with_cmake(workspace_root: &Path) -> PathBuf {
 
     let dst = config.build();
     dst.join("build").join("lib")
+}
+
+fn selected_cxx(msvc: bool) -> Option<std::ffi::OsString> {
+    if let Some(cxx) = env::var_os("SUPRA_CXX") {
+        return Some(cxx);
+    }
+    if msvc {
+        return None;
+    }
+
+    match env::var("TARGET").as_deref() {
+        Ok("x86_64-unknown-linux-musl") => Some("x86_64-linux-musl-g++".into()),
+        Ok("aarch64-unknown-linux-gnu") => Some("aarch64-linux-gnu-g++".into()),
+        _ => Some("clang++".into()),
+    }
 }
 
 /// Find one library's archive under `lib_dir`.
@@ -185,6 +197,9 @@ fn link_cxx_runtime() {
     let env_abi = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     match target.as_str() {
+        "linux" | "android" if env_abi == "musl" => {
+            println!("cargo:rustc-link-lib=static=stdc++");
+        }
         "linux" | "android" => {
             // Which runtime depends on the compiler, not the OS. clang defaults
             // to libstdc++ on Linux distributions, and mismatching it produces

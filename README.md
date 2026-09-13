@@ -4,10 +4,11 @@ A terminal coding-agent harness built from scratch in Rust, C++20, and WASM.
 One binary, `supra`. No prompt compression, no history summarisation — the
 prefix stays byte-stable so the provider's cache does the saving.
 
-**Status: T30 complete.** The 37-stage build sequence is closed: 36 crates,
-one `supra` binary (`run`, `eval`, `update`, `config show`), signed releases
-via `release.yml`. `supra run` assembles the full startup path today and
-reports mode, cohort, session dir, and the admission plan.
+**Status:** the 37 crate stages and their tested primitives are present. The
+`supra run` executable integration is narrower: it performs one provider
+proposal, sequential peer validation, and answer persistence. It does not yet
+execute tools or integrate the complete digest, prompt-ledger, sandbox,
+deterministic-gate, or TUI lifecycle described as target architecture below.
 
 ---
 
@@ -68,22 +69,13 @@ There is no `/cost`. Transparency you have to ask for is never consulted
 while spend is climbing — and when the prefix breaks, the marker appears
 that turn, not on the invoice.
 
-**The environment carries the instruction.** `edit_file` fails if the file
-was not read this session; `read_file` truncates large files with a hint.
-Zero prompt tokens, fully reliable. The system prompt is under 400 tokens.
-
-**Structural edits, not string matching.** Byte-range splices through
-tree-sitter preserve formatting exactly; a reparse gate rejects any edit
-producing an `ERROR`/`MISSING` node with atomic rollback.
-
-**No agent can spawn itself.** Seven layers, the strongest being absence:
-the WASM linker exposes no spawn import, so an agent has no vocabulary for
-it. No permission mode relaxes this.
-
-**Trust is explicit.** `--ignore-project-config` and `--sandbox off` each
-require their own `--yes`; `update apply` refuses without a verified
-minisign signature (fetch, verify, then apply, in that order); secrets live
-in the OS keyring with an encrypted-file fallback, never in plaintext.
+**Implemented primitives; executable integration pending.** The tool, AST,
+guard, sandbox, permission, journal, prompt, digest, TUI, and updater crates
+provide tested contracts, but `supra run` currently advertises no tools and
+rejects tool-use responses. Accordingly, read-before-edit, structural rollback,
+sandboxed command execution, and automatic post-edit gates are not current CLI
+behavior. `supra update check` prints verification guidance and `update apply`
+is not implemented.
 
 The full derivation, all invariants, and the honest list of verified versus
 estimated: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. Per-crate
@@ -93,21 +85,24 @@ decisions and mutation tables: each `crates/supra_*/README.md`.
 
 ## Install
 
-Requirements: Rust 1.85+, CMake 3.24+, clang++ with C++20, git. Optional:
-`bubblewrap` (Linux sandbox), `clang-tidy`, `cargo-deny`, `ninja`, `just`.
+Requirements: Rust 1.86+, CMake 3.24+, clang++ with C++20, git. Optional:
+`clang-tidy`, `cargo-deny`, `ninja`, `just`. `bubblewrap` is detected for
+experiments but is not invoked by the shipped Linux sandbox backend.
 
 ### Option A — one line (release binary)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Anonnymous0071/supra-harness/main/scripts/install.sh | bash
+curl -fsSL "https://raw.githubusercontent.com/Anonnymous0071/supra-harness/vX.Y.Z/scripts/install.sh" | SUPRA_VERSION=vX.Y.Z SUPRA_PUBKEY='<published minisign public key>' bash
 ```
 
-Installs the latest `supra` for your platform into `~/.local/bin`
-(override with `PREFIX=`, pin with `SUPRA_VERSION=vX.Y.Z`), verifies the
-SHA-256 checksum before touching anything, and verifies the minisign
-signature when the release carries `.minisig` files (needs `minisign`
-plus `SUPRA_PUBKEY=` set to the release key — refusing is correct when
-the key is unknown). Needs `curl`.
+Installs an explicitly pinned `supra` release for supported targets into `~/.local/bin`
+(override with `PREFIX=`). The installer requires the independently published
+`SUPRA_PUBKEY`, verifies a required Minisign signature over the canonical
+per-target manifest, then checks the exact archive name, target, version, size,
+digest, and sole regular executable member before touching the destination.
+There is no checksum-only fallback. Use the tag-pinned installer URL shown in
+the release notes; do not pipe the mutable `main` branch into a shell. Needs
+`curl`, `minisign`, `python3`, and `tar`.
 
 ### Option B — from source (developers)
 
@@ -126,12 +121,14 @@ cargo install --locked --path crates/supra_cli
 ### Verify it works
 
 ```sh
-supra --version        # supra 0.1.0
-supra                  # run: mode, cohort, session dir, admission plan
+supra --version        # prints the installed version
+supra --help           # list commands; an explicit subcommand is required
 supra config show      # resolved config and where each value came from
 supra eval             # offline economy shape-check (always runs, no network)
-supra eval --live      # live probe; skips explicitly without credentials
-supra update check     # names the verifier for the artefact
+supra eval --live      # Anthropic/OpenAI probe; may incur provider charges
+supra update check --archive ./supra-$TARGET.tar.gz \
+  --manifest ./supra-$TARGET.manifest.json \
+  --signature ./supra-$TARGET.manifest.json.minisig --public-key ./supra.pub
 ```
 
 ---
@@ -142,7 +139,7 @@ supra update check     # names the verifier for the artefact
 Cargo.toml           workspace, dependency pinning, lint and profile policy
 CMakeLists.txt       C++20 root: shared flag contract for T2-T4
 cmake/               CMake helper functions
-cpp/                 C++20 libraries: width (T2), ansi (T3), sandbox (T4)
+crates/supra_ffi/native/ C++20 libraries: width, ansi, and sandbox
 crates/              Rust crates: 36 members, T5 onward (supra_cli is the binary)
 agents/              WASM agent components (T20)
 docs/ARCHITECTURE.md normative architecture contract

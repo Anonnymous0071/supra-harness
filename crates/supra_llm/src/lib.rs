@@ -1,7 +1,7 @@
 //! Provider clients for supra-harness.
 //!
 //! **T13** of the stage sequence: three providers behind one call shape, each with its
-//! own [`CachePolicy`](policy::CachePolicy), one canonical serialiser, and a thinking
+//! own [`CachePolicy`], one canonical serialiser, and a thinking
 //! budget frozen at startup.
 //!
 //! # What this stage is for
@@ -49,6 +49,6 @@ pub mod policy;
 pub mod providers;
 
 pub use canonical::{CanonicalError, canonicalize, canonicalize_value, parse_strict};
-pub use client::{Client, Completion, Message, Request, Role, Thinking, Usage};
+pub use client::{Client, Completion, ContentBlock, Message, Request, Role, StopReason, Thinking, Usage};
 pub use error::LlmError;
 pub use policy::{CachePolicy, ProviderKind};

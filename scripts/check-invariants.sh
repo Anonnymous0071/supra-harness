@@ -173,6 +173,51 @@ has_sql() {
     printf '%s\n' "$body" | grep -qF "$needle"
 }
 
+# A populated workspace is no longer optional. If Cargo metadata cannot be read, or if
+# either package list is empty, every downstream Rust gate would otherwise certify nothing.
+if ! metadata=$(cargo metadata --locked --no-deps --format-version 1 2>&1); then
+    fail "cargo metadata failed; Rust validation cannot determine its scope" "$metadata"
+    metadata_counts="0 0"
+else
+    metadata_counts=$(printf '%s' "$metadata" | python3 -c \
+        'import json, sys; data=json.load(sys.stdin); print(len(data["packages"]), len(data["workspace_members"]))' \
+        2>&1) || {
+        fail "cargo metadata returned unreadable JSON" "$metadata_counts"
+        metadata_counts="0 0"
+    }
+    read -r package_count member_count <<<"$metadata_counts"
+    if [ "${package_count:-0}" -eq 0 ] || [ "${member_count:-0}" -eq 0 ]; then
+        fail "the Rust workspace is empty" \
+            "packages=${package_count:-unknown} workspace_members=${member_count:-unknown}" \
+            "an empty workspace makes build, test, lint, and dependency checks vacuous"
+    fi
+fi
+
+# CI executes this checker on a committed tree. Refuse any workflow action whose ref can
+# move after review: tags and branches are supply-chain input, not immutable provenance.
+workflow_hits=$(grep -RInE \
+    'uses:[[:space:]]+[^#[:space:]]+@(v[0-9]+|main|master|latest)([[:space:]]|$)' \
+    .github/workflows 2>/dev/null || true)
+if [ -n "$workflow_hits" ]; then
+    fail "GitHub Actions are not pinned to immutable commits" \
+        "$workflow_hits" \
+        "a mutable action tag can replace trusted CI code after review"
+fi
+
+# The package MSRV and Clippy policy are one compatibility claim. The pinned default
+# toolchain is deliberately independent: contributors may use a newer compiler while CI
+# still proves that every package builds on the minimum version advertised to users.
+workspace_msrv=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml |
+    sed -n 's/^rust-version = "\(.*\)"/\1/p' | head -1)
+clippy_msrv=$(sed -n 's/^msrv = "\(.*\)"/\1/p' clippy.toml | head -1)
+if [ -z "$workspace_msrv" ] || [ -z "$clippy_msrv" ]; then
+    fail "could not read the workspace and Clippy MSRV declarations"
+elif [ "$workspace_msrv" != "$clippy_msrv" ]; then
+    fail "the Rust compatibility declarations disagree" \
+        "Cargo.toml=$workspace_msrv clippy.toml=$clippy_msrv" \
+        "Clippy must evaluate APIs against the version the packages advertise"
+fi
+
 crate=crates/supra_types/src
 
 # ---------------------------------------------------------------------------
@@ -650,16 +695,19 @@ if [ -d "$vector" ]; then
             "a failed write would leave the tier describing a row that does not exist"
     fi
 
-    # The binarisation threshold is frozen. If it moves, every code written before the move
-    # answers a different question from every code written after, and the scan ranks them
-    # against each other without failing.
-    hits=$(scan_sql "$vector/index.rs" 'UPDATE vector_meta')
+    # The binarisation threshold, dimensions, model, and creation time are frozen. The
+    # revision is deliberately mutable: it is the cache-invalidation clock and not part of
+    # the encoding configuration. Refuse assignments to every frozen column while allowing
+    # `revision = revision + 1`.
+    hits=$(scan_sql "$vector/index.rs" 'UPDATE vector_meta.*SET[^";]*(dims|model|threshold|created_at)[[:space:]]*=')
     if [ -n "$hits" ]; then
         fail "the frozen index configuration is being updated in place" "$hits" \
-            "moving the threshold silently invalidates every code already written"
+            "moving the encoding parameters silently invalidates every code already written"
     fi
-    if ! printf '%s' "$(sed -n '/pub fn open(/,/^    }/p' "$vector/index.rs")" |
-        grep -q 'FrozenThresholdMismatch'; then
+    threshold_error=$(scan "$vector/index.rs" 'VectorError::FrozenThresholdMismatch')
+    threshold_compare=$(scan "$vector/index.rs" \
+        'codes::encode_embedding\(&found\.threshold\) != codes::encode_embedding\(threshold\)')
+    if [ -z "$threshold_error" ] || [ -z "$threshold_compare" ]; then
         fail "open no longer refuses a changed threshold" \
             "silently keeping the stored one leaves the caller wrong about its own encoding"
     fi
@@ -793,24 +841,23 @@ if [ -d "$secrets" ]; then
             "a floor that disagrees with the constant it guards is worse than no floor"
     fi
 
-    # The vault file must be 0600 before the first secret byte lands, not after. A chmod
-    # after the write leaves a window where the file is world-readable; the temp file must
-    # also carry the mode, because rename preserves it.
-    #
-    # Two `set_permissions` calls exist (temp file before the write, destination after the
-    # rename), so the check extracts only the segment between `File::create` and the first
-    # `write_all`: exactly the region where ordering matters. A probe that deleted the
-    # first chmod while leaving the second must fail - the second covers the destination,
-    # not the window.
-    segment=$(sed -n '/fn save(/,/^    }/p' "$secrets/file_store.rs" |
-        sed -n '/File::create/,/write_all/p')
-    if ! printf '%s\n' "$segment" | grep -q 'set_permissions'; then
-        fail "the vault file is not restricted before the first write" "$segment" \
-            "chmod must precede write_all, or the secret has a world-readable window"
+    # The temporary vault file is born 0600 before it is opened. `OpenOptionsExt::mode`
+    # applies the creation mode atomically, avoiding the world-readable window that a
+    # create-then-chmod sequence introduces. The destination is re-asserted after rename.
+    # `save_with_temp_suffixes` owns the temp-file allocation while `save` owns the
+    # transaction lock. Extract the helper through its closing brace so the check follows
+    # the code that actually opens the encrypted vault.
+    segment=$(sed -n '/fn save_with_temp_suffixes(/,/^    }/p' "$secrets/file_store.rs" |
+        sed -n '/let mut options = fs::OpenOptions::new/,/write_all/p')
+    if ! printf '%s\n' "$segment" | grep -q 'create_new(true)'; then
+        fail "the vault temp file is no longer created exclusively" "$segment" \
+            "an attacker-controlled pre-existing temp path must never be opened"
     fi
-    if ! printf '%s\n' "$segment" | grep -q 'from_mode(0o600)'; then
-        fail "the pre-write restriction is not 0600" "$segment" \
-            "the mode is the guarantee, not just the presence of a chmod call"
+    mode_at=$(printf '%s\n' "$segment" | grep -n 'mode(0o600)' | head -1 | cut -d: -f1)
+    open_at=$(printf '%s\n' "$segment" | grep -n 'options.open' | head -1 | cut -d: -f1)
+    if [ -z "$mode_at" ] || [ -z "$open_at" ] || [ "$mode_at" -ge "$open_at" ]; then
+        fail "the vault temp file is not born with mode 0600" "$segment" \
+            "the creation mode must be set before open, not after the first secret byte lands"
     fi
 
     # The passphrase must never come from an interactive prompt inside the library. A
@@ -1460,7 +1507,7 @@ if [ -d "$journal" ]; then
     # the kernel may drop. No userspace test can observe a power loss, so
     # the call is pinned structurally - mutation M3 survived the suite and
     # is caught here instead.
-    flushed=$(scan "$journal/journal.rs" 'file\.sync_all\(\)\?;')
+    flushed=$(scan "$journal/journal.rs" 'temporary\.file_mut\(\)\?\.sync_all\(\)\?;')
     if [ -z "$flushed" ]; then
         fail "undo no longer flushes the restored bytes" \
             "crates/supra_journal/src/journal.rs" \
@@ -1503,7 +1550,7 @@ if [ -d "$journal" ]; then
     # The mark and the write share one transaction: mark_undone inside
     # undo's with_transaction. A mark that ran outside it would let two
     # concurrent undoes both pass the read.
-    marked=$(scan "$journal/journal.rs" 'schema::mark_undone\(transaction, snapshot\)\?;')
+    marked=$(scan "$journal/journal.rs" 'if !schema::mark_undone\(transaction, snapshot\)\? \{')
     if [ -z "$marked" ]; then
         fail "the undo mark no longer shares the undo's transaction" \
             "crates/supra_journal/src/journal.rs" \
@@ -1572,9 +1619,10 @@ if [ -d "$permission" ]; then
     fi
 
     # Rules are consulted before everything: resolve(rules) is the gate's
-    # first move. A gate that evaluated the matrix first would let a deny
-    # be outrun by an ask.
-    rules_first=$(scan "$permission/gate.rs" 'if let Some\(effect\) = resolve\(rules\) \{')
+    # first move. Keep the binding rather than pinning one control-flow style:
+    # deny is handled immediately, while allow survives the non-relaxable
+    # authority and escape-hatch checks before waiving ordinary consent.
+    rules_first=$(scan "$permission/gate.rs" 'let resolved_rule = resolve\(rules\);')
     if [ -z "$rules_first" ]; then
         fail "the gate no longer consults rules first" \
             "crates/supra_permission/src/gate.rs" \
@@ -1684,8 +1732,9 @@ if [ -d "$mcpsrc" ]; then
             "the host env holds secrets no third-party server needs"
     fi
 
-    # The budget is consulted at probe, before anything is cached.
-    budgeted=$(scan "$mcpsrc/gateway.rs" 'listed\.tools\.len\(\) > TOOLS_PER_SERVER')
+    # The aggregate budget is consulted after every tools/list page settles and before
+    # rows are built or cached. A per-page check can be bypassed by pagination.
+    budgeted=$(scan "$mcpsrc/gateway.rs" 'remote_tools\.len\(\) > TOOLS_PER_SERVER')
     if [ -z "$budgeted" ]; then
         fail "the per-server discovery budget is no longer enforced" \
             "crates/supra_mcp/src/gateway.rs" \
@@ -1771,13 +1820,10 @@ if [ -d "$pluginsrc" ]; then
             "a verify-less caller must still be refused; the paranoid path is the pinned path"
     fi
 
-    # The fuel trap is classified by name: grepping the chain is the
-    # classifier, and the word it greps for is load-bearing - M6's
-    # mutation greps for nothing.
-    # `scan_sql`, not `scan`: the classifier's subject is the string
-    # literal "fuel" itself, which `scan` blanks by design - the same
-    # case as T17's instruction guard.
-    classified=$(scan_sql "$pluginsrc/host.rs" 'message\.contains\("fuel"\)')
+    # Fuel exhaustion is classified by Wasmtime's typed trap rather than
+    # matching display text. This remains load-bearing: deleting the
+    # OutOfFuel arm turns budget exhaustion into an undifferentiated trap.
+    classified=$(scan "$pluginsrc/host.rs" 'error\.downcast_ref::<Trap>\(\) == Some\(&Trap::OutOfFuel\)')
     if [ -z "$classified" ]; then
         fail "the fuel trap is no longer classified" \
             "crates/supra_plugin/src/host.rs" \
@@ -1789,8 +1835,8 @@ fi
 # T21 - blackboard guards
 #
 # The peer contract's load-bearing lines: proposer exclusion at vote,
-# membership through the validators map, unreachable closes the claim.
-# Through `scan`; probed against the same M-series the suite catches.
+# proposer approval at publication, membership through the validators map,
+# and atomic vote/status persistence.
 # ---------------------------------------------------------------------------
 bbsrc="crates/supra_blackboard/src"
 
@@ -1802,11 +1848,26 @@ if [ -d "$bbsrc" ]; then
             "T12.5 L7: a proposer's vote never counts toward its own claim"
     fi
 
+    implicit_vote=$(scan "$bbsrc/board.rs" 'tally\.record\(Vote::Yes\)')
+    if [ -z "$implicit_vote" ]; then
+        fail "publishing no longer contributes the proposer's vote" \
+            "crates/supra_blackboard/src/board.rs" \
+            "k includes the proposer, so the E1 two-peer tier needs that implicit approval to reach ceil(2k/3)"
+    fi
+
     membership=$(scan "$bbsrc/board.rs" 'state\.validators\.get_mut\(&voter\)')
     if [ -z "$membership" ]; then
         fail "cohort membership is no longer checked through the roster" \
             "crates/supra_blackboard/src/board.rs" \
             "a stranger must have no slot to vote through"
+    fi
+
+    atomic_vote=$(scan "$bbsrc/board.rs" 'schema::insert_vote\(tx, claim, voter, verdict\)')
+    atomic_status=$(scan "$bbsrc/board.rs" 'schema::update_status\(tx, claim, status_text\(outcome\)\)')
+    if [ -z "$atomic_vote" ] || [ -z "$atomic_status" ]; then
+        fail "terminal votes and claim status are no longer persisted together" \
+            "crates/supra_blackboard/src/board.rs" \
+            "a crash must not preserve a decisive vote while leaving its claim open"
     fi
 
     closed=$(scan "$bbsrc/board.rs" 'state\.status = outcome;')
@@ -1851,18 +1912,27 @@ fi
 # ---------------------------------------------------------------------------
 # T23 - turn loop guards
 #
-# The loop's load-bearing properties: agreement is the vote, the
-# escalation abort is published, and the ceiling is checked. Through
-# `scan`; probed against the same M-series.
+# The loop's load-bearing properties: proposals and validator verdicts stay
+# distinct, the escalation abort is published, and the ceiling is checked.
+# Through `scan`; probed against the same M-series.
 # ---------------------------------------------------------------------------
 coresrc="crates/supra_core/src"
 
 if [ -d "$coresrc" ]; then
-    agreement=$(scan "$coresrc/turn.rs" 'answer_is_supported\(&answer\).*Vote::Yes.*Vote::No')
-    if [ -z "$agreement" ]; then
-        fail "a disagreeing peer no longer votes no" \
+    proposal=$(scan "$coresrc/turn.rs" 'PeerAnswer::proposal|pub fn proposal')
+    validation=$(scan "$coresrc/turn.rs" 'PeerAnswer::validation|pub const fn validation')
+    verdict_vote=$(scan "$coresrc/turn.rs" 'let vote = verdict\.vote\(\)')
+    if [ -z "$proposal" ] || [ -z "$validation" ] || [ -z "$verdict_vote" ]; then
+        fail "the turn loop no longer separates proposals from structured verdicts" \
             "crates/supra_core/src/turn.rs" \
-            "a quorum over answers is a quorum: agreement is the vote"
+            "semantic agreement is a bounded validator verdict, not byte equality between generated answers"
+    fi
+
+    proposer_only=$(scan "$coresrc/turn.rs" 'answer\.agent != self\.session\[0\]')
+    if [ -z "$proposer_only" ]; then
+        fail "validators may submit unbounded proposal text" \
+            "crates/supra_core/src/turn.rs" \
+            "only the designated proposer may supply the candidate; validators supply bounded verdicts"
     fi
 
     escalation=$(scan_sql "$coresrc/turn.rs" 'escalating now')
@@ -1911,7 +1981,7 @@ if [ -d "$lspsrc" ]; then
             "the AST ships semantic false; the server's answer is the one place that flips it"
     fi
 
-    restarted=$(scan "$lspsrc/client.rs" 'spawn_child\(\)\?;')
+    restarted=$(scan "$lspsrc/client.rs" 'self\.spawn_child\(server\)\?;')
     if [ -z "$restarted" ]; then
         fail "a crashed server no longer restarts" \
             "crates/supra_lsp/src/client.rs" \
@@ -2050,7 +2120,7 @@ fi
 telsrc="crates/supra_telemetry/src"
 
 if [ -d "$telsrc" ]; then
-    per_report=$(scan "$telsrc/report.rs" 'report: supra_types::SessionId::generate\(\)')
+    per_report=$(scan "$telsrc/report.rs" 'identity: ReportId\(supra_types::SessionId::generate\(\)\)')
     if [ -z "$per_report" ]; then
         fail "the report id is no longer random per report" \
             "crates/supra_telemetry/src/report.rs" \
@@ -2178,9 +2248,9 @@ if [ -d "$clisrc" ]; then
             "a tightening escape hatch without confirmation is a bypass with a flag"
     fi
 
-    # No `"off"` in the pattern: literals are blanked, so match the shape -
-    # a case-insensitive sandbox comparison gated on `!self.yes`.
-    if ! scan "$clisrc/args.rs" 'sandbox\.eq_ignore_ascii_case.*&& !self\.yes' | grep -q .; then
+    # `SandboxArg` is parsed by clap, so this is a typed equality rather than a string
+    # comparison. The confirmation still has to be in the same predicate.
+    if ! scan "$clisrc/args.rs" 'self\.sandbox == SandboxArg::Off && !self\.yes' | grep -q .; then
         fail "the --sandbox off confirmation is gone" \
             "crates/supra_cli/src/args.rs" \
             "disabling the sandbox is a separate flag with its own confirmation, per section 6"
@@ -2192,29 +2262,138 @@ if [ -d "$clisrc" ]; then
             "the shape-check is what always runs in CI; live is the exception, not the rule"
     fi
 
-    # `scan_sql`: `"skipped"` is a literal, blanked by plain `scan` - same
-    # lesson, third restatement.
-    if ! scan_sql "$clisrc/main.rs" 'Ok\("skipped"\)' | grep -q .; then
+    if ! scan_sql "$clisrc/main.rs" 'live probe: skipped \(no configured providers\)' | grep -q .; then
         fail "the live-probe skip is no longer explicit" \
             "crates/supra_cli/src/main.rs" \
             "a probe that cannot run must say so; silence reads as a pass"
     fi
 
-    # `scan_sql`: the refusal text is a literal inside `anyhow::bail!`, and
-    # plain `scan` blanks literals - the same lesson as the thinking-display
-    # cost guard in T29. The `Ok("skipped")` above stays on `scan`: it is an
-    # identifier, not a literal.
-    if ! scan_sql "$clisrc/main.rs" 'refuses without a verified signature' | grep -q .; then
-        fail "update apply no longer refuses an unverified artefact" \
+    if ! scan "$clisrc/main.rs" 'supra_update::check_local' | grep -q .; then
+        fail "update check no longer verifies local artefacts" \
             "crates/supra_cli/src/main.rs" \
-            "fetch, verify, then apply - in that order, or it is a download"
+            "the check command must call the verifier rather than merely describe it"
     fi
 
-    if ! scan_sql "$clisrc/main.rs" 'supra_update::verify' | grep -q .; then
-        fail "update check no longer names the verifier" \
+    if ! scan "$clisrc/main.rs" 'supra_update::apply_local' | grep -q .; then
+        fail "update apply no longer verifies before installation" \
             "crates/supra_cli/src/main.rs" \
-            "the check must say what verifies the artefact, via scan_sql since the name lives in a literal"
+            "apply_local owns the verify-then-apply ordering; bypassing it turns the updater into a download"
     fi
+
+    for required in archive manifest signature public_key; do
+        if ! scan "$clisrc/args.rs" "$required: PathBuf" | grep -q .; then
+            fail "update commands no longer require $required" \
+                "crates/supra_cli/src/args.rs" \
+                "every local trust input must be explicit; no network or implicit discovery is allowed"
+        fi
+    done
+fi
+
+# Release automation is itself a trust boundary. Manual runs must check out and
+# publish the requested tag, Windows packaging must name the actual `.exe`, and
+# official publication must fail closed when the signing key is absent.
+release_workflow=".github/workflows/release.yml"
+if [ -f "$release_workflow" ]; then
+    if ! python3 - "$release_workflow" .github/workflows/ci.yml <<'PY'
+import sys
+import yaml
+
+release_path, ci_path = sys.argv[1:]
+release = yaml.safe_load(open(release_path, encoding="utf-8"))
+ci = yaml.safe_load(open(ci_path, encoding="utf-8"))
+# PyYAML 1.1 parses the key `on` as True.
+ci_on = ci.get("on", ci.get(True, {}))
+call = ci_on.get("workflow_call") if isinstance(ci_on, dict) else None
+assert isinstance(call, dict), "ci.yml is not a reusable workflow"
+assert call.get("inputs", {}).get("ref", {}).get("required") is True, "workflow_call.ref is not required"
+jobs = release.get("jobs", {})
+preflight = jobs["preflight"]
+assert preflight["steps"][0]["with"]["ref"] == "${{ env.RELEASE_TAG }}"
+assert jobs["gate"]["uses"] == "./.github/workflows/ci.yml"
+assert jobs["gate"]["with"]["ref"] == "${{ needs.preflight.outputs.sha }}"
+assert "gate" in jobs["build"]["needs"]
+assert "gate" in jobs["publish"]["needs"]
+assert release["permissions"]["contents"] == "read"
+assert jobs["publish"]["permissions"]["contents"] == "write"
+assert jobs["publish"]["steps"][-1]["with"]["tag_name"] == "${{ needs.preflight.outputs.tag }}"
+PY
+    then
+        fail "release workflow no longer binds and validates an exact tagged revision" \
+            "$release_workflow" \
+            "publication must depend on the complete reusable CI gate for that exact commit"
+    fi
+fi
+
+if [ -f scripts/package.sh ]; then
+    if ! grep -qF '*-windows-*) binary="supra.exe"' scripts/package.sh; then
+        fail "Windows packaging no longer selects supra.exe" \
+            "scripts/package.sh" \
+            "the Windows release target never emits an extensionless supra binary"
+    fi
+    if grep -qE 'sha256sum[[:space:]]+"?dist/' scripts/package.sh; then
+        fail "package checksum sidecars contain a dist/ path" \
+            "scripts/package.sh" \
+            "the installer verifies from an empty directory where only basenames exist"
+    fi
+fi
+
+if [ -f scripts/install.sh ]; then
+    if grep -qE 'SKIP_CHECKSUM|checksum only|no \.minisig|releases/latest' scripts/install.sh; then
+        fail "the installer still permits mutable, unsigned, or unchecked installation" \
+            "scripts/install.sh" \
+            "installation is the last trust boundary and must be tag-pinned and fail closed"
+    fi
+    if ! grep -qF 'python3' scripts/install.sh || ! grep -qF 'minisign -Vm' scripts/install.sh; then
+        fail "the installer no longer verifies the signed update manifest" \
+            "scripts/install.sh" \
+            "installation must authenticate the manifest before checking its archive and executable bindings"
+    fi
+fi
+
+if [ -f crates/supra_ffi/Cargo.toml ]; then
+    if ! grep -qF '"native/**"' crates/supra_ffi/Cargo.toml || \
+       ! grep -qF 'manifest_dir.join("native")' crates/supra_ffi/build.rs; then
+        fail "supra_ffi's registry archive does not own its native build inputs" \
+            "crates/supra_ffi/{Cargo.toml,build.rs}" \
+            "cargo package must compile without relying on files outside the crate archive"
+    fi
+    if ! grep -qF 'x86_64-linux-musl-g++' crates/supra_ffi/build.rs || \
+       ! grep -qF 'rustc-link-lib=static=stdc++' crates/supra_ffi/build.rs; then
+        fail "musl builds can select the host C++ compiler or dynamic runtime" \
+            "crates/supra_ffi/build.rs" \
+            "the release target must use a musl C++ compiler and static matching runtime"
+    fi
+fi
+
+if [ -f scripts/package-os.sh ]; then
+    if grep -qE 'rpm_header|cpio_entry|struct\.pack' scripts/package-os.sh; then
+        fail "Linux packaging contains a handwritten RPM encoder" \
+            "scripts/package-os.sh" \
+            "release formats must be emitted and validated by standard package tooling"
+    fi
+    if ! grep -qF '/usr/share/doc/supra/changelog.gz' scripts/package-os.sh || \
+       ! grep -qF '%license /usr/share/licenses/supra/LICENSE-APACHE' scripts/package-os.sh; then
+        fail "native Linux packages omit licence or changelog payloads" \
+            "scripts/package-os.sh" \
+            "installable packages must carry their legal and release documentation"
+    fi
+fi
+
+if [ -f scripts/sign-release.sh ]; then
+    if grep -qF 'skipping signatures' scripts/sign-release.sh; then
+        fail "official release signing can still silently skip" \
+            "scripts/sign-release.sh" \
+            "an unsigned artifact must not pass through the publication workflow"
+    fi
+    if ! grep -qF 'manifest.json' scripts/sign-release.sh; then
+        fail "release signing no longer authenticates update manifests" \
+            "scripts/sign-release.sh" \
+            "the signed canonical manifest is the trust root for the archive and executable binding"
+    fi
+fi
+
+if [ -f packaging/homebrew/supra.rb ] && grep -qF 'REPLACE_WITH_' packaging/homebrew/supra.rb; then
+    printf '%s\n' "invariants: Homebrew formula is a release template and is not installable yet" >&2
 fi
 
 # ---------------------------------------------------------------------------
@@ -2247,6 +2426,29 @@ if [ -d "$themesrc" ]; then
             "crates/supra_theme/src/banner.rs" \
             "a banner that assumes its own width is the first thing a narrow terminal scrolls off"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# Workspace publication policy
+#
+# Supra is released as one signed binary bundle. The crates are implementation
+# units, not independently versioned registry packages; allowing even a leaf
+# crate to default to publishable creates a partial graph that `cargo package`
+# cannot verify as a workspace and consumers cannot resolve consistently.
+# ---------------------------------------------------------------------------
+if [ -f Cargo.toml ]; then
+    cargo metadata --no-deps --format-version 1 2>/dev/null |
+        python3 -c '
+import json
+import sys
+
+packages = json.load(sys.stdin)["packages"]
+publishable = sorted(package["name"] for package in packages if package["publish"] != [])
+if publishable:
+    raise SystemExit("workspace packages unexpectedly publishable: " + ", ".join(publishable))
+' || fail "the monolithic workspace contains registry-publishable crates" \
+        "every package must declare publish = false" \
+        "release the signed supra binary bundle, not an incomplete internal crate graph"
 fi
 
 # ---------------------------------------------------------------------------

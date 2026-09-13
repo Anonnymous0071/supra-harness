@@ -7,22 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+publish = false
 
-# The C++ sources and headers are inputs to the build, and CMake caches the tree
-# under OUT_DIR. Listing them keeps a `cargo package` self-contained and makes
-# rebuild tracking explicit rather than relying on build.rs guessing.
+# The C++ sources and headers are inputs to the build. Owning the native tree
+# inside this crate keeps registry packages self-contained and gives the root
+# CMake build and Cargo one canonical source tree.
 include = [
     "src/**/*.rs",
     "build.rs",
     "abi_sizes.rs",
     "abi_check.cpp",
-    "../../cpp/**/*.cpp",
-    "../../cpp/**/*.hpp",
-    "../../cpp/**/*.h",
-    "../../cpp/**/CMakeLists.txt",
-    "../../cpp/**/data/**",
-    "../../cmake/**",
-    "../../CMakeLists.txt",
+    "native/**",
 ]
 
 [lints]

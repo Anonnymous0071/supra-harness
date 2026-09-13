@@ -120,17 +120,6 @@ pub(super) fn insert_vote(
     Ok(())
 }
 
-/// Remove a vote row, undoing an insert whose tally refused.
-pub(super) fn delete_vote(
-    tx: &rusqlite::Transaction<'_>,
-    claim: supra_types::ClaimId,
-    voter: supra_types::AgentId,
-) -> Result<(), supra_store::StoreError> {
-    tx.prepare_cached(&format!("DELETE FROM {VOTE_TABLE} WHERE claim_id = ?1 AND voter = ?2"))?
-        .execute(rusqlite::params![claim.to_string(), voter.to_string()])?;
-    Ok(())
-}
-
 /// One claim row as the board reads it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredClaim {

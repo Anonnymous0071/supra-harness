@@ -232,21 +232,17 @@ mod tests {
 
     #[test]
     fn reported_usage_overrides_the_estimate() {
-        let completion = supra_llm::Completion {
-            text: "ok".to_owned(),
-            usage: Some(supra_llm::Usage { input_tokens: 5_000, output_tokens: 40, cached_tokens: 4_000 }),
-            thinking: supra_llm::Thinking { budget_tokens: 0 },
-        };
+        let completion = supra_llm::Completion::end_turn(
+            "ok",
+            Some(supra_llm::Usage { input_tokens: 5_000, output_tokens: 40, cached_tokens: 4_000 }),
+            supra_llm::Thinking { budget_tokens: 0 },
+        );
         let measured = measure_reported("E1", "E1", &completion, 1_000);
         assert_eq!(measured.input_tokens, 5_000, "the provider's number wins");
         assert_eq!(measured.output_tokens, 40);
         assert!(measured.cache_hit);
 
-        let silent = supra_llm::Completion {
-            text: "ok".to_owned(),
-            usage: None,
-            thinking: supra_llm::Thinking { budget_tokens: 0 },
-        };
+        let silent = supra_llm::Completion::end_turn("ok", None, supra_llm::Thinking { budget_tokens: 0 });
         let estimated = measure_reported("E1", "E1", &silent, 1_000);
         assert_eq!(estimated.input_tokens, 1_000, "no report falls back to the estimate");
         assert!(!estimated.cache_hit, "absent usage is not a cache hit");
@@ -254,11 +250,11 @@ mod tests {
 
     #[test]
     fn measure_marks_a_cache_hit_from_usage() {
-        let completion = supra_llm::Completion {
-            text: "ok".to_owned(),
-            usage: Some(supra_llm::Usage { input_tokens: 1000, output_tokens: 50, cached_tokens: 900 }),
-            thinking: supra_llm::Thinking { budget_tokens: 0 },
-        };
+        let completion = supra_llm::Completion::end_turn(
+            "ok",
+            Some(supra_llm::Usage { input_tokens: 1000, output_tokens: 50, cached_tokens: 900 }),
+            supra_llm::Thinking { budget_tokens: 0 },
+        );
         let measured = measure("E1", "E1", &completion, 1000);
         assert!(measured.cache_hit);
         assert_eq!(measured.output_tokens, 50);

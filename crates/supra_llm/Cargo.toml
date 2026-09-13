@@ -17,7 +17,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true }
 async-openai = { workspace = true }
-anthropic_sdk = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 

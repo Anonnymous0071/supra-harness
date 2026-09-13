@@ -6,10 +6,7 @@ components = ["rustfmt", "clippy", "llvm-tools", "rust-src"]
 targets = [
     # Host.
     "x86_64-unknown-linux-gnu",
-    # T20 agent components. wasip2 is the component-model target the WIT ABI
-    # targets; wasip1 is retained as the fallback while component tooling
-    # stabilises.
+    # T20 agent components use the component-model target exercised by the build gate.
     "wasm32-wasip2",
-    "wasm32-wasip1",
 ]
 profile = "minimal"

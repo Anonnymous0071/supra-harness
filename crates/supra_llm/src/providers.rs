@@ -1,25 +1,20 @@
-//! One request, one response, through the official provider SDKs.
+//! One request, one response, through provider-native transports.
 //!
-//! The `Anthropic` path speaks the Messages API; the `OpenAI`
-//! path speaks the Chat Completions API. Both stream: the
-//! SDK owns the wire framing and the event parsing, and this crate
-//! accumulates text deltas plus usage into a [`Completion`], exactly as
-//! it did when the framing was hand-rolled. The policy layer
-//! ([`CachePolicy`](crate::CachePolicy)) is unchanged — the SDKs carry
-//! the cache fields the policy names, they do not decide them.
+//! The `Anthropic` path sends canonical Messages API bytes over rustls;
+//! the `OpenAI` path uses its official SDK's Chat Completions API. Both
+//! stream into the same lossless [`Completion`] contract. The policy layer
+//! ([`CachePolicy`](crate::CachePolicy)) owns cache shape and thinking policy;
+//! transports only send those decisions and classify failures.
 //!
-//! What the SDKs do *not* own: credential storage, retry policy, or the
-//! conversion from [`LlmError`](crate::LlmError) recoverability classes.
-//! An SDK error is mapped at the boundary into the variant the caller
-//! already matches on — [`Unauthorized`](crate::LlmError::Unauthorized),
+//! Credentials arrive per request and retry policy stays with the caller.
+//! Boundary failures are classified as [`Unauthorized`](crate::LlmError::Unauthorized),
 //! [`RateLimited`](crate::LlmError::RateLimited),
 //! [`Transport`](crate::LlmError::Transport), or
-//! [`BadResponse`](crate::LlmError::BadResponse) — so no caller changes.
+//! [`BadResponse`](crate::LlmError::BadResponse).
 
-use anthropic_sdk::types::{MessageContent, MessageParam, Role as AnthropicRole};
 use futures::StreamExt as _;
 
-use crate::client::{Completion, Request, Role, Thinking, Usage};
+use crate::client::{Completion, ContentBlock, Request, Role, StopReason, Thinking, Usage};
 use crate::error::LlmError;
 use crate::policy::ProviderKind;
 
@@ -29,145 +24,445 @@ pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 
 /// The Anthropic model used when the configuration pins none, and the one
 /// the live test exercises: the cheapest current Messages model.
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-haiku-20241022";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5-20251001";
 
-/// Send one Anthropic request through the official SDK and read the
+/// Send one Anthropic request as canonical Messages API bytes and read the
 /// streamed completion.
 ///
-/// `endpoint` overrides the API base (a custom gateway or a test
-/// double); `None` means the SDK default. The credential arrives per
-/// request and is never stored — the SDK holds it for the call only.
+/// `endpoint` overrides the API base (a custom gateway or test double);
+/// `None` selects `https://api.anthropic.com`. The credential arrives per
+/// request and is never stored.
 ///
 /// # Errors
 ///
 /// [`LlmError::Unauthorized`], [`LlmError::RateLimited`],
 /// [`LlmError::Transport`], or [`LlmError::BadResponse`], by
-/// recoverability rather than by SDK spelling.
+/// recoverability rather than by wire spelling.
+#[allow(clippy::too_many_lines, reason = "the lossless response conversion forms one boundary")]
 pub async fn send_anthropic(
+    http: reqwest::Client,
     request: &Request,
     endpoint: Option<&str>,
     model: &str,
     thinking: Thinking,
     credential: &supra_secrets::SecretString,
 ) -> Result<Completion, LlmError> {
-    use anthropic_sdk::config::ClientConfig;
+    let endpoint = anthropic_messages_endpoint(endpoint);
+    let body = anthropic_body(request, model)?;
+    let response = http
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("x-api-key", credential.expose())
+        .header("anthropic-version", "2023-06-01")
+        .body(body.as_str().to_owned())
+        .send()
+        .await
+        .map_err(|error| LlmError::Transport {
+            provider: ProviderKind::Anthropic.name().to_owned(),
+            detail: error.to_string(),
+        })?;
 
-    let mut config = ClientConfig::new(credential.expose());
-    if let Some(base) = endpoint {
-        config.base_url = base.to_owned();
-    }
-    let client = anthropic_sdk::client::Anthropic::with_config(config).map_err(|error| {
-        LlmError::Transport { provider: ProviderKind::Anthropic.name().to_owned(), detail: error.to_string() }
-    })?;
-
-    let messages: Vec<MessageParam> = request
-        .messages
-        .iter()
-        .map(|message| MessageParam {
-            role: match message.role {
-                Role::User => AnthropicRole::User,
-                Role::Assistant => AnthropicRole::Assistant,
-            },
-            content: MessageContent::Text(message.content.clone()),
-        })
-        .collect();
-
-    let params = anthropic_sdk::types::MessageCreateParams {
-        model: model.to_owned(),
-        max_tokens: 32_000,
-        messages,
-        system: None,
-        temperature: None,
-        top_p: None,
-        top_k: None,
-        stop_sequences: None,
-        stream: None,
-        tools: tools_value(request)?,
-        tool_choice: None,
-        metadata: None,
-    };
-
-    let stream = client.messages().stream(params).await.map_err(map_anthropic)?;
-    let message = stream.final_message().await.map_err(map_anthropic)?;
-
-    let mut text = String::new();
-    for block in &message.content {
-        if let anthropic_sdk::types::ContentBlock::Text { text: part } = block {
-            text.push_str(part);
-        }
-    }
-    let usage = Some(Usage {
-        input_tokens: u64::from(message.usage.input_tokens),
-        output_tokens: u64::from(message.usage.output_tokens),
-        cached_tokens: u64::from(message.usage.cache_read_input_tokens.unwrap_or(0)),
-    });
-    Ok(Completion { text, usage, thinking })
-}
-
-/// Convert canonical tool definitions into the SDK's tool shape.
-///
-/// A definition that does not parse is skipped, not refused: the
-/// canonical layer guarantees shape, so a failure here is a layering
-/// defect worth degrading rather than a request worth dropping.
-fn tools_value(request: &Request) -> Result<Option<Vec<anthropic_sdk::types::Tool>>, LlmError> {
-    if request.tools.is_empty() {
-        return Ok(None);
-    }
-    let mut tools = Vec::new();
-    for tool in &request.tools {
-        let parsed: serde_json::Value =
-            serde_json::from_str(tool.as_str()).map_err(|error| LlmError::BadResponse {
-                provider: ProviderKind::Anthropic.name().to_owned(),
-                detail: format!("tool definition is not JSON: {error}"),
-            })?;
-        let name = parsed.get("name").and_then(serde_json::Value::as_str).unwrap_or("tool").to_owned();
-        let description =
-            parsed.get("description").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
-        let properties = parsed
-            .get("input_schema")
-            .and_then(|schema| schema.get("properties"))
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        tools.push(anthropic_sdk::types::Tool {
-            name,
-            description,
-            input_schema: anthropic_sdk::types::ToolInputSchema {
-                schema_type: "object".to_owned(),
-                properties,
-                required: Vec::new(),
-                additional: serde_json::Map::new(),
-            },
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(LlmError::Unauthorized {
+            provider: ProviderKind::Anthropic.name().to_owned(),
+            detail: format!("HTTP {status}"),
         });
     }
-    Ok(Some(tools))
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(LlmError::RateLimited {
+            provider: ProviderKind::Anthropic.name().to_owned(),
+            retry_after_ms: provider_retry_after_ms(response.headers()),
+        });
+    }
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(LlmError::BadResponse {
+            provider: ProviderKind::Anthropic.name().to_owned(),
+            detail: format!("HTTP {status}: {detail}"),
+        });
+    }
+    read_anthropic_sse(response, thinking).await
 }
 
-/// Map an Anthropic SDK failure into the caller's recoverability class.
-///
-/// Authentication and permission failures are never retried; rate
-/// limits carry the documented 60 s default (the SDK does not surface a
-/// `retry-after` value); transport failures stay retryable; everything
-/// else is a response the client cannot use.
-fn map_anthropic(error: anthropic_sdk::types::AnthropicError) -> LlmError {
-    use anthropic_sdk::types::AnthropicError as Sdk;
+fn anthropic_messages_endpoint(base: Option<&str>) -> String {
+    let base = base.unwrap_or("https://api.anthropic.com").trim_end_matches('/');
+    if base.ends_with("/v1/messages") { base.to_owned() } else { format!("{base}/v1/messages") }
+}
 
-    let provider = ProviderKind::Anthropic.name().to_owned();
-    match error {
-        Sdk::Authentication { message, .. } | Sdk::PermissionDenied { message, .. } => {
-            LlmError::Unauthorized { provider, detail: message }
-        }
-        Sdk::InvalidApiKey => LlmError::Unauthorized { provider, detail: "invalid credential".to_owned() },
-        Sdk::RateLimit { .. } => LlmError::RateLimited { provider, retry_after_ms: 60_000 },
-        Sdk::Connection { message } | Sdk::NetworkError(message) => {
-            LlmError::Transport { provider, detail: message }
-        }
-        Sdk::ConnectionTimeout | Sdk::Timeout => {
-            LlmError::Transport { provider, detail: "the request timed out".to_owned() }
-        }
-        Sdk::StreamError(detail) => LlmError::BadResponse { provider, detail },
-        other => LlmError::BadResponse { provider, detail: other.to_string() },
+fn anthropic_body(request: &Request, model: &str) -> Result<supra_types::CanonicalJson, LlmError> {
+    let renderer = crate::client::Client::new(
+        ProviderKind::Anthropic.name(),
+        String::new(),
+        model.to_owned(),
+        request.thinking.budget_tokens,
+    )?;
+    renderer.render_body(request).map_err(|error| LlmError::BadResponse {
+        provider: ProviderKind::Anthropic.name().to_owned(),
+        detail: format!("request body is not canonical: {error}"),
+    })
+}
+
+const MAX_ANTHROPIC_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ANTHROPIC_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_ANTHROPIC_BLOCKS: usize = 4096;
+
+fn provider_retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
+    if let Some(seconds) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return seconds.saturating_mul(1_000);
     }
+    headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(60_000)
+}
+
+#[derive(Debug)]
+enum AnthropicBlock {
+    Text { text: String, citations: Vec<serde_json::Value> },
+    Thinking { thinking: String, signature: String },
+    RedactedThinking { data: String },
+    ToolUse { id: String, name: String, input: serde_json::Value, partial_json: String },
+    Unknown { raw: serde_json::Value, partial_json: String },
+}
+
+impl AnthropicBlock {
+    fn start(raw: serde_json::Value) -> Self {
+        let kind = raw.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let string =
+            |name: &str| raw.get(name).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        match kind {
+            "text" => Self::Text {
+                text: string("text"),
+                citations: raw
+                    .get("citations")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            },
+            "thinking" => Self::Thinking { thinking: string("thinking"), signature: string("signature") },
+            "redacted_thinking" => Self::RedactedThinking { data: string("data") },
+            "tool_use" => Self::ToolUse {
+                id: string("id"),
+                name: string("name"),
+                input: raw.get("input").cloned().unwrap_or(serde_json::Value::Null),
+                partial_json: String::new(),
+            },
+            _ => Self::Unknown { raw, partial_json: String::new() },
+        }
+    }
+
+    fn apply_delta(&mut self, delta: &serde_json::Value) -> Result<(), String> {
+        let kind = delta.get("type").and_then(serde_json::Value::as_str).unwrap_or_default();
+        match (self, kind) {
+            (Self::Text { text, .. }, "text_delta") => {
+                text.push_str(delta.get("text").and_then(serde_json::Value::as_str).unwrap_or_default());
+            }
+            (Self::Text { citations, .. }, "citations_delta" | "citation_delta") => {
+                if let Some(citation) = delta.get("citation") {
+                    citations.push(citation.clone());
+                }
+            }
+            (Self::Thinking { thinking, .. }, "thinking_delta") => {
+                thinking
+                    .push_str(delta.get("thinking").and_then(serde_json::Value::as_str).unwrap_or_default());
+            }
+            (Self::Thinking { signature, .. }, "signature_delta") => {
+                signature
+                    .push_str(delta.get("signature").and_then(serde_json::Value::as_str).unwrap_or_default());
+            }
+            (Self::ToolUse { partial_json, .. } | Self::Unknown { partial_json, .. }, "input_json_delta") => {
+                partial_json.push_str(
+                    delta.get("partial_json").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                );
+            }
+            (block, _) => {
+                return Err(format!("{kind} delta does not match {} block", block.kind()));
+            }
+        }
+        Ok(())
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Text { .. } => "text",
+            Self::Thinking { .. } => "thinking",
+            Self::RedactedThinking { .. } => "redacted_thinking",
+            Self::ToolUse { .. } => "tool_use",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+
+    fn finish(self) -> Result<ContentBlock, String> {
+        Ok(match self {
+            Self::Text { text, citations } => ContentBlock::Text { text, citations },
+            Self::Thinking { thinking, signature } => ContentBlock::Thinking { thinking, signature },
+            Self::RedactedThinking { data } => ContentBlock::RedactedThinking { data },
+            Self::ToolUse { id, name, input, partial_json } => {
+                let input = if partial_json.is_empty() {
+                    input
+                } else {
+                    serde_json::from_str(&partial_json)
+                        .map_err(|error| format!("tool input JSON is invalid: {error}"))?
+                };
+                ContentBlock::ToolUse { id, name, input }
+            }
+            Self::Unknown { mut raw, partial_json } => {
+                if !partial_json.is_empty() {
+                    raw["input"] = serde_json::from_str(&partial_json)
+                        .map_err(|error| format!("unknown block input JSON is invalid: {error}"))?;
+                }
+                ContentBlock::Unknown { raw }
+            }
+        })
+    }
+}
+
+#[derive(Default)]
+struct AnthropicStream {
+    open: std::collections::BTreeMap<u32, AnthropicBlock>,
+    complete: std::collections::BTreeMap<u32, ContentBlock>,
+    stop_reason: Option<StopReason>,
+    stop_sequence: Option<String>,
+    model: String,
+    request_id: Option<String>,
+    usage: Option<Usage>,
+    saw_message_stop: bool,
+}
+
+impl AnthropicStream {
+    fn event(&mut self, event: &serde_json::Value) -> Result<(), String> {
+        match event.get("type").and_then(serde_json::Value::as_str).unwrap_or_default() {
+            "message_start" => {
+                let message = event.get("message").ok_or("message_start has no message")?;
+                message
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .clone_into(&mut self.model);
+                self.request_id = message.get("id").and_then(serde_json::Value::as_str).map(str::to_owned);
+                self.merge_usage(message);
+                if let Some(blocks) = message.get("content").and_then(serde_json::Value::as_array) {
+                    for (index, block) in blocks.iter().cloned().enumerate() {
+                        let index = u32::try_from(index).map_err(|error| error.to_string())?;
+                        self.insert_complete(index, AnthropicBlock::start(block).finish()?)?;
+                    }
+                }
+            }
+            "content_block_start" => {
+                let index = event_index(event)?;
+                if self.open.contains_key(&index) || self.complete.contains_key(&index) {
+                    return Err(format!("duplicate content block index {index}"));
+                }
+                self.ensure_block_capacity()?;
+                let raw = event.get("content_block").cloned().ok_or("content_block_start has no block")?;
+                self.open.insert(index, AnthropicBlock::start(raw));
+            }
+            "content_block_delta" => {
+                let index = event_index(event)?;
+                let delta = event.get("delta").ok_or("content_block_delta has no delta")?;
+                self.open
+                    .get_mut(&index)
+                    .ok_or_else(|| format!("delta for unopened block {index}"))?
+                    .apply_delta(delta)?;
+            }
+            "content_block_stop" => {
+                let index = event_index(event)?;
+                let block =
+                    self.open.remove(&index).ok_or_else(|| format!("stop for unopened block {index}"))?;
+                self.insert_complete(index, block.finish()?)?;
+            }
+            "message_delta" => {
+                let delta = event.get("delta").ok_or("message_delta has no delta")?;
+                if let Some(reason) = delta.get("stop_reason").and_then(serde_json::Value::as_str) {
+                    self.stop_reason = Some(anthropic_stop_reason(reason));
+                }
+                self.stop_sequence =
+                    delta.get("stop_sequence").and_then(serde_json::Value::as_str).map(str::to_owned);
+                self.merge_usage(event);
+            }
+            "message_stop" => self.saw_message_stop = true,
+            "ping" => {}
+            "error" => {
+                return Err(event
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("the provider sent an error event")
+                    .to_owned());
+            }
+            kind => return Err(format!("unknown Anthropic stream event {kind:?}")),
+        }
+        Ok(())
+    }
+
+    fn ensure_block_capacity(&self) -> Result<(), String> {
+        if self.open.len().saturating_add(self.complete.len()) >= MAX_ANTHROPIC_BLOCKS {
+            Err(format!("stream exceeds {MAX_ANTHROPIC_BLOCKS} content blocks"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn insert_complete(&mut self, index: u32, block: ContentBlock) -> Result<(), String> {
+        self.ensure_block_capacity()?;
+        if self.complete.insert(index, block).is_some() {
+            return Err(format!("duplicate content block index {index}"));
+        }
+        Ok(())
+    }
+
+    fn merge_usage(&mut self, value: &serde_json::Value) {
+        let Some(reported) = value.get("usage") else { return };
+        let usage = self.usage.get_or_insert_with(Usage::default);
+        if let Some(input) = reported.get("input_tokens").and_then(serde_json::Value::as_u64) {
+            usage.input_tokens = input;
+        }
+        if let Some(output) = reported.get("output_tokens").and_then(serde_json::Value::as_u64) {
+            usage.output_tokens = output;
+        }
+        if let Some(cached) = reported.get("cache_read_input_tokens").and_then(serde_json::Value::as_u64) {
+            usage.cached_tokens = cached;
+        }
+    }
+}
+
+fn event_index(event: &serde_json::Value) -> Result<u32, String> {
+    let index = event.get("index").and_then(serde_json::Value::as_u64).ok_or("stream event has no index")?;
+    u32::try_from(index).map_err(|_| format!("content block index {index} exceeds u32"))
+}
+
+fn anthropic_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "end_turn" => StopReason::EndTurn,
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::MaxTokens,
+        "stop_sequence" => StopReason::StopSequence,
+        "pause_turn" => StopReason::PauseTurn,
+        "refusal" => StopReason::Refusal,
+        "model_context_window_exceeded" => StopReason::ModelContextWindowExceeded,
+        other => StopReason::Other(other.to_owned()),
+    }
+}
+
+async fn read_anthropic_sse(response: reqwest::Response, thinking: Thinking) -> Result<Completion, LlmError> {
+    let provider = ProviderKind::Anthropic.name().to_owned();
+    let header_request_id = response
+        .headers()
+        .get("request-id")
+        .or_else(|| response.headers().get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut received = 0usize;
+    let mut state = AnthropicStream::default();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| LlmError::Transport { provider: provider.clone(), detail: error.to_string() })?;
+        received = received.saturating_add(chunk.len());
+        if received > MAX_ANTHROPIC_STREAM_BYTES {
+            return Err(LlmError::BadResponse {
+                provider,
+                detail: format!("stream exceeds {MAX_ANTHROPIC_STREAM_BYTES} bytes"),
+            });
+        }
+        buffer.extend_from_slice(&chunk);
+        while let Some(end) = find_sse_event_end(&buffer) {
+            if end > MAX_ANTHROPIC_EVENT_BYTES {
+                return Err(LlmError::BadResponse {
+                    provider,
+                    detail: format!("SSE event exceeds {MAX_ANTHROPIC_EVENT_BYTES} bytes"),
+                });
+            }
+            let event: Vec<u8> = buffer.drain(..end).collect();
+            if let Some(payload) = sse_payload(&event)
+                .map_err(|detail| LlmError::BadResponse { provider: provider.clone(), detail })?
+            {
+                if payload == "[DONE]" {
+                    state.saw_message_stop = true;
+                } else {
+                    let json: serde_json::Value =
+                        serde_json::from_str(payload).map_err(|error| LlmError::BadResponse {
+                            provider: provider.clone(),
+                            detail: format!("event is not JSON: {error}"),
+                        })?;
+                    state
+                        .event(&json)
+                        .map_err(|detail| LlmError::BadResponse { provider: provider.clone(), detail })?;
+                }
+            }
+        }
+        if buffer.len() > MAX_ANTHROPIC_EVENT_BYTES {
+            return Err(LlmError::BadResponse {
+                provider,
+                detail: format!("SSE event exceeds {MAX_ANTHROPIC_EVENT_BYTES} bytes"),
+            });
+        }
+    }
+
+    if !buffer.iter().all(u8::is_ascii_whitespace) {
+        return Err(LlmError::BadResponse {
+            provider,
+            detail: "stream ended inside an SSE event".to_owned(),
+        });
+    }
+    if !state.saw_message_stop {
+        return Err(LlmError::BadResponse {
+            provider,
+            detail: "stream ended before message_stop".to_owned(),
+        });
+    }
+    if !state.open.is_empty() {
+        return Err(LlmError::BadResponse {
+            provider,
+            detail: "stream ended with an open content block".to_owned(),
+        });
+    }
+    let stop_reason = state.stop_reason.ok_or_else(|| LlmError::BadResponse {
+        provider: provider.clone(),
+        detail: "message_stop arrived without a stop_reason".to_owned(),
+    })?;
+    let request_id = header_request_id.or(state.request_id);
+    Ok(Completion {
+        content: state.complete.into_values().collect(),
+        stop_reason,
+        stop_sequence: state.stop_sequence,
+        model: state.model,
+        request_id,
+        usage: state.usage,
+        thinking,
+    })
+}
+
+fn find_sse_event_end(buffer: &[u8]) -> Option<usize> {
+    let unix = buffer.windows(2).position(|pair| pair == b"\n\n").map(|at| at + 2);
+    let windows = buffer.windows(4).position(|part| part == b"\r\n\r\n").map(|at| at + 4);
+    match (unix, windows) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn sse_payload(event: &[u8]) -> Result<Option<&str>, String> {
+    let text = std::str::from_utf8(event).map_err(|error| format!("SSE event is not UTF-8: {error}"))?;
+    let mut data = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("data:") {
+            if data.is_some() {
+                return Err("SSE event has multiple data lines".to_owned());
+            }
+            data = Some(value.trim());
+        }
+    }
+    Ok(data)
 }
 
 /// Send one `OpenAI` request through the official SDK.
@@ -195,7 +490,7 @@ pub async fn send_openai(
     let client = openai_client(endpoint, credential);
     let sdk_request = openai_request(request, model, prompt_cache_key)?;
     match client.chat().create(sdk_request.clone()).await {
-        Ok(response) => Ok(blocking_completion(response, thinking)),
+        Ok(response) => blocking_completion(response, thinking),
         Err(error) if blocks_streaming(&error) => stream_openai(&client, sdk_request, thinking).await,
         Err(error) => Err(map_openai(&error)),
     }
@@ -237,35 +532,15 @@ fn openai_request(
     model: &str,
     prompt_cache_key: Option<&str>,
 ) -> Result<async_openai::types::chat::CreateChatCompletionRequest, LlmError> {
-    use async_openai::types::chat::{
-        ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
-    };
+    use async_openai::types::chat::CreateChatCompletionRequest;
 
-    let messages: Vec<ChatCompletionRequestMessage> = request
+    let messages = request
         .messages
         .iter()
-        .map(|message| match message.role {
-            Role::User => ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Text(message.content.clone()),
-                name: None,
-            }),
-            Role::Assistant => ChatCompletionRequestMessage::Assistant(
-                async_openai::types::chat::ChatCompletionRequestAssistantMessage {
-                    content: Some(
-                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContent::Text(
-                            message.content.clone(),
-                        ),
-                    ),
-                    refusal: None,
-                    name: None,
-                    audio: None,
-                    tool_calls: None,
-                    #[allow(deprecated)]
-                    function_call: None,
-                },
-            ),
-        })
+        .map(openai_message)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .collect();
 
     let sdk_request = CreateChatCompletionRequest {
@@ -286,6 +561,129 @@ fn openai_request(
     Ok(sdk_request)
 }
 
+fn openai_message(
+    message: &crate::client::Message,
+) -> Result<Vec<async_openai::types::chat::ChatCompletionRequestMessage>, LlmError> {
+    match message.role {
+        Role::Assistant => Ok(vec![openai_assistant_message(message)?]),
+        Role::User => openai_user_messages(message),
+    }
+}
+
+fn openai_assistant_message(
+    message: &crate::client::Message,
+) -> Result<async_openai::types::chat::ChatCompletionRequestMessage, LlmError> {
+    use async_openai::types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage, FunctionCall,
+    };
+
+    let mut tool_calls = Vec::new();
+    let mut text = String::new();
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { text: part, citations } if citations.is_empty() => text.push_str(part),
+            ContentBlock::ToolUse { id, name, input } => {
+                let arguments = canonical_tool_value(input)?.as_str().to_owned();
+                tool_calls.push(ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                    id: id.clone(),
+                    function: FunctionCall { name: name.clone(), arguments },
+                }));
+            }
+            block => return Err(non_replayable_openai_block("assistant", block)),
+        }
+    }
+    if text.is_empty() && tool_calls.is_empty() {
+        return Err(empty_openai_message("assistant"));
+    }
+    Ok(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+        content: (!text.is_empty()).then_some(ChatCompletionRequestAssistantMessageContent::Text(text)),
+        refusal: None,
+        name: None,
+        audio: None,
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+        #[allow(deprecated)]
+        function_call: None,
+    }))
+}
+
+fn openai_user_messages(
+    message: &crate::client::Message,
+) -> Result<Vec<async_openai::types::chat::ChatCompletionRequestMessage>, LlmError> {
+    use async_openai::types::chat::{
+        ChatCompletionRequestMessage, ChatCompletionRequestToolMessage,
+        ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent,
+    };
+
+    let mut messages = Vec::new();
+    let mut text = String::new();
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { text: part, citations } if citations.is_empty() => text.push_str(part),
+            ContentBlock::ToolResult { tool_use_id, content, is_error: _ } => {
+                if !text.is_empty() {
+                    messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text(std::mem::take(&mut text)),
+                        name: None,
+                    }));
+                }
+                messages.push(ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+                    content: ChatCompletionRequestToolMessageContent::Text(tool_result_text(content)?),
+                    tool_call_id: tool_use_id.clone(),
+                }));
+            }
+            block => return Err(non_replayable_openai_block("user", block)),
+        }
+    }
+    if !text.is_empty() {
+        messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(text),
+            name: None,
+        }));
+    }
+    if messages.is_empty() {
+        return Err(empty_openai_message("user"));
+    }
+    Ok(messages)
+}
+
+fn non_replayable_openai_block(role: &str, block: &ContentBlock) -> LlmError {
+    let kind = match block {
+        ContentBlock::Text { .. } => "text with citations",
+        ContentBlock::Thinking { .. } => "thinking",
+        ContentBlock::RedactedThinking { .. } => "redacted thinking",
+        ContentBlock::ToolUse { .. } => "tool use",
+        ContentBlock::ToolResult { .. } => "tool result",
+        ContentBlock::Unknown { .. } => "unknown",
+    };
+    LlmError::BadResponse {
+        provider: ProviderKind::OpenAI.name().to_owned(),
+        detail: format!("cannot replay {kind} block in an OpenAI {role} message"),
+    }
+}
+
+fn empty_openai_message(role: &str) -> LlmError {
+    LlmError::BadResponse {
+        provider: ProviderKind::OpenAI.name().to_owned(),
+        detail: format!("cannot replay an empty OpenAI {role} message"),
+    }
+}
+
+fn canonical_tool_value(value: &serde_json::Value) -> Result<supra_types::CanonicalJson, LlmError> {
+    crate::canonicalize_value(value).map_err(|error| LlmError::BadResponse {
+        provider: ProviderKind::OpenAI.name().to_owned(),
+        detail: format!("tool value is not canonical JSON: {error}"),
+    })
+}
+
+fn tool_result_text(content: &serde_json::Value) -> Result<String, LlmError> {
+    match content {
+        serde_json::Value::String(text) => Ok(text.clone()),
+        value => Ok(canonical_tool_value(value)?.as_str().to_owned()),
+    }
+}
+
 /// Read one blocking `OpenAI` answer into a [`Completion`].
 ///
 /// The first choice carries the answer; usage rides the top level.
@@ -295,19 +693,68 @@ fn openai_request(
 fn blocking_completion(
     response: async_openai::types::chat::CreateChatCompletionResponse,
     thinking: Thinking,
-) -> Completion {
-    let mut text = String::new();
+) -> Result<Completion, LlmError> {
+    if response.choices.is_empty() {
+        return Err(LlmError::BadResponse {
+            provider: ProviderKind::OpenAI.name().to_owned(),
+            detail: "the response contained no choices".to_owned(),
+        });
+    }
+    let mut content = Vec::new();
+    let mut stop_reason = StopReason::EndTurn;
     for choice in &response.choices {
         if let Some(part) = &choice.message.content {
-            text.push_str(part);
+            content.push(ContentBlock::text(part.clone()));
+        }
+        if let Some(tool_calls) = &choice.message.tool_calls {
+            content.extend(tool_calls.iter().map(openai_tool_call));
+        }
+        if let Some(reason) = choice.finish_reason {
+            stop_reason = openai_stop_reason(reason);
         }
     }
     let usage = response.usage.map(|reported| Usage {
         input_tokens: u64::from(reported.prompt_tokens),
         output_tokens: u64::from(reported.completion_tokens),
-        cached_tokens: 0,
+        cached_tokens: reported
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens)
+            .map_or(0, u64::from),
     });
-    Completion { text, usage, thinking }
+    Ok(Completion {
+        content,
+        stop_reason,
+        stop_sequence: None,
+        model: response.model,
+        request_id: Some(response.id),
+        usage,
+        thinking,
+    })
+}
+
+fn openai_tool_call(call: &async_openai::types::chat::ChatCompletionMessageToolCalls) -> ContentBlock {
+    match call {
+        async_openai::types::chat::ChatCompletionMessageToolCalls::Function(call) => {
+            let input = serde_json::from_str(&call.function.arguments)
+                .unwrap_or_else(|_| serde_json::Value::String(call.function.arguments.clone()));
+            ContentBlock::ToolUse { id: call.id.clone(), name: call.function.name.clone(), input }
+        }
+        async_openai::types::chat::ChatCompletionMessageToolCalls::Custom(call) => ContentBlock::ToolUse {
+            id: call.id.clone(),
+            name: call.custom_tool.name.clone(),
+            input: serde_json::Value::String(call.custom_tool.input.clone()),
+        },
+    }
+}
+
+fn openai_stop_reason(reason: async_openai::types::chat::FinishReason) -> StopReason {
+    match reason {
+        async_openai::types::chat::FinishReason::Stop => StopReason::EndTurn,
+        async_openai::types::chat::FinishReason::Length => StopReason::MaxTokens,
+        async_openai::types::chat::FinishReason::ToolCalls
+        | async_openai::types::chat::FinishReason::FunctionCall => StopReason::ToolUse,
+        async_openai::types::chat::FinishReason::ContentFilter => StopReason::ContentFilter,
+    }
 }
 
 /// Whether a blocking-call failure is worth retrying as a stream.
@@ -338,37 +785,74 @@ async fn stream_openai(
 ) -> Result<Completion, LlmError> {
     let mut stream = client.chat().create_stream(sdk_request).await.map_err(|error| map_openai(&error))?;
 
-    let mut text = String::new();
+    let mut content = Vec::new();
+    let mut tool_calls = std::collections::BTreeMap::<u32, OpenAiToolCall>::new();
     let mut usage: Option<Usage> = None;
-    let mut terminal = false;
+    let mut stop_reason = None;
+    let mut model = String::new();
+    let mut request_id = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| map_openai(&error))?;
+        model.clone_from(&chunk.model);
+        request_id = Some(chunk.id.clone());
         for choice in &chunk.choices {
             if let Some(part) = &choice.delta.content {
-                text.push_str(part);
+                content.push(ContentBlock::text(part.clone()));
             }
-            if choice.finish_reason.is_some() {
-                terminal = true;
+            if let Some(deltas) = &choice.delta.tool_calls {
+                for delta in deltas {
+                    let call = tool_calls.entry(delta.index).or_default();
+                    if let Some(id) = &delta.id {
+                        call.id.clone_from(id);
+                    }
+                    if let Some(function) = &delta.function {
+                        if let Some(name) = &function.name {
+                            call.name.push_str(name);
+                        }
+                        if let Some(arguments) = &function.arguments {
+                            call.arguments.push_str(arguments);
+                        }
+                    }
+                }
+            }
+            if let Some(reason) = choice.finish_reason {
+                stop_reason = Some(openai_stop_reason(reason));
             }
         }
         if let Some(reported) = &chunk.usage {
             usage = Some(Usage {
                 input_tokens: u64::from(reported.prompt_tokens),
                 output_tokens: u64::from(reported.completion_tokens),
-                cached_tokens: 0,
+                cached_tokens: reported
+                    .prompt_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens)
+                    .map_or(0, u64::from),
             });
         }
     }
 
-    if !terminal {
-        let detail = if text.is_empty() {
+    let Some(stop_reason) = stop_reason else {
+        let detail = if content.is_empty() {
             "the stream ended with no events".to_owned()
         } else {
             "the stream ended before a terminal marker".to_owned()
         };
         return Err(LlmError::BadResponse { provider: ProviderKind::OpenAI.name().to_owned(), detail });
-    }
-    Ok(Completion { text, usage, thinking })
+    };
+    content.extend(tool_calls.into_values().map(|call| {
+        let input =
+            serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::String(call.arguments));
+        ContentBlock::ToolUse { id: call.id, name: call.name, input }
+    }));
+    Ok(Completion { content, stop_reason, stop_sequence: None, model, request_id, usage, thinking })
+}
+
+#[derive(Default)]
+struct OpenAiToolCall {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 /// The reasoning effort for a request: `medium` when thinking is on,
@@ -431,6 +915,8 @@ fn map_openai(error: &async_openai::error::OpenAIError) -> LlmError {
                 LlmError::Unauthorized { provider, detail }
             } else if status == 429 {
                 LlmError::RateLimited { provider, retry_after_ms: 60_000 }
+            } else if (400..500).contains(&status) {
+                LlmError::BadResponse { provider, detail: format!("HTTP {status}: {detail}") }
             } else {
                 LlmError::Transport { provider, detail: format!("HTTP {status}: {detail}") }
             }
@@ -456,11 +942,39 @@ mod tests {
         Request {
             provider,
             model: "m".to_owned(),
-            messages: vec![crate::client::Message { role: Role::User, content: "hi".to_owned() }],
+            messages: vec![crate::client::Message::text(Role::User, "hi")],
             tools: Vec::new(),
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
         }
+    }
+
+    fn sample_blocking_response(
+        choices: Vec<async_openai::types::chat::ChatChoice>,
+        usage: Option<async_openai::types::chat::CompletionUsage>,
+    ) -> async_openai::types::chat::CreateChatCompletionResponse {
+        async_openai::types::chat::CreateChatCompletionResponse {
+            id: "chatcmpl-test".to_owned(),
+            choices,
+            created: 0,
+            model: "m".to_owned(),
+            service_tier: None,
+            #[allow(deprecated)]
+            system_fingerprint: None,
+            object: "chat.completion".to_owned(),
+            usage,
+            metadata: None,
+            moderation: None,
+        }
+    }
+
+    #[test]
+    fn empty_openai_choices_are_a_bad_response() {
+        let error =
+            blocking_completion(sample_blocking_response(Vec::new(), None), Thinking { budget_tokens: 0 })
+                .expect_err("an empty choice list is not a successful answer");
+        assert!(matches!(error, LlmError::BadResponse { .. }), "{error}");
+        assert!(error.to_string().contains("no choices"), "{error}");
     }
 
     #[test]
@@ -471,14 +985,187 @@ mod tests {
         assert!(reasoning_effort(&thinking).is_some());
 
         let anthropic = sample_request(ProviderKind::Anthropic);
-        assert!(tools_value(&anthropic).expect("no tools").is_none());
         assert!(openai_tools(&anthropic).expect("no tools").is_none());
+        let body = anthropic_body(&anthropic, DEFAULT_ANTHROPIC_MODEL).expect("body renders");
+        assert!(!body.as_str().contains("\"tools\""), "{}", body.as_str());
+    }
+
+    #[test]
+    fn anthropic_preserves_complete_tool_schemas() {
+        let request = Request {
+            tools: vec![crate::canonicalize(
+                r#"{"description":"lookup","input_schema":{"additionalProperties":false,"properties":{"query":{"minLength":1,"type":"string"}},"required":["query"],"type":"object"},"name":"lookup"}"#,
+            )
+            .expect("canonical tool")],
+            ..sample_request(ProviderKind::Anthropic)
+        };
+
+        let body = anthropic_body(&request, DEFAULT_ANTHROPIC_MODEL).expect("body renders");
+        let parsed: serde_json::Value = serde_json::from_str(body.as_str()).expect("body is JSON");
+        let schema = &parsed["tools"][0]["input_schema"];
+        assert_eq!(schema["required"], serde_json::json!(["query"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["query"]["minLength"], 1);
+    }
+
+    #[test]
+    fn provider_stop_reasons_remain_distinct() {
+        assert_eq!(anthropic_stop_reason("end_turn"), StopReason::EndTurn);
+        assert_eq!(anthropic_stop_reason("tool_use"), StopReason::ToolUse);
+        assert_eq!(anthropic_stop_reason("max_tokens"), StopReason::MaxTokens);
+        assert_eq!(anthropic_stop_reason("pause_turn"), StopReason::PauseTurn);
+        assert_eq!(anthropic_stop_reason("refusal"), StopReason::Refusal);
+        assert_eq!(
+            openai_stop_reason(async_openai::types::chat::FinishReason::Length),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            openai_stop_reason(async_openai::types::chat::FinishReason::ToolCalls),
+            StopReason::ToolUse
+        );
+    }
+
+    #[test]
+    fn openai_replays_tool_calls_and_results_without_losing_ids_or_order() {
+        let request = Request {
+            messages: vec![
+                crate::client::Message::text(Role::User, "inspect"),
+                crate::client::Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::text("checking"),
+                        ContentBlock::ToolUse {
+                            id: "call_b".to_owned(),
+                            name: "lookup".to_owned(),
+                            input: serde_json::json!({"z": 2, "a": 1}),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call_a".to_owned(),
+                            name: "read".to_owned(),
+                            input: serde_json::json!({"path": "x"}),
+                        },
+                    ],
+                },
+                crate::client::Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call_b".to_owned(),
+                            content: serde_json::json!({"z": 2, "a": 1}),
+                            is_error: false,
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call_a".to_owned(),
+                            content: serde_json::Value::String("done".to_owned()),
+                            is_error: false,
+                        },
+                    ],
+                },
+            ],
+            ..sample_request(ProviderKind::OpenAI)
+        };
+
+        let rendered = openai_request(&request, "m", None).expect("request renders");
+        let wire = serde_json::to_value(rendered).expect("SDK request serializes");
+        assert_eq!(wire["messages"].as_array().expect("messages").len(), 4);
+        assert_eq!(wire["messages"][1]["content"], "checking");
+        assert_eq!(wire["messages"][1]["tool_calls"][0]["id"], "call_b");
+        assert_eq!(wire["messages"][1]["tool_calls"][0]["function"]["arguments"], "{\"a\":1,\"z\":2}");
+        assert_eq!(wire["messages"][1]["tool_calls"][1]["id"], "call_a");
+        assert_eq!(
+            wire["messages"][2],
+            serde_json::json!({
+                "role": "tool",
+                "content": "{\"a\":1,\"z\":2}",
+                "tool_call_id": "call_b",
+            })
+        );
+        assert_eq!(
+            wire["messages"][3],
+            serde_json::json!({
+                "role": "tool",
+                "content": "done",
+                "tool_call_id": "call_a",
+            })
+        );
+    }
+
+    #[test]
+    fn openai_preserves_user_and_tool_result_block_order() {
+        let request = Request {
+            messages: vec![crate::client::Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::text("before"),
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_owned(),
+                        content: serde_json::Value::String("result".to_owned()),
+                        is_error: true,
+                    },
+                    ContentBlock::text("after"),
+                ],
+            }],
+            ..sample_request(ProviderKind::OpenAI)
+        };
+
+        let rendered = openai_request(&request, "m", None).expect("request renders");
+        let wire = serde_json::to_value(rendered).expect("SDK request serializes");
+        assert_eq!(wire["messages"][0], serde_json::json!({"role": "user", "content": "before"}));
+        assert_eq!(wire["messages"][1]["role"], "tool");
+        assert_eq!(wire["messages"][1]["tool_call_id"], "call_1");
+        assert_eq!(wire["messages"][2], serde_json::json!({"role": "user", "content": "after"}));
+    }
+
+    #[test]
+    fn openai_replay_refuses_protocol_blocks_it_cannot_encode() {
+        let request = Request {
+            messages: vec![crate::client::Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    thinking: "private".to_owned(),
+                    signature: "signature".to_owned(),
+                }],
+            }],
+            ..sample_request(ProviderKind::OpenAI)
+        };
+
+        let error = openai_request(&request, "m", None).expect_err("thinking must not disappear");
+        assert!(matches!(error, LlmError::BadResponse { .. }), "{error}");
+        assert!(error.to_string().contains("thinking"), "{error}");
+    }
+
+    #[test]
+    fn openai_tool_argument_json_is_canonical() {
+        let first = crate::client::Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call".to_owned(),
+                name: "lookup".to_owned(),
+                input: serde_json::json!({"z": 2, "a": {"y": 1, "b": 0}}),
+            }],
+        };
+        let second = crate::client::Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call".to_owned(),
+                name: "lookup".to_owned(),
+                input: serde_json::from_str(r#"{"a":{"b":0,"y":1},"z":2}"#).expect("JSON"),
+            }],
+        };
+
+        let first = openai_assistant_message(&first).expect("first renders");
+        let second = openai_assistant_message(&second).expect("second renders");
+        assert_eq!(
+            serde_json::to_value(first).expect("serialize"),
+            serde_json::to_value(second).expect("serialize")
+        );
     }
 
     #[test]
     fn blocking_answers_read_text_and_usage() {
         use async_openai::types::chat::{
             ChatChoice, ChatCompletionResponseMessage, CompletionUsage, CreateChatCompletionResponse,
+            PromptTokensDetails,
         };
 
         let response = CreateChatCompletionResponse {
@@ -508,16 +1195,20 @@ mod tests {
                 prompt_tokens: 213,
                 completion_tokens: 7,
                 total_tokens: 220,
-                prompt_tokens_details: None,
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: Some(89),
+                    ..Default::default()
+                }),
                 completion_tokens_details: None,
             }),
             metadata: None,
             moderation: None,
         };
-        let completion = blocking_completion(response, Thinking { budget_tokens: 0 });
-        assert_eq!(completion.text, "live-ok");
+        let completion =
+            blocking_completion(response, Thinking { budget_tokens: 0 }).expect("valid completion");
+        assert_eq!(completion.text(), "live-ok");
         let usage = completion.usage.expect("usage rides the top level");
-        assert_eq!((usage.input_tokens, usage.output_tokens), (213, 7));
+        assert_eq!((usage.input_tokens, usage.output_tokens, usage.cached_tokens), (213, 7, 89));
     }
 
     #[test]
@@ -531,33 +1222,53 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_auth_failures_never_retry() {
-        use anthropic_sdk::types::AnthropicError as Sdk;
+    fn anthropic_retry_after_obeys_headers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
 
-        let error = map_anthropic(Sdk::InvalidApiKey);
-        assert!(matches!(error, LlmError::Unauthorized { .. }), "{error}");
-        let error = map_anthropic(Sdk::Authentication { message: "bad".to_owned(), status: 401 });
-        assert!(matches!(error, LlmError::Unauthorized { .. }), "{error}");
-        let error = map_anthropic(Sdk::PermissionDenied { message: "no".to_owned(), status: 403 });
-        assert!(matches!(error, LlmError::Unauthorized { .. }), "{error}");
+        let mut headers = HeaderMap::new();
+        assert_eq!(provider_retry_after_ms(&headers), 60_000);
+        headers.insert("retry-after-ms", HeaderValue::from_static("1250"));
+        assert_eq!(provider_retry_after_ms(&headers), 1_250);
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("4"));
+        assert_eq!(provider_retry_after_ms(&headers), 4_000);
     }
 
     #[test]
-    fn anthropic_rate_limits_carry_the_default_delay() {
-        use anthropic_sdk::types::AnthropicError as Sdk;
+    fn anthropic_stream_state_preserves_ordered_protocol_blocks() {
+        let mut stream = AnthropicStream::default();
+        for event in [
+            serde_json::json!({"type":"message_start","message":{"id":"msg_1","model":"claude-test","content":[],"usage":{"input_tokens":7}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reason"}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque"}}),
+            serde_json::json!({"type":"content_block_stop","index":1}),
+            serde_json::json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"lookup","input":{}}}),
+            serde_json::json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"x\"}"}}),
+            serde_json::json!({"type":"content_block_stop","index":2}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":11}}),
+            serde_json::json!({"type":"message_stop"}),
+        ] {
+            stream.event(&event).expect("valid event");
+        }
 
-        let error = map_anthropic(Sdk::RateLimit { message: "slow".to_owned(), status: 429 });
-        assert!(matches!(error, LlmError::RateLimited { retry_after_ms: 60_000, .. }), "{error}");
-    }
-
-    #[test]
-    fn anthropic_transport_failures_stay_retryable() {
-        use anthropic_sdk::types::AnthropicError as Sdk;
-
-        let error = map_anthropic(Sdk::Connection { message: "down".to_owned() });
-        assert!(matches!(error, LlmError::Transport { .. }), "{error}");
-        let error = map_anthropic(Sdk::Timeout);
-        assert!(matches!(error, LlmError::Transport { .. }), "{error}");
+        assert_eq!(stream.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(stream.model, "claude-test");
+        assert_eq!(stream.request_id.as_deref(), Some("msg_1"));
+        assert_eq!(stream.usage, Some(Usage { input_tokens: 7, output_tokens: 11, cached_tokens: 0 }));
+        assert_eq!(
+            stream.complete.into_values().collect::<Vec<_>>(),
+            vec![
+                ContentBlock::Thinking { thinking: "reason".to_owned(), signature: "sig".to_owned() },
+                ContentBlock::RedactedThinking { data: "opaque".to_owned() },
+                ContentBlock::ToolUse {
+                    id: "tool_1".to_owned(),
+                    name: "lookup".to_owned(),
+                    input: serde_json::json!({"query":"x"}),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -583,6 +1294,12 @@ mod tests {
         let error = map_openai(&Sdk::ApiError(response(429, "slow")));
         assert!(matches!(error, LlmError::RateLimited { retry_after_ms: 60_000, .. }), "{error}");
 
+        let error = map_openai(&Sdk::ApiError(response(400, "bad model")));
+        assert!(matches!(error, LlmError::BadResponse { .. }), "{error}");
+
+        let error = map_openai(&Sdk::ApiError(response(404, "missing endpoint")));
+        assert!(matches!(error, LlmError::BadResponse { .. }), "{error}");
+
         let error = map_openai(&Sdk::ApiError(response(500, "boom")));
         assert!(matches!(error, LlmError::Transport { .. }), "{error}");
     }
@@ -603,20 +1320,23 @@ mod tests {
         let request = Request {
             provider: ProviderKind::Anthropic,
             model: model.clone(),
-            messages: vec![crate::client::Message {
-                role: Role::User,
-                content: "Reply with exactly: live-ok".to_owned(),
-            }],
+            messages: vec![crate::client::Message::text(Role::User, "Reply with exactly: live-ok")],
             tools: Vec::new(),
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
         };
-        let completion =
-            send_anthropic(&request, Some(&base), &model, Thinking { budget_tokens: 0 }, &credential)
-                .await
-                .expect("the gateway answers through the SDK");
+        let completion = send_anthropic(
+            reqwest::Client::new(),
+            &request,
+            Some(&base),
+            &model,
+            Thinking { budget_tokens: 0 },
+            &credential,
+        )
+        .await
+        .expect("the gateway answers through the Messages transport");
 
-        assert_eq!(completion.text.trim(), "live-ok", "the stream carried the exact answer");
+        assert_eq!(completion.text().trim(), "live-ok", "the stream carried the exact answer");
         let usage = completion.usage.expect("the gateway reports usage");
         assert!(usage.input_tokens > 0, "input usage is reported: {usage:?}");
         assert!(usage.output_tokens > 0, "output usage is reported: {usage:?}");
@@ -642,10 +1362,7 @@ mod tests {
         let request = Request {
             provider: ProviderKind::OpenAI,
             model: model.clone(),
-            messages: vec![crate::client::Message {
-                role: Role::User,
-                content: "Reply with exactly: live-ok".to_owned(),
-            }],
+            messages: vec![crate::client::Message::text(Role::User, "Reply with exactly: live-ok")],
             tools: Vec::new(),
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
@@ -655,12 +1372,12 @@ mod tests {
                 .await
                 .expect("the gateway answers through the SDK");
 
-        assert!(!completion.text.trim().is_empty(), "the stream carried text");
+        assert!(!completion.text().trim().is_empty(), "the stream carried text");
         if let Some(usage) = completion.usage {
             assert!(usage.input_tokens > 0, "input usage is reported: {usage:?}");
             assert!(usage.output_tokens > 0, "output usage is reported: {usage:?}");
         }
-        println!("live openai text: {:?}", completion.text.trim());
+        println!("live openai text: {:?}", completion.text().trim());
         println!("live openai usage: {:?}", completion.usage);
     }
 

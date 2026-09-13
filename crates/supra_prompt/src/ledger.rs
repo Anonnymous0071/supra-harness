@@ -2,7 +2,7 @@
 //!
 //! # What the ledger owns
 //!
-//! The ordered sequence of [`Sealed`](supra_types::Sealed) segments that is the prompt
+//! The ordered sequence of [`Sealed`] segments that is the prompt
 //! prefix, the sequence numbers on them, and the prefix hash over the sequence. Appending
 //! is the only mutation; there is no edit, no remove, no reorder. A generation seal
 //! freezes the sequence into a [`Generation`] whose hash can be re-proven later.
@@ -22,6 +22,9 @@
 //! means, and hashing it directly makes the hash a statement about order rather than
 //! about content that already has its own digest.
 
+use std::collections::HashSet;
+
+use serde::{Deserialize, Serialize};
 use supra_types::{CanonicalWriter, ContentHash, Sealable, Sealed, Segment, SegmentId, SeqNo};
 
 use crate::error::PromptError;
@@ -32,7 +35,7 @@ use crate::error::PromptError;
 const PREFIX_HASH_KIND: u8 = 0x20;
 
 /// One frozen prefix: the segment sequence sealed under its hash.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generation {
     /// Which rewrite this was. Zero is the session's first prefix, before any rewrite.
     pub generation: u64,
@@ -42,12 +45,31 @@ pub struct Generation {
     pub prefix_hash: ContentHash,
 }
 
+/// Durable, serde-backed state for one prompt ledger.
+///
+/// This type is intentionally separate from [`PromptLedger`]: deserialising the
+/// representation does not make it trusted. Pass it through
+/// [`PromptLedger::from_snapshot`] before using any restored segment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerSnapshot {
+    /// Live entries in prefix order, including assigned sequence numbers and
+    /// verified content hashes.
+    pub entries: Vec<Sealed<Segment>>,
+    /// The next sequence number the ledger will assign.
+    pub next_seq: SeqNo,
+    /// The number assigned to the next generation seal.
+    pub generation: u64,
+    /// Most recently completed generation, when one has been sealed.
+    pub latest_generation: Option<Generation>,
+}
+
 /// The prompt prefix as an ordered, append-only sequence.
 #[derive(Clone, Debug, Default)]
 pub struct PromptLedger {
     entries: Vec<Sealed<Segment>>,
     next_seq: SeqNo,
     generation: u64,
+    latest_generation: Option<Generation>,
 }
 
 impl PromptLedger {
@@ -113,6 +135,48 @@ impl PromptLedger {
         &self.entries
     }
 
+    /// Most recently completed generation seal, if this ledger has one.
+    #[must_use]
+    pub const fn latest_generation(&self) -> Option<&Generation> {
+        self.latest_generation.as_ref()
+    }
+
+    /// Capture the complete durable state needed to resume appending.
+    ///
+    /// The snapshot remains an untrusted representation until it passes
+    /// [`Self::from_snapshot`]. Keeping snapshot creation explicit avoids
+    /// making ordinary ledger serialisation an unchecked restore path.
+    #[must_use]
+    pub fn snapshot(&self) -> LedgerSnapshot {
+        LedgerSnapshot {
+            entries: self.entries.clone(),
+            next_seq: self.next_seq,
+            generation: self.generation,
+            latest_generation: self.latest_generation.clone(),
+        }
+    }
+
+    /// Restore a ledger after proving every persisted invariant.
+    ///
+    /// Validation rejects sequence gaps or reuse, duplicate segment identities,
+    /// invalid entry seals, inconsistent next-sequence and generation counters,
+    /// and a latest-generation seal that does not describe the live sequence.
+    /// No field is repaired or inferred: doing so could resume with a prefix
+    /// different from the one that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// [`PromptError::InvalidSnapshot`] when any stored invariant fails.
+    pub fn from_snapshot(snapshot: LedgerSnapshot) -> Result<Self, PromptError> {
+        validate_snapshot(&snapshot)?;
+        Ok(Self {
+            entries: snapshot.entries,
+            next_seq: snapshot.next_seq,
+            generation: snapshot.generation,
+            latest_generation: snapshot.latest_generation,
+        })
+    }
+
     /// Hash over the live `(SeqNo, ContentHash)` sequence.
     ///
     /// Recomputed from the entries every call: the ledger never caches it, so there is
@@ -136,6 +200,7 @@ impl PromptLedger {
             prefix_hash: self.prefix_hash(),
         };
         self.generation += 1;
+        self.latest_generation = Some(seal.clone());
         seal
     }
 
@@ -168,6 +233,76 @@ impl PromptLedger {
     pub fn clear_for_rewrite(&mut self) {
         self.entries.clear();
     }
+}
+
+fn invalid_snapshot(detail: impl Into<String>) -> PromptError {
+    PromptError::InvalidSnapshot { detail: detail.into() }
+}
+
+fn validate_snapshot(snapshot: &LedgerSnapshot) -> Result<(), PromptError> {
+    let mut ids = HashSet::with_capacity(snapshot.entries.len());
+    for (index, entry) in snapshot.entries.iter().enumerate() {
+        let expected = u64::try_from(index)
+            .map_err(|_| invalid_snapshot("the entry count exceeds the sequence-number range"))?;
+        if entry.seq().get() != expected {
+            return Err(invalid_snapshot(format!(
+                "entry {index} has sequence {}, expected #{expected}",
+                entry.seq()
+            )));
+        }
+        if !entry.verify() {
+            return Err(invalid_snapshot(format!("entry {} has an invalid content seal", entry.seq())));
+        }
+        if !ids.insert(entry.id()) {
+            return Err(invalid_snapshot(format!("segment {} appears more than once", entry.id())));
+        }
+    }
+
+    let expected_next = u64::try_from(snapshot.entries.len())
+        .map_err(|_| invalid_snapshot("the entry count exceeds the sequence-number range"))?;
+    if snapshot.next_seq.get() != expected_next {
+        return Err(invalid_snapshot(format!(
+            "next sequence is {}, expected #{expected_next}",
+            snapshot.next_seq
+        )));
+    }
+
+    match &snapshot.latest_generation {
+        None if snapshot.generation != 0 => {
+            return Err(invalid_snapshot(format!(
+                "generation counter is {} but no generation seal is present",
+                snapshot.generation
+            )));
+        }
+        None => {}
+        Some(seal) => {
+            let expected_generation = seal
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| invalid_snapshot("the latest generation number cannot advance"))?;
+            if snapshot.generation != expected_generation {
+                return Err(invalid_snapshot(format!(
+                    "generation counter is {}, expected {expected_generation} after seal {}",
+                    snapshot.generation, seal.generation
+                )));
+            }
+            let segment_ids: Vec<SegmentId> = snapshot.entries.iter().map(|entry| entry.id()).collect();
+            if seal.segments != segment_ids {
+                return Err(invalid_snapshot(format!(
+                    "generation {} records a different segment sequence",
+                    seal.generation
+                )));
+            }
+            let found = hash_sequence(snapshot.entries.iter().map(|entry| (entry.seq(), entry.hash())));
+            if seal.prefix_hash != found {
+                return Err(invalid_snapshot(format!(
+                    "generation {} records prefix hash {}, recomputed {}",
+                    seal.generation, seal.prefix_hash, found
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Hash a `(SeqNo, ContentHash)` sequence under the ledger domain separator.

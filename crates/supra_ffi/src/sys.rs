@@ -328,6 +328,8 @@ pub(crate) struct supra_sandbox_policy {
 pub(crate) struct supra_sandbox_process {
     pub pid: i64,
     pub tier: u8,
+    pub native_process: usize,
+    pub native_job: usize,
     pub error: [c_char; SANDBOX_ERROR_LEN],
 }
 
@@ -366,6 +368,7 @@ unsafe extern "C" {
         out_status: *mut c_int,
     ) -> c_int;
     pub(crate) fn supra_sandbox_kill(process: *const supra_sandbox_process, grace_ms: u32) -> c_int;
+    pub(crate) fn supra_sandbox_release(process: *mut supra_sandbox_process);
 
     pub(crate) fn supra_sandbox_self_path(out: *mut c_char, cap: usize) -> usize;
     pub(crate) fn supra_sandbox_self_identity(out_dev: *mut u64, out_ino: *mut u64) -> c_int;

@@ -100,9 +100,11 @@ mod tests {
 
         let claim = append_finding(&mut board, turn, agents[0], &agents[1..], &finding).expect("claim");
         let outcome = vote_finding(&mut board, claim, agents[1], Vote::Yes, &finding).expect("v1");
-        assert_eq!(outcome.status, supra_types::QuorumStatus::Open);
-        let outcome = vote_finding(&mut board, claim, agents[2], Vote::Yes, &finding).expect("v2");
         assert_eq!(outcome.status, supra_types::QuorumStatus::Reached);
+        assert_eq!(outcome.tally.yes(), 2, "proposer plus the confirming validator reach 2/3");
+        let error = vote_finding(&mut board, claim, agents[2], Vote::Yes, &finding)
+            .expect_err("a terminal claim accepts no late votes");
+        assert!(matches!(error, BlackboardError::Closed { claim: closed } if closed == claim));
     }
 
     #[test]
@@ -156,7 +158,8 @@ mod tests {
         let claim = append_finding(&mut board, TurnId::generate(), agents[0], &agents[1..], &found[0])
             .expect("claim");
         let outcome = vote_finding(&mut board, claim, agents[1], Vote::Yes, &found[0]).expect("vote");
-        assert_eq!(outcome.status, supra_types::QuorumStatus::Open);
+        assert_eq!(outcome.status, supra_types::QuorumStatus::Reached);
         assert_eq!(outcome.tally.k(), 3);
+        assert_eq!(outcome.tally.yes(), 2, "the proposer is part of the cohort tally");
     }
 }

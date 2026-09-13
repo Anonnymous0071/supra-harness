@@ -24,12 +24,14 @@
 //!
 //! # The lifecycle
 //!
-//! [`Host::new`] builds the engine (fuel on) and the three linkers;
-//! [`Host::verify`] type-checks a component's declared imports against
-//! its class **without instantiating it**; [`Host::instantiate`] links,
-//! checks the `run` export's signature, and hands back a [`Plugin`] whose
-//! store carries the fuel budget. [`Plugin::call`] runs the export;
-//! exhaustion is [`PluginError::FuelExhausted`], not a hang.
+//! [`Host::new`] builds the engine (fuel on), the three linkers, and a
+//! fail-closed dispatcher; [`Host::with_dispatcher`] lets the runtime inject
+//! class-safe behavior; [`Host::verify`] type-checks a component's declared
+//! imports against its class **without instantiating it**;
+//! [`Host::instantiate`] links, checks the `run` export's signature, and hands
+//! back a [`Plugin`] whose store carries fuel and bounded host-call audit.
+//! [`Plugin::call`] runs the export; exhaustion is
+//! [`PluginError::FuelExhausted`], not a hang.
 //!
 //! # Usage
 //!
@@ -46,10 +48,16 @@
 // allow reaches a shipped path.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::print_stderr))]
 
+pub mod dispatch;
 pub mod error;
 pub mod host;
 pub mod world;
 
+pub use dispatch::{
+    DEFAULT_MAX_ARGUMENT_BYTES, DEFAULT_MAX_CALLS, DEFAULT_MAX_INSTANCES, DEFAULT_MAX_MEMORIES,
+    DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_TABLE_ELEMENTS, DEFAULT_MAX_TABLES,
+    DenyAllDispatcher, DispatchError, HostCall, HostDispatcher, HostFunction, HostLimits, PluginIdentity,
+};
 pub use error::PluginError;
 pub use host::{DEFAULT_FUEL, Host, HostState, Plugin};
 pub use world::{WORLD, imports_for};

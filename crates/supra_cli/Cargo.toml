@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Peer-validated coding-agent harness: the `supra` CLI."
-publish = true
+publish = false
 homepage = "https://github.com/Anonnymous0071/supra-harness"
 documentation = "https://github.com/Anonnymous0071/supra-harness/blob/main/README.md"
 keywords = ["cli", "coding-agent", "llm", "developer-tools"]
@@ -25,9 +25,13 @@ supra_secrets = { workspace = true }
 supra_store = { workspace = true }
 supra_vector = { workspace = true }
 supra_theme = { workspace = true }
+supra_tui = { workspace = true }
 supra_command = { workspace = true }
 supra_cohort = { workspace = true }
 supra_core = { workspace = true }
+supra_blackboard = { workspace = true }
+supra_eventbus = { workspace = true }
+supra_prompt = { workspace = true }
 supra_session = { workspace = true }
 supra_hook = { workspace = true }
 supra_mcp = { workspace = true }
@@ -36,7 +40,7 @@ supra_telemetry = { workspace = true }
 supra_update = { workspace = true }
 supra_eval = { workspace = true }
 supra_llm = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "test-util"] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

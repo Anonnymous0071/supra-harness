@@ -12,8 +12,11 @@ believe it has. If you have a proof of concept, attach it privately.
 
 ## Scope
 
-supra-harness executes model-directed commands against a local filesystem. The
-following are in scope:
+The repository contains sandbox, permission, journal, guard, AST, tool, and plugin
+components intended to protect model-directed commands. The current `supra run`
+provider path advertises no tools and rejects tool use, so it does not yet execute
+model-directed commands through those components. The following are in scope for
+the library boundaries and for any executable path that integrates them:
 
 - **Sandbox escape.** Any command reaching outside the configured filesystem or
   network policy (T4, T16).
@@ -35,10 +38,11 @@ Out of scope: the LLM producing wrong code; provider outages; cost incurred by
 
 ## Design commitments
 
-**No permission mode relaxes an architectural boundary.** `yolo` removes user
-prompts only. Guard layers L1-L7, the sandbox, and the AST reparse gate have no
-off switch. Disabling the sandbox requires the separate `--sandbox off` flag
-with its own confirmation and a persistent status-line warning.
+**Library boundaries do not treat permission mode as authority.** `yolo` removes
+user prompts in the permission component only. Guard, sandbox, and AST components
+remain separate enforcement layers. The current `supra run` path advertises no
+tools; when executable tool integration lands, disabling the sandbox must remain
+a separate confirmed `--sandbox off` choice and be surfaced persistently.
 
 **Capability by absence, not by refusal.** A runtime check is code that can have
 a bug. A missing ABI cannot. Agent WASM components are linked against an

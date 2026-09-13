@@ -87,13 +87,14 @@ M6 is the silent-corruption case the strictness exists for; M9 is I3's
 manifest-stability property (a disable that changed the manifest would
 break the BP1 prefix).
 
-## Obligations left to later stages
+## Delivered boundary and runtime ownership
 
 - **T20** derives each peer's WASM import set from `Tool::class`, so an
   agent has no name to call a Host or User tool through.
-- **T23** owns `SessionFacts` (the read-set grows as `read_file` runs),
-  evaluates the permission gate on `invocation.effect()`, and dispatches
-  execution.
+- **Delivered in the runtime seam:** invocation effects can be evaluated against
+  permission policy before execution, and `SessionFacts` grows as reads occur.
+  Concrete CLI/plugin adapters remain responsible for wiring that seam to their
+  execution environment.
 - **T18/T19** (MCP, skills) register their tools through this registry at
   startup - dynamic discovery appends, which I3 permits, and the manifest
   test's byte-stability property is what makes that safe.

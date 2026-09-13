@@ -11,7 +11,7 @@
 //! | ----- | ------- | --------- |
 //! | L1 | no identity established | [`identity::is_established`] |
 //! | L2 | no marker key generated | [`marker::has_key`] |
-//! | L3 | the command names this binary | argv[0], its final component, and its resolved name |
+//! | L3 | the command names this binary | `argv[0]`, its final component, and its resolved name |
 //! | L4 | the command *is* this binary | (device, inode) via `supra_ffi` |
 //! | L5 | the marker does not authenticate | HMAC-SHA256 over `version:nonce` |
 //! | L6 | the lineage would cycle or nest | [`supra_types::Lineage::child`] |

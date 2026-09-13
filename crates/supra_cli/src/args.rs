@@ -70,8 +70,15 @@ pub enum LogFormatArg {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    #[command(about = "Start an interactive supra session")]
-    Run,
+    #[command(about = "Execute one peer-validated provider turn")]
+    Run {
+        #[arg(long, value_name = "NAME", help = "Use the configured provider NAME")]
+        provider: Option<String>,
+        #[arg(long, value_name = "ID", help = "Resume a saved session instead of starting one")]
+        resume: Option<String>,
+        #[arg(trailing_var_arg = true, help = "Task to send to the provider cohort")]
+        task: Vec<String>,
+    },
     #[command(about = "Run the offline evaluation suite")]
     Eval {
         #[arg(long, help = "Also run the provider-backed evaluation probe")]
@@ -91,10 +98,39 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum UpdateAction {
-    #[command(about = "Check whether a signed update is available")]
-    Check,
-    #[command(about = "Apply an update after signature verification")]
-    Apply,
+    #[command(about = "Verify a signed local update bundle")]
+    Check {
+        /// Local release archive to verify.
+        #[arg(long, value_name = "PATH", required = true)]
+        archive: PathBuf,
+        /// Canonical JSON manifest signed by the release key.
+        #[arg(long, value_name = "PATH", required = true)]
+        manifest: PathBuf,
+        /// Minisign signature over the manifest bytes.
+        #[arg(long, value_name = "PATH", required = true)]
+        signature: PathBuf,
+        /// Minisign public-key file.
+        #[arg(long, value_name = "PATH", required = true)]
+        public_key: PathBuf,
+    },
+    #[command(about = "Verify and atomically apply a signed local update bundle")]
+    Apply {
+        /// Local release archive to verify and apply.
+        #[arg(long, value_name = "PATH", required = true)]
+        archive: PathBuf,
+        /// Canonical JSON manifest signed by the release key.
+        #[arg(long, value_name = "PATH", required = true)]
+        manifest: PathBuf,
+        /// Minisign signature over the manifest bytes.
+        #[arg(long, value_name = "PATH", required = true)]
+        signature: PathBuf,
+        /// Minisign public-key file.
+        #[arg(long, value_name = "PATH", required = true)]
+        public_key: PathBuf,
+        /// Destination binary; defaults to the running executable.
+        #[arg(long, value_name = "PATH")]
+        install_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -169,10 +205,53 @@ mod tests {
         let top_help = top.render_long_help().to_string();
         assert!(top_help.contains("Confirm security-sensitive"), "{top_help}");
         assert!(top_help.contains("Enable or disable sandboxing"), "{top_help}");
-        assert!(top_help.contains("Start an interactive supra session"), "{top_help}");
+        assert!(top_help.contains("Execute one peer-validated provider turn"), "{top_help}");
+
+        let mut run = Cli::command().find_subcommand_mut("run").expect("run command").clone();
+        let run_help = run.render_long_help().to_string();
+        assert!(run_help.contains("configured provider"), "{run_help}");
+        assert!(run_help.contains("Resume a saved session"), "{run_help}");
+
+        let resumed = <Cli as clap::Parser>::try_parse_from([
+            "supra",
+            "run",
+            "--resume",
+            "01J00000000000000000000000",
+            "task",
+        ]);
+        assert!(resumed.is_ok(), "resume accepts a session id: {resumed:?}");
+
+        let bare = <Cli as clap::Parser>::try_parse_from(["supra", "run"]);
+        assert!(bare.is_ok(), "run without a task parses; the turn refuses it, not the parser");
 
         let mut update = Cli::command().find_subcommand_mut("update").expect("update command").clone();
         let update_help = update.render_long_help().to_string();
-        assert!(update_help.contains("Apply an update after signature verification"), "{update_help}");
+        assert!(update_help.contains("Verify and atomically apply"), "{update_help}");
+
+        for action in ["check", "apply"] {
+            let error = <Cli as clap::Parser>::try_parse_from(["supra", "update", action])
+                .expect_err("all trust inputs are required");
+            let rendered = error.to_string();
+            for flag in ["--archive", "--manifest", "--signature", "--public-key"] {
+                assert!(rendered.contains(flag), "{action} did not require {flag}: {rendered}");
+            }
+        }
+
+        let apply = <Cli as clap::Parser>::try_parse_from([
+            "supra",
+            "update",
+            "apply",
+            "--archive",
+            "bundle.tar.gz",
+            "--manifest",
+            "bundle.manifest.json",
+            "--signature",
+            "bundle.manifest.json.minisig",
+            "--public-key",
+            "supra.pub",
+            "--install-path",
+            "/tmp/supra",
+        ]);
+        assert!(apply.is_ok(), "complete apply arguments should parse: {apply:?}");
     }
 }

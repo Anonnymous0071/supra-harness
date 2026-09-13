@@ -1,5 +1,5 @@
 # Clippy configuration. Complements [workspace.lints.clippy] in Cargo.toml.
-msrv = "1.85"
+msrv = "1.86"
 
 # A coding agent runs unattended for hours. A single panic in a tool call path
 # ends the session, so deep call graphs are reviewed rather than tolerated.

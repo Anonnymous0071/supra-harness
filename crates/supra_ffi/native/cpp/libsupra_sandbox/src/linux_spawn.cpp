@@ -564,6 +564,12 @@ int supra_sandbox_kill(const supra_sandbox_process* process, uint32_t grace_ms) 
     return supra_sandbox_wait(process, 1000, &status) == 1 ? 1 : 0;
 }
 
+void supra_sandbox_release(supra_sandbox_process* process) {
+    // POSIX ownership is represented by the pid alone. Detach transfers reaping
+    // responsibility to the caller and has no native handles to close.
+    static_cast<void>(process);
+}
+
 }  // extern "C"
 
 #endif  // __linux__

@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use supra_blackboard::Blackboard;
 use supra_eventbus::Bus;
 use supra_types::{
     AgentId, Block, ClaimId, Event, PEER_CEILING, QuorumStatus, Role, Segment, SegmentId, SegmentKind,
-    TurnId, Vote, shards_needed,
+    TurnId, Verdict, shards_needed,
 };
 
 use crate::error::TurnError;
@@ -12,8 +14,24 @@ use crate::error::TurnError;
 pub struct PeerAnswer {
     /// Which peer answered.
     pub agent: AgentId,
-    /// The answer body, already canonical.
-    pub text: String,
+    /// Full proposer output. Validators leave this absent.
+    pub text: Option<String>,
+    /// Bounded structured validation. The proposer leaves this absent.
+    pub verdict: Option<Verdict>,
+}
+
+impl PeerAnswer {
+    /// Construct a full candidate answer from the proposer.
+    #[must_use]
+    pub fn proposal(agent: AgentId, text: impl Into<String>) -> Self {
+        Self { agent, text: Some(text.into()), verdict: None }
+    }
+
+    /// Construct a validator response.
+    #[must_use]
+    pub const fn validation(agent: AgentId, verdict: Verdict) -> Self {
+        Self { agent, text: None, verdict: Some(verdict) }
+    }
 }
 
 /// Where the turn stands after each recorded vote.
@@ -37,12 +55,13 @@ pub struct Turn {
     id: TurnId,
     session: Vec<AgentId>,
     blackboard: Blackboard,
-    bus: Bus,
+    bus: Arc<Bus>,
     claim: ClaimId,
     answer: Option<String>,
     votes_seen: usize,
     steps_seen: Vec<Step>,
     finished: bool,
+    blind_rederivation: bool,
 }
 
 impl Turn {
@@ -64,6 +83,25 @@ impl Turn {
         task: &str,
         agents: Vec<AgentId>,
     ) -> Result<Self, TurnError> {
+        Self::start_shared(blackboard, Arc::new(bus), task, agents)
+    }
+
+    /// Steps 1-4 using a bus shared with the session coordinator.
+    ///
+    /// Unlike [`Self::start`], this keeps the caller's handle alive so one
+    /// subscription can observe every turn in a long-running session. The
+    /// bus remains non-blocking and closes only after the session and all
+    /// turns release their handles.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    pub fn start_shared(
+        blackboard: Blackboard,
+        bus: Arc<Bus>,
+        task: &str,
+        agents: Vec<AgentId>,
+    ) -> Result<Self, TurnError> {
         if agents.is_empty() {
             return Err(TurnError::NoAnswer("an empty cohort cannot field a turn".to_owned()));
         }
@@ -73,17 +111,24 @@ impl Turn {
                 agents.len()
             )));
         }
+        if task.is_empty() {
+            return Err(TurnError::NoAnswer("an empty task cannot field a turn".to_owned()));
+        }
         let turn_id = TurnId::generate();
         let Some(proposer) = agents.first() else {
             return Err(TurnError::NoAnswer("an empty cohort cannot field a turn".to_owned()));
         };
         let proposer = *proposer;
-        let validators: Vec<AgentId> = agents.iter().copied().filter(|a| *a != proposer).collect();
+        let validators: Vec<AgentId> = agents.iter().copied().filter(|agent| *agent != proposer).collect();
+        let blind_rederivation = agents.len() == 1;
 
         let mut blackboard = blackboard;
-        let claim = blackboard
-            .publish(turn_id, proposer, &validators, task)
-            .map_err(|error| TurnError::NoAnswer(error.to_string()))?;
+        let claim = if blind_rederivation {
+            blackboard.publish_blind(turn_id, proposer, "turn candidate")
+        } else {
+            blackboard.publish(turn_id, proposer, &validators, "turn candidate")
+        }
+        .map_err(|error| TurnError::NoAnswer(error.to_string()))?;
         bus.publish(Event::TurnStarted { turn: turn_id });
         bus.publish(Event::ClaimPublished { claim, proposer });
 
@@ -97,6 +142,7 @@ impl Turn {
             votes_seen: 0,
             steps_seen: Vec::new(),
             finished: false,
+            blind_rederivation,
         })
     }
 
@@ -124,35 +170,56 @@ impl Turn {
         shards_needed(self.session.len())
     }
 
-    /// Step 6, one vote at a time: record a peer's answer and evaluate
-    /// quorum incrementally.
+    /// Step 6, one response at a time: store the proposal or record a structured verdict.
     ///
-    /// The first answer to arrive becomes the turn's working answer; a
-    /// later peer votes yes exactly when it confirms the working answer
-    /// - which is what a quorum over answers means.
+    /// Only the first cohort member may submit full answer text. Validators submit
+    /// [`Verdict`] values, so semantically equivalent approvals do not require byte-
+    /// identical prose and answer length is independent of the verdict budget.
     ///
     /// # Errors
     ///
-    /// [`TurnError::NoAnswer`] carrying the blackboard's reason when the
-    /// vote refuses; the turn keeps its prior state.
+    /// [`TurnError::NoAnswer`] for a malformed response or a refused blackboard vote;
+    /// the turn keeps its prior durable state.
     pub fn record(&mut self, answer: PeerAnswer) -> Result<Step, TurnError> {
-        let vote = if self.answer_is_supported(&answer) { Vote::Yes } else { Vote::No };
-        let verdict = supra_types::Verdict::new(vote, supra_types::Confidence::Medium, &answer.text, None)
-            .map_err(|error| TurnError::NoAnswer(error.to_string()))?;
-        let outcome = self
-            .blackboard
-            .vote(self.claim, answer.agent, &verdict)
-            .map_err(|error| TurnError::NoAnswer(error.to_string()))?;
+        if let Some(text) = answer.text {
+            if answer.verdict.is_some() {
+                return Err(TurnError::NoAnswer(
+                    "a peer response cannot be both a proposal and a verdict".to_owned(),
+                ));
+            }
+            if answer.agent != self.session[0] {
+                return Err(TurnError::NoAnswer("only the proposer may submit a full answer".to_owned()));
+            }
+            if text.is_empty() {
+                return Err(TurnError::EmptyClaim);
+            }
+            if self.answer.is_some() {
+                return Err(TurnError::NoAnswer("the proposer already submitted an answer".to_owned()));
+            }
+            self.answer = Some(text);
+            return Ok(Step::Collecting);
+        }
+
+        if self.answer.is_none() {
+            return Err(TurnError::NoAnswer("a validator answered before the proposal".to_owned()));
+        }
+        let verdict = answer.verdict.ok_or_else(|| {
+            TurnError::NoAnswer("a peer response contains neither answer nor verdict".to_owned())
+        })?;
+        let outcome = if self.blind_rederivation && answer.agent == self.session[0] {
+            self.blackboard.vote_blind(self.claim, answer.agent, &verdict)
+        } else {
+            self.blackboard.vote(self.claim, answer.agent, &verdict)
+        }
+        .map_err(|error| TurnError::NoAnswer(error.to_string()))?;
+        let vote = verdict.vote();
 
         self.bus.publish(Event::VoteCast {
             claim: self.claim,
             voter: answer.agent,
             vote,
-            confidence: supra_types::Confidence::Medium,
+            confidence: verdict.confidence(),
         });
-        if self.answer.is_none() {
-            self.answer = Some(answer.text);
-        }
         self.votes_seen += 1;
 
         let step = match outcome.status {
@@ -183,13 +250,6 @@ impl Turn {
         };
         self.steps_seen.push(step);
         Ok(step)
-    }
-
-    fn answer_is_supported(&self, answer: &PeerAnswer) -> bool {
-        match &self.answer {
-            None => true,
-            Some(working) => working == &answer.text,
-        }
     }
 
     /// Steps 8 and 13: the agreed answer, sealed into the ledger as the
@@ -270,7 +330,7 @@ mod tests {
     use supra_blackboard::Blackboard;
     use supra_eventbus::{Bus, TopicSet};
     use supra_store::Store;
-    use supra_types::{AgentId, QuorumStatus, Topic};
+    use supra_types::{AgentId, Confidence, QuorumStatus, Topic, Vote};
 
     use super::*;
 
@@ -291,7 +351,14 @@ mod tests {
     }
 
     fn answer(agent: AgentId, text: &str) -> PeerAnswer {
-        PeerAnswer { agent, text: text.to_owned() }
+        PeerAnswer::proposal(agent, text)
+    }
+
+    fn validation(agent: AgentId, vote: Vote) -> PeerAnswer {
+        PeerAnswer::validation(
+            agent,
+            Verdict::new(vote, Confidence::Medium, "independently checked", None).expect("verdict"),
+        )
     }
 
     #[test]
@@ -301,11 +368,11 @@ mod tests {
         assert_eq!(turn.k(), 3);
         assert_eq!(turn.shards(), 1);
 
-        assert_eq!(turn.record(answer(peers[1], "fix it")).expect("v1"), Step::Collecting);
+        assert_eq!(turn.record(answer(peers[0], "fix it")).expect("proposal"), Step::Collecting);
+        assert_eq!(turn.record(validation(peers[1], Vote::Yes)).expect("v1"), Step::Reached);
         assert_eq!(turn.answer(), Some("fix it"));
-        assert_eq!(turn.record(answer(peers[2], "fix it")).expect("v2"), Step::Reached);
         assert_eq!(turn.status(), Some(QuorumStatus::Reached));
-        assert_eq!(turn.steps(), &[Step::Collecting, Step::Reached]);
+        assert_eq!(turn.steps(), &[Step::Reached]);
 
         let mut ledger = supra_prompt::PromptLedger::new();
         let id = turn.finish(&mut ledger).expect("finish");
@@ -318,8 +385,8 @@ mod tests {
     fn the_ledger_seals_the_agreed_answer_not_the_task() {
         let peers = agents(3);
         let mut turn = Turn::start(board(), Bus::new(), "the task text", peers.clone()).expect("turn");
-        turn.record(answer(peers[1], "the agreed answer")).expect("v1");
-        turn.record(answer(peers[2], "the agreed answer")).expect("v2");
+        turn.record(answer(peers[0], "the agreed answer")).expect("proposal");
+        turn.record(validation(peers[1], Vote::Yes)).expect("v1");
 
         let mut ledger = supra_prompt::PromptLedger::new();
         turn.finish(&mut ledger).expect("finish");
@@ -341,16 +408,17 @@ mod tests {
 
     #[test]
     fn finish_is_refused_before_quorum_and_after_escalation() {
-        let peers = agents(2);
+        let peers = agents(3);
         let mut turn = Turn::start(board(), Bus::new(), "task", peers.clone()).expect("turn");
-        turn.record(answer(peers[1], "an answer")).expect("v1");
+        turn.record(answer(peers[0], "an answer")).expect("proposal");
         let mut ledger = supra_prompt::PromptLedger::new();
         assert!(turn.finish(&mut ledger).is_err(), "open quorum cannot finish");
 
         let cohort = agents(4);
         let mut escalated = Turn::start(board(), Bus::new(), "task", cohort.clone()).expect("turn");
+        escalated.record(answer(cohort[0], "candidate")).expect("proposal");
         for peer in &cohort[1..] {
-            let _ = escalated.record(answer(*peer, &format!("answer from {peer:?}")));
+            let _ = escalated.record(validation(*peer, Vote::No));
         }
         assert_eq!(escalated.steps().last(), Some(&Step::Escalate));
         assert!(escalated.finish(&mut ledger).is_err(), "escalated cannot finish");
@@ -360,14 +428,15 @@ mod tests {
     fn a_disagreeing_peer_votes_no_and_unreachable_escalates() {
         let peers = agents(4);
         let mut turn = Turn::start(board(), Bus::new(), "the fix", peers.clone()).expect("turn");
-        assert_eq!(turn.record(answer(peers[1], "fix a")).expect("v1"), Step::Collecting);
+        assert_eq!(turn.record(answer(peers[0], "fix a")).expect("proposal"), Step::Collecting);
+        assert_eq!(turn.record(validation(peers[1], Vote::Yes)).expect("v1"), Step::Collecting);
         assert_eq!(
-            turn.record(answer(peers[2], "fix b")).expect("v2"),
+            turn.record(validation(peers[2], Vote::No)).expect("v2"),
             Step::Collecting,
             "yes=1 no=1 pending=1: 1+1 >= needed 2, still reachable"
         );
         assert_eq!(
-            turn.record(answer(peers[3], "fix c")).expect("v3"),
+            turn.record(validation(peers[3], Vote::No)).expect("v3"),
             Step::Escalate,
             "yes+pending = 1+0 < needed 2: escalate now"
         );
@@ -381,8 +450,8 @@ mod tests {
         let bus = Bus::new();
         let subscription = bus.subscribe(TopicSet::of(Topic::Cohort));
         let mut turn = Turn::start(board(), bus, "the fix", peers.clone()).expect("turn");
-        turn.record(answer(peers[1], "fix it")).expect("v1");
-        turn.record(answer(peers[2], "fix it")).expect("v2");
+        turn.record(answer(peers[0], "fix it")).expect("proposal");
+        turn.record(validation(peers[1], Vote::Yes)).expect("v1");
 
         let mut saw_vote = false;
         let mut saw_reached = false;
@@ -401,13 +470,31 @@ mod tests {
     }
 
     #[test]
+    fn one_shared_subscription_observes_multiple_turns() {
+        let bus = Arc::new(Bus::new());
+        let subscription = bus.subscribe(TopicSet::of(Topic::Turn));
+
+        let first = Turn::start_shared(board(), Arc::clone(&bus), "first", agents(1)).expect("first turn");
+        let second = Turn::start_shared(board(), Arc::clone(&bus), "second", agents(1)).expect("second turn");
+        assert_ne!(first.id(), second.id());
+
+        let started = subscription
+            .drain()
+            .into_iter()
+            .filter(|delivery| matches!(delivery.event.as_ref(), Event::TurnStarted { .. }))
+            .count();
+        assert_eq!(started, 2, "the session subscription spans both turns");
+        assert!(!subscription.is_closed(), "the session still owns the bus");
+    }
+
+    #[test]
     fn turn_events_carry_the_turn_topic() {
         let peers = agents(3);
         let bus = Bus::new();
         let subscription = bus.subscribe(TopicSet::of(Topic::Turn).union(TopicSet::of(Topic::Prompt)));
         let mut turn = Turn::start(board(), bus, "the fix", peers.clone()).expect("turn");
-        turn.record(answer(peers[1], "fix it")).expect("v1");
-        turn.record(answer(peers[2], "fix it")).expect("v2");
+        turn.record(answer(peers[0], "fix it")).expect("proposal");
+        turn.record(validation(peers[1], Vote::Yes)).expect("v1");
         let mut ledger = supra_prompt::PromptLedger::new();
         turn.finish(&mut ledger).expect("finish");
 
@@ -442,23 +529,26 @@ mod tests {
     fn the_proposer_never_votes_on_its_own_claim() {
         let peers = agents(2);
         let mut turn = Turn::start(board(), Bus::new(), "the fix", peers.clone()).expect("turn");
-        let error = turn.record(answer(peers[0], "me too")).expect_err("proposer");
+        turn.record(answer(peers[0], "candidate")).expect("proposal");
+        let error = turn.record(answer(peers[0], "me too")).expect_err("second proposal");
         assert!(matches!(error, TurnError::NoAnswer(_)));
+        assert_eq!(turn.answer(), Some("candidate"), "a rejected duplicate cannot replace the candidate");
     }
 
     #[test]
     fn a_late_peer_after_reach_is_refused_by_the_closed_claim() {
         let peers = agents(6);
         let mut turn = Turn::start(board(), Bus::new(), "the fix", peers.clone()).expect("turn");
-        for voter in &peers[1..4] {
+        turn.record(answer(peers[0], "fix")).expect("proposal");
+        for voter in &peers[1..3] {
             assert_eq!(
-                turn.record(answer(*voter, "fix")).expect("agreeing"),
+                turn.record(validation(*voter, Vote::Yes)).expect("agreeing"),
                 Step::Collecting,
-                "quorum(6) = 4: the fourth yes is the reach"
+                "quorum(6) = 4: proposer plus three validators reach"
             );
         }
-        assert_eq!(turn.record(answer(peers[4], "fix")).expect("the reach"), Step::Reached);
-        let result = turn.record(answer(peers[5], "fix"));
+        assert_eq!(turn.record(validation(peers[3], Vote::Yes)).expect("the reach"), Step::Reached);
+        let result = turn.record(validation(peers[4], Vote::Yes));
         assert!(matches!(result, Err(TurnError::NoAnswer(_))));
     }
 
@@ -468,9 +558,10 @@ mod tests {
         let bus = Bus::new();
         let subscription = bus.subscribe(TopicSet::of(Topic::Cohort));
         let mut turn = Turn::start(board(), bus, "the fix", peers.clone()).expect("turn");
-        turn.record(answer(peers[1], "fix a")).expect("v1");
-        turn.record(answer(peers[2], "fix b")).expect("v2");
-        turn.record(answer(peers[3], "fix c")).expect("v3, unreachable");
+        turn.record(answer(peers[0], "fix a")).expect("proposal");
+        turn.record(validation(peers[1], Vote::Yes)).expect("v1");
+        turn.record(validation(peers[2], Vote::No)).expect("v2");
+        turn.record(validation(peers[3], Vote::No)).expect("v3, unreachable");
 
         let mut saw_unreachable = false;
         let mut saw_abort = false;
@@ -508,19 +599,28 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_task_body_refuses_at_finish_not_at_publish() {
+    fn an_empty_task_body_is_refused_at_start() {
         let peers = agents(3);
-        let mut turn = Turn::start(board(), Bus::new(), "x", peers.clone()).expect("turn");
-        turn.record(answer(peers[1], "x")).expect("v1");
-        turn.record(answer(peers[2], "x")).expect("v2, reached");
+        let result = Turn::start(board(), Bus::new(), "", peers);
+        assert!(matches!(result, Err(TurnError::NoAnswer(_))));
+    }
 
-        let mut ledger = supra_prompt::PromptLedger::new();
-        let id = turn.finish(&mut ledger).expect("a non-empty body seals");
-        assert_ne!(id, SegmentId::generate());
+    #[test]
+    fn a_single_peer_uses_a_blind_validation_pass() {
+        let peers = agents(1);
+        let mut turn = Turn::start(board(), Bus::new(), "task", peers.clone()).expect("turn");
+        turn.record(answer(peers[0], "candidate")).expect("proposal");
+        assert_eq!(turn.record(validation(peers[0], Vote::Yes)).expect("blind validation"), Step::Reached);
+        assert_eq!(turn.status(), Some(QuorumStatus::Reached));
+    }
 
-        let empty = Turn::start(board(), Bus::new(), "x", peers.clone()).expect("turn 2");
-        let bodyless = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| empty.claim()));
-        assert!(bodyless.is_ok(), "querying a live claim never panics");
+    #[test]
+    fn validators_cannot_submit_full_proposals() {
+        let peers = agents(2);
+        let mut turn = Turn::start(board(), Bus::new(), "task", peers.clone()).expect("turn");
+        let error = turn.record(answer(peers[1], "candidate")).expect_err("validator proposal");
+        assert!(matches!(error, TurnError::NoAnswer(_)));
+        assert!(turn.answer().is_none());
     }
 
     #[test]

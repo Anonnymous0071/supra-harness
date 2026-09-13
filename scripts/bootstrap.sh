@@ -15,7 +15,7 @@ echo "==> components"
 rustup component add rustfmt clippy llvm-tools rust-src
 
 echo "==> targets"
-rustup target add wasm32-wasip2 wasm32-wasip1
+rustup target add wasm32-wasip2
 
 echo
 echo "Cargo-installed tooling is optional; install what you need:"

@@ -28,16 +28,31 @@ impl Session {
     }
 
     /// Record one completed turn.
-    pub fn record_turn(&mut self, turn: supra_types::TurnId) {
+    ///
+    /// Returns `false` without changing the session when `turn` is nil or was
+    /// already recorded. Existing callers may continue to ignore the return
+    /// value; callers that ingest external ids can use it to reject duplicates.
+    pub fn record_turn(&mut self, turn: supra_types::TurnId) -> bool {
+        if turn.is_nil() || self.turns.contains(&turn) {
+            return false;
+        }
         self.turns.push(turn);
         self.bodies.push(String::new());
+        true
     }
 
     /// Record one completed turn with the body its ledger segment
     /// sealed, so a later resume-export round trip keeps it.
-    pub fn record_turn_with_body(&mut self, turn: supra_types::TurnId, body: impl Into<String>) {
+    ///
+    /// Returns `false` without changing the session when `turn` is nil or was
+    /// already recorded.
+    pub fn record_turn_with_body(&mut self, turn: supra_types::TurnId, body: impl Into<String>) -> bool {
+        if turn.is_nil() || self.turns.contains(&turn) {
+            return false;
+        }
         self.turns.push(turn);
         self.bodies.push(body.into());
+        true
     }
 
     /// The completed turns, in order.
@@ -58,7 +73,9 @@ impl Session {
     /// The bodies a resume read back are written out again, so a
     /// save-after-resume is a round trip rather than an erasure; a
     /// turn recorded without one persists an empty body, the shape the
-    /// checkpoint has always held.
+    /// checkpoint has always held. When the file is already a lossless
+    /// checkpoint, structured fields are retained and only compatible appended
+    /// legacy turns are merged.
     ///
     /// # Errors
     ///
@@ -67,6 +84,46 @@ impl Session {
         let turns: Vec<(supra_types::TurnId, String)> =
             self.turns.iter().zip(&self.bodies).map(|(turn, body)| (*turn, body.clone())).collect();
         store::save(directory, self.id, &turns)
+    }
+
+    /// Build an additive, lossless checkpoint from this legacy session view.
+    ///
+    /// Existing turns retain their accepted display bodies. Callers that own
+    /// provider protocol blocks can replace these records with
+    /// [`CheckpointTurn`](crate::CheckpointTurn)s before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the checkpoint validation error rather than dropping a turn if
+    /// an invalid legacy `Session` is ever produced by a future constructor.
+    pub fn checkpoint(&self) -> Result<crate::SessionCheckpoint, SessionError> {
+        let mut checkpoint = crate::SessionCheckpoint::new(self.id);
+        for (turn, body) in self.turns.iter().zip(&self.bodies) {
+            checkpoint.push_turn(crate::CheckpointTurn::new(*turn, body.clone(), Vec::new(), None))?;
+        }
+        Ok(checkpoint)
+    }
+
+    /// Persist a caller-supplied lossless checkpoint for this session.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Malformed`] when the checkpoint names another session;
+    /// otherwise whatever the checkpoint store refuses.
+    pub fn save_checkpoint(
+        &self,
+        directory: &Path,
+        checkpoint: &crate::SessionCheckpoint,
+        expected_revision: Option<u64>,
+    ) -> Result<(), SessionError> {
+        if checkpoint.session() != self.id {
+            return Err(SessionError::Malformed(format!(
+                "checkpoint names session {} but this session is {}",
+                checkpoint.session(),
+                self.id
+            )));
+        }
+        store::save_checkpoint(directory, checkpoint, expected_revision)
     }
 
     /// Resume a persisted session, or `None` when it was never saved.
@@ -83,6 +140,29 @@ impl Session {
             bodies.push(body);
         }
         Ok(Some(Self { id, turns: ids, bodies }))
+    }
+
+    /// Resume the lossless checkpoint and its legacy `Session` projection.
+    ///
+    /// Legacy tuple files are upgraded in memory. Structured provider payloads
+    /// remain available in the returned checkpoint while the `Session` keeps
+    /// the accepted display bodies used by existing call sites.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the checkpoint store refuses.
+    pub fn resume_checkpoint(
+        directory: &Path,
+        id: SessionId,
+    ) -> Result<Option<(Self, crate::SessionCheckpoint)>, SessionError> {
+        let Some(checkpoint) = store::load_checkpoint(directory, id)? else { return Ok(None) };
+        let mut turns = Vec::with_capacity(checkpoint.turns().len());
+        let mut bodies = Vec::with_capacity(checkpoint.turns().len());
+        for turn in checkpoint.turns() {
+            turns.push(turn.turn());
+            bodies.push(turn.display_body().to_owned());
+        }
+        Ok(Some((Self { id, turns, bodies }, checkpoint)))
     }
 
     /// Branch: a new session id carrying this session's turns. The
@@ -135,14 +215,9 @@ mod tests {
     use super::*;
 
     fn scratch() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "supra-session-l2-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("supra-session-l2-{}", std::process::id()));
+        dir.push(supra_types::SessionId::generate().to_string());
         std::fs::create_dir_all(&dir).expect("dir");
         dir
     }
@@ -230,5 +305,53 @@ mod tests {
             "a save after resume keeps the bodies rather than erasing them"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rich_checkpoint_survives_legacy_resume_and_save() {
+        let dir = scratch();
+        let session = Session::new();
+        let turn = supra_types::TurnId::generate();
+        let mut checkpoint = crate::SessionCheckpoint::new(session.id());
+        checkpoint
+            .push_turn(crate::CheckpointTurn::new(
+                turn,
+                "accepted",
+                vec![crate::ProtocolMessage::from_payload(serde_json::json!({
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "signature": "opaque"}],
+                    "provider_field": 7
+                }))],
+                Some(serde_json::json!({"usage": {"input": 2}})),
+            ))
+            .expect("turn");
+        checkpoint.set_ledger(Some(serde_json::json!({"generation": 4}))).expect("ledger");
+        checkpoint.set_config(Some(serde_json::json!({"model": "frozen"}))).expect("config");
+        session.save_checkpoint(&dir, &checkpoint, Some(0)).expect("rich save");
+
+        let resumed = Session::resume(&dir, session.id()).expect("resume").expect("present");
+        resumed.save(&dir).expect("legacy-compatible save");
+
+        let restored = store::load_checkpoint(&dir, session.id()).expect("load").expect("present");
+        assert_eq!(restored, checkpoint);
+        assert_eq!(restored.turns()[0].messages()[0].payload()["provider_field"], 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_turns_are_rejected_without_changing_the_first_record() {
+        let mut session = Session::new();
+        let turn = supra_types::TurnId::generate();
+
+        assert!(session.record_turn_with_body(turn, "first"));
+        assert!(!session.record_turn_with_body(turn, "replacement"));
+        assert!(!session.record_turn(turn));
+        assert_eq!(session.turns(), &[turn]);
+        assert_eq!(session.bodies(), &["first".to_owned()]);
+
+        let checkpoint = session.checkpoint().expect("unique session converts");
+        assert_eq!(checkpoint.turns().len(), 1);
+        assert_eq!(checkpoint.turns()[0].turn(), turn);
+        assert_eq!(checkpoint.turns()[0].display_body(), "first");
     }
 }

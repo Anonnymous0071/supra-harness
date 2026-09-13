@@ -165,15 +165,15 @@ impl Config {
         self.provider_sources.get(name).copied()
     }
 
-    /// Resolve one provider's credential to a [`SecretString`].
+    /// Resolve one provider's credential to a [`supra_secrets::SecretString`].
     ///
     /// The resolution ladder mirrors T12's: `api_key_env` is read from the process environment,
-    /// `api_key_keyring` is read through [`SecretManager`], which tries the OS keyring and then
+    /// `api_key_keyring` is read through [`supra_secrets::SecretManager`], which tries the OS keyring and then
     /// the encrypted file. T7's validation already guarantees exactly one source is named, so
     /// this function chooses rather than prioritises - and that is why it cannot fail on
     /// ambiguity. It fails only when the named source has nothing to give.
     ///
-    /// The result is a [`SecretString`], not a `String`: the caller receives a value whose
+    /// The result is a [`supra_secrets::SecretString`], not a `String`: the caller receives a value whose
     /// `Debug` and `Display` reveal nothing, so the credential cannot leak through a diagnostic
     /// between here and the HTTP layer. T8's redactor is the net beneath, not the mechanism.
     ///

@@ -73,7 +73,7 @@ nothing.
 
 ## Obligations left to later stages
 
-- **T23** wires `wait_event("stopped")` into the turn loop's step 7
-  escalation path when a finding asks for it; the client is synchronous
-  and the runtime owns timing.
+- **Executable integration** is pending: a future turn driver can wire
+  `wait_event("stopped")` into its deterministic-gate escalation path. The
+  current `supra run` path does not invoke DAP.
 - **T29** renders the stack trace where the finding pointed.

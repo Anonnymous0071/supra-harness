@@ -1,6 +1,6 @@
 //! `supra` — the single binary for T30.
 //!
-//! One binary, subcommands `run` (default), `eval`, `update`, `config show`.
+//! One binary, subcommands `run`, `eval`, `update`, `config show`.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -11,7 +11,9 @@
 
 mod args;
 mod registry;
+mod render;
 mod runtime;
+mod slash;
 mod startup;
 
 use args::{Cli, Command, ConfigAction, SandboxArg, UpdateAction};
@@ -21,32 +23,153 @@ fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
     cli.validate()?;
 
-    let command = cli.command.take().unwrap_or(Command::Run);
+    let command = cli
+        .command
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("a command is required; run `supra run --help` to execute a task"))?;
     match command {
-        Command::Run => run(cli),
+        Command::Run { provider, resume, task } => {
+            run(cli, provider.as_deref(), resume.as_deref(), &task.join(" "))
+        }
         Command::Eval { live } => eval_cmd(live),
         Command::Update { action } => update_cmd(action),
         Command::Config { action } => config_cmd(&cli, action),
     }
 }
 
-fn run(cli: Cli) -> anyhow::Result<()> {
+fn run(cli: Cli, provider: Option<&str>, resume: Option<&str>, task: &str) -> anyhow::Result<()> {
     let config = startup::discover_resolve(&cli)?;
     let log = startup::init_logging(&cli)?;
     let secrets = startup::open_secrets(&cli);
-    let _ = secrets.primary_backend();
     let sandbox_off = cli.sandbox == SandboxArg::Off;
     let wired = registry::wire(&config);
     let assembled = startup::assemble(config, log, sandbox_off);
-    let estimated = runtime::estimate_tier();
-    let planned = runtime::plan_turn(&assembled.config, estimated);
-    println!(
-        "mode {} cohort {} sessions {} | {}",
-        assembled.config.permission_mode().label(),
-        assembled.config.cohort_limit(),
-        wired.session_dir.display(),
-        runtime::describe(&planned)
-    );
+    let resume = resume
+        .map(str::parse::<supra_types::SessionId>)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("--resume is not a session id: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("tokio runtime: {error}"))?;
+    if !task.trim().is_empty() {
+        let result = runtime.block_on(runtime::execute_turn_resuming(
+            &assembled.config,
+            &secrets,
+            &wired.session_dir,
+            &wired.hooks,
+            resume,
+            provider,
+            task,
+        ))?;
+        println!("session {}", result.session);
+        println!("{}", result.answer);
+        return Ok(());
+    }
+    if resume.is_some() {
+        anyhow::bail!("--resume needs a task: `supra run --resume ID <task>` runs one turn on it");
+    }
+    repl(&assembled, &secrets, &wired, provider, &runtime)
+}
+
+fn repl(
+    assembled: &startup::Startup,
+    secrets: &supra_secrets::SecretManager,
+    wired: &registry::Wired,
+    provider: Option<&str>,
+    runtime: &tokio::runtime::Runtime,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead as _, Write as _};
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mut session: Option<supra_types::SessionId> = None;
+    loop {
+        print!("supra> ");
+        std::io::stdout().flush().map_err(|error| anyhow::anyhow!("stdout: {error}"))?;
+        let Some(line) = lines.next() else { break };
+        let line = line.map_err(|error| anyhow::anyhow!("stdin: {error}"))?;
+        let action = slash::dispatch(&wired.commands, slash::parse_line(&line))
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        match action {
+            slash::Action::Exit => break,
+            slash::Action::Help => {
+                for command in wired.commands.all() {
+                    println!("/{}\t{}", command.name, command.description);
+                }
+            }
+            slash::Action::Clear => {
+                print!("\x1b[2J\x1b[H");
+            }
+            slash::Action::Mode | slash::Action::Permissions => {
+                println!("mode {}", assembled.config.permission_mode().label());
+            }
+            slash::Action::Sandbox => {
+                println!("sandbox {}", if assembled.sandbox_off { "off" } else { "on" });
+            }
+            slash::Action::Telemetry => {
+                println!(
+                    "telemetry {}",
+                    wired.consent.map_or("off", |consent| match consent {
+                        supra_telemetry::Consent::Off => "off",
+                        supra_telemetry::Consent::On => "on",
+                    })
+                );
+            }
+            slash::Action::Model(current) => {
+                println!("model {}", current.as_deref().unwrap_or("(configured)"));
+            }
+            slash::Action::New => {
+                session = None;
+                println!("new session");
+            }
+            slash::Action::Resume(id) => {
+                let id = id
+                    .parse::<supra_types::SessionId>()
+                    .map_err(|error| anyhow::anyhow!("resume needs a session id, got {id:?}: {error}"))?;
+                session = Some(id);
+                println!("resumed {id}");
+            }
+            slash::Action::Branch => {
+                let Some(id) = session else {
+                    anyhow::bail!("branch needs a live session: run a task first");
+                };
+                let Some(saved) = supra_session::Session::resume(&wired.session_dir, id)? else {
+                    anyhow::bail!("no saved session {id}");
+                };
+                let branched = saved.branch();
+                let branched_id = branched.id();
+                branched.save(&wired.session_dir)?;
+                session = Some(branched_id);
+                println!("branched {id} -> {branched_id}");
+            }
+            slash::Action::Export => {
+                let Some(id) = session else {
+                    anyhow::bail!("export needs a live session: run a task first");
+                };
+                let Some(saved) = supra_session::Session::resume(&wired.session_dir, id)? else {
+                    anyhow::bail!("no saved session {id}");
+                };
+                println!("{}", saved.export_markdown());
+            }
+            slash::Action::Task(task) => {
+                if task.trim().is_empty() {
+                    continue;
+                }
+                let result = runtime.block_on(runtime::execute_turn_resuming(
+                    &assembled.config,
+                    secrets,
+                    &wired.session_dir,
+                    &wired.hooks,
+                    session,
+                    provider,
+                    &task,
+                ))?;
+                session = Some(result.session);
+                println!("session {}", result.session);
+                println!("{}", result.answer);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -66,14 +189,16 @@ fn eval_cmd(live: bool) -> anyhow::Result<()> {
 }
 
 async fn live_probe() -> anyhow::Result<()> {
-    let cli = Cli::try_parse_from(["supra"])?;
+    let cli = Cli::try_parse_from(["supra", "eval", "--live"])?;
     let config = startup::discover_resolve(&cli)?;
     let secrets = startup::open_secrets(&cli);
 
+    let mut configured = 0usize;
     for name in ["anthropic", "openai"] {
         if config.providers().get(name).is_none() {
             continue;
         }
+        configured += 1;
         let credential = match config.provider_secret(name, &secrets) {
             Ok(credential) => credential,
             Err(error) => {
@@ -85,10 +210,7 @@ async fn live_probe() -> anyhow::Result<()> {
         let request = supra_llm::Request {
             provider: client.provider(),
             model: client.model().to_owned(),
-            messages: vec![supra_llm::Message {
-                role: supra_llm::Role::User,
-                content: "Reply with exactly: live-ok".to_owned(),
-            }],
+            messages: vec![supra_llm::Message::text(supra_llm::Role::User, "Reply with exactly: live-ok")],
             tools: Vec::new(),
             thinking: supra_llm::Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
@@ -97,7 +219,7 @@ async fn live_probe() -> anyhow::Result<()> {
             Ok(completion) => {
                 println!(
                     "live probe {name}: ok text={:?} usage={:?}",
-                    completion.text.trim(),
+                    completion.text().trim(),
                     completion.usage
                 );
             }
@@ -107,24 +229,49 @@ async fn live_probe() -> anyhow::Result<()> {
             }
         }
     }
+    if configured == 0 {
+        println!("live probe: skipped (no configured providers)");
+    }
     Ok(())
-}
-
-fn update_check_message() -> anyhow::Result<String> {
-    let current = supra_update::parse_version(env!("CARGO_PKG_VERSION"))?;
-    Ok(format!("supra {current}: update check needs network; verify artefacts with supra_update::verify"))
 }
 
 fn update_cmd(action: UpdateAction) -> anyhow::Result<()> {
     match action {
-        UpdateAction::Check => {
-            println!("{}", update_check_message()?);
+        UpdateAction::Check { archive, manifest, signature, public_key } => {
+            let verified = supra_update::check_local(supra_update::LocalUpdate {
+                archive: &archive,
+                manifest: &manifest,
+                signature: &signature,
+                public_key: &public_key,
+                expected_target: supra_update::current_target(),
+            })?;
+            println!(
+                "verified supra {} for {}: {} -> {}",
+                verified.version(),
+                verified.target(),
+                verified.archive(),
+                verified.executable_path()
+            );
             Ok(())
         }
-        UpdateAction::Apply => {
-            anyhow::bail!(
-                "supra update apply refuses without a verified signature: fetch, verify, then apply"
-            );
+        UpdateAction::Apply { archive, manifest, signature, public_key, install_path } => {
+            let install_path = match install_path {
+                Some(path) => path,
+                None => std::env::current_exe()
+                    .map_err(|error| anyhow::anyhow!("resolve running supra executable: {error}"))?,
+            };
+            let outcome = supra_update::apply_local(
+                supra_update::LocalUpdate {
+                    archive: &archive,
+                    manifest: &manifest,
+                    signature: &signature,
+                    public_key: &public_key,
+                    expected_target: supra_update::current_target(),
+                },
+                &install_path,
+            )?;
+            println!("installed supra {} at {}", outcome.version, outcome.install_path.display());
+            Ok(())
         }
     }
 }
@@ -149,7 +296,7 @@ mod tests {
     fn the_live_probe_skips_providers_with_no_credential() {
         // An empty environment names no provider, so the probe has
         // nothing to call: absence is `Ok`, not a refusal.
-        let cli = Cli::try_parse_from(["supra"]).expect("args parse");
+        let cli = Cli::try_parse_from(["supra", "eval"]).expect("args parse");
         let config = startup::discover_resolve(&cli).expect("empty env resolves");
         assert!(config.providers().is_empty(), "no providers without configuration");
     }
@@ -158,7 +305,7 @@ mod tests {
     fn a_configured_provider_without_a_credential_is_named_not_panicked() {
         // The probe resolves the secret through the manager; a missing
         // credential is a skip with the provider named, never a panic.
-        let cli = Cli::try_parse_from(["supra"]).expect("args parse");
+        let cli = Cli::try_parse_from(["supra", "eval"]).expect("args parse");
         let config = startup::discover_resolve(&cli).expect("resolves");
         let secrets = startup::open_secrets(&cli);
         for name in ["anthropic", "openai"] {
@@ -170,18 +317,24 @@ mod tests {
     }
 
     #[test]
-    fn update_check_names_the_verifier() {
-        let message = update_check_message().expect("check never fails without network");
-        assert!(
-            message.contains("supra_update::verify"),
-            "check must name the verifier, not just any help: {message}"
-        );
-        update_cmd(UpdateAction::Check).expect("check never fails without network");
-    }
+    fn update_commands_fail_closed_on_missing_local_inputs() {
+        use std::path::PathBuf;
 
-    #[test]
-    fn update_apply_refuses_without_a_signature() {
-        let error = update_cmd(UpdateAction::Apply).expect_err("apply must refuse");
-        assert!(error.to_string().contains("verified signature"), "{error}");
+        let missing = PathBuf::from("definitely-missing-update-input");
+        let check = UpdateAction::Check {
+            archive: missing.clone(),
+            manifest: missing.clone(),
+            signature: missing.clone(),
+            public_key: missing.clone(),
+        };
+        assert!(update_cmd(check).is_err(), "check must not report an unavailable bundle as valid");
+        let apply = UpdateAction::Apply {
+            archive: missing.clone(),
+            manifest: missing.clone(),
+            signature: missing.clone(),
+            public_key: missing,
+            install_path: Some(PathBuf::from("must-not-be-created")),
+        };
+        assert!(update_cmd(apply).is_err(), "apply must verify before creating a destination");
     }
 }

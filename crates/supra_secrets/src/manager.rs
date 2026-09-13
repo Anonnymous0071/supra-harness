@@ -7,11 +7,12 @@
 //! ```
 //!
 //! The ladder is decided at [`SecretManager::open`] by probing the OS keyring, never assumed.
-//! `keyring` v4 reports `NoDefaultStore` within milliseconds when no Secret Service provider is
-//! running - measured, ~10 ms, on a machine with a session bus but no keyring daemon - so the
-//! probe is cheap and it cannot hang startup. If the probe fails, the encrypted file becomes the
-//! primary store. If that cannot work either (no passphrase source and no terminal), the error
-//! says exactly what to set rather than pretending a store exists.
+//! `keyring` v3 creates entries lazily, so the probe reads a dedicated sentinel: a value or
+//! [`keyring::Error::NoEntry`] proves the platform store answered, while every backend error
+//! selects the encrypted-file fallback. The probe never creates, changes, or deletes a secret.
+//! If the probe fails, the encrypted file becomes the primary store. If that cannot work either
+//! (no passphrase source and no terminal), the error says exactly what to set rather than
+//! pretending a store exists.
 //!
 //! # Why "primary" and "fallback", not a merged namespace
 //!
@@ -126,11 +127,14 @@ impl SecretManager {
     }
 
     fn open_with_store(file: FileStore) -> Self {
-        // Probing the keyring: `store_status` forces the one-time initialisation and returns
-        // its outcome without creating an entry. Measured at ~10 ms when the Secret Service is
-        // absent; it cannot block on a network service because there is nothing to reach.
-        let (keyring_available, keyring_probe_error) = match keyring::Entry::store_status() {
-            Ok(()) => (true, None),
+        // Entry construction validates only the service/account shape in keyring v3; the read is
+        // what connects to the native store. NoEntry is therefore a successful availability
+        // probe. A dedicated namespace keeps an accidental pre-existing value harmless, and the
+        // probe never writes or deletes it.
+        let probe = keyring::Entry::new("supra-harness-keyring-probe-v1", "availability")
+            .and_then(|entry| entry.get_password());
+        let (keyring_available, keyring_probe_error) = match probe {
+            Ok(_) | Err(keyring::Error::NoEntry) => (true, None),
             Err(error) => (false, Some(error.to_string())),
         };
 
@@ -243,13 +247,15 @@ impl SecretManager {
     ///
     /// # Errors
     ///
-    /// As the store that is primary.
+    /// Any error from either store. Deletion checks both stores when the keyring is available so
+    /// a fallback copy cannot silently survive a reported success.
     pub fn delete(&self, service: &str, account: &str) -> Result<bool, SecretsError> {
         if self.keyring_available {
             let removed = self.keyring_delete(service, account)?;
             // Also remove from the file, in case a previous headless session wrote it there.
-            let file_removed = self.file.delete(service, account).unwrap_or(false);
-            Ok(removed || file_removed)
+            // A corrupt or inaccessible fallback must remain visible: reporting success while a
+            // credential copy survives would violate the deletion contract.
+            combine_delete_results(removed, self.file.delete(service, account))
         } else {
             self.file.delete(service, account)
         }
@@ -287,5 +293,32 @@ impl SecretManager {
             Err(error) if is_no_entry(&error) => Ok(false),
             Err(error) => Err(SecretsError::Keyring(error.to_string())),
         }
+    }
+}
+
+fn combine_delete_results(
+    primary_removed: bool,
+    fallback_removed: Result<bool, SecretsError>,
+) -> Result<bool, SecretsError> {
+    fallback_removed.map(|removed| primary_removed || removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_delete_errors_are_not_suppressed_after_primary_success() {
+        let fallback_error = SecretsError::Crypto { detail: "fallback vault could not be opened".to_owned() };
+        let error =
+            combine_delete_results(true, Err(fallback_error)).expect_err("fallback error must propagate");
+        assert!(matches!(error, SecretsError::Crypto { .. }));
+    }
+
+    #[test]
+    fn deletion_reports_a_record_found_in_either_store() {
+        assert!(combine_delete_results(true, Ok(false)).expect("primary result"));
+        assert!(combine_delete_results(false, Ok(true)).expect("fallback result"));
+        assert!(!combine_delete_results(false, Ok(false)).expect("miss result"));
     }
 }

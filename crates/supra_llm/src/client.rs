@@ -43,7 +43,7 @@
 //!
 //! Until T14 lands, this client carries thinking blocks verbatim and never drops them.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::error::LlmError;
 use crate::policy::{CachePolicy, ProviderKind};
@@ -73,13 +73,179 @@ impl Thinking {
     }
 }
 
+/// One ordered content block in a provider message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContentBlock {
+    /// Visible text and any provider citations attached to it.
+    Text {
+        /// The text exactly as received or sent.
+        text: String,
+        /// Provider citation objects, retained verbatim and in order.
+        citations: Vec<serde_json::Value>,
+    },
+    /// Claude reasoning that must be replayed with its signature unchanged.
+    Thinking {
+        /// Reasoning text.
+        thinking: String,
+        /// Provider signature authenticating the reasoning block.
+        signature: String,
+    },
+    /// Provider-redacted reasoning that must still be replayed unchanged.
+    RedactedThinking {
+        /// Opaque provider payload.
+        data: String,
+    },
+    /// A model request to invoke a tool.
+    ToolUse {
+        /// Provider-assigned tool-use identifier.
+        id: String,
+        /// Registered tool name.
+        name: String,
+        /// Tool input exactly as structured by the provider.
+        input: serde_json::Value,
+    },
+    /// A host result corresponding to a prior tool use.
+    ToolResult {
+        /// Identifier of the tool use this answers.
+        tool_use_id: String,
+        /// Result content: either a string or an ordered array of provider blocks.
+        content: serde_json::Value,
+        /// Whether execution failed.
+        is_error: bool,
+    },
+    /// A provider block this version does not interpret, retained for lossless replay.
+    Unknown {
+        /// The complete provider object.
+        raw: serde_json::Value,
+    },
+}
+
+impl ContentBlock {
+    /// Construct a visible text block.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into(), citations: Vec::new() }
+    }
+
+    fn wire_value(&self) -> serde_json::Value {
+        match self {
+            Self::Text { text, citations } => {
+                let mut value = serde_json::json!({"type": "text", "text": text});
+                if !citations.is_empty() {
+                    value["citations"] = serde_json::Value::Array(citations.clone());
+                }
+                value
+            }
+            Self::Thinking { thinking, signature } => {
+                serde_json::json!({"type": "thinking", "thinking": thinking, "signature": signature})
+            }
+            Self::RedactedThinking { data } => {
+                serde_json::json!({"type": "redacted_thinking", "data": data})
+            }
+            Self::ToolUse { id, name, input } => {
+                serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+            }
+            Self::ToolResult { tool_use_id, content, is_error } => {
+                let mut value = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": content,
+                });
+                if *is_error {
+                    value["is_error"] = serde_json::Value::Bool(true);
+                }
+                value
+            }
+            Self::Unknown { raw } => raw.clone(),
+        }
+    }
+
+    fn from_wire_value(value: serde_json::Value) -> Result<Self, String> {
+        let kind = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "content block has no string type".to_owned())?;
+        let string = |field: &str| {
+            value
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{kind} content block has no string {field}"))
+        };
+        match kind {
+            "text" => Ok(Self::Text {
+                text: string("text")?,
+                citations: value
+                    .get("citations")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            }),
+            "thinking" => {
+                Ok(Self::Thinking { thinking: string("thinking")?, signature: string("signature")? })
+            }
+            "redacted_thinking" => Ok(Self::RedactedThinking { data: string("data")? }),
+            "tool_use" => Ok(Self::ToolUse {
+                id: string("id")?,
+                name: string("name")?,
+                input: value.get("input").cloned().unwrap_or(serde_json::Value::Null),
+            }),
+            "tool_result" => Ok(Self::ToolResult {
+                tool_use_id: string("tool_use_id")?,
+                content: value.get("content").cloned().unwrap_or(serde_json::Value::String(String::new())),
+                is_error: value.get("is_error").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            }),
+            _ => Ok(Self::Unknown { raw: value }),
+        }
+    }
+}
+
+impl Serialize for ContentBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.wire_value().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_wire_value(value).map_err(D::Error::custom)
+    }
+}
+
 /// One message in a request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     /// Who authored it.
     pub role: Role,
-    /// Text content. Canonical text, not rendered prose: T14 owns rendering.
-    pub content: String,
+    /// Ordered content. Replay-required thinking and tool blocks retain their exact order.
+    pub content: Vec<ContentBlock>,
+}
+
+impl Message {
+    /// Construct a one-block text message.
+    #[must_use]
+    pub fn text(role: Role, text: impl Into<String>) -> Self {
+        Self { role, content: vec![ContentBlock::text(text)] }
+    }
+
+    /// Join only visible text blocks in their original order.
+    #[must_use]
+    pub fn text_content(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// A request to one provider.
@@ -145,17 +311,77 @@ pub struct Usage {
     pub cached_tokens: u64,
 }
 
-/// A completed response.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why a provider stopped generating.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// The model completed the turn normally.
+    EndTurn,
+    /// The model emitted tool-use blocks and requires results.
+    ToolUse,
+    /// The configured output-token limit truncated the answer.
+    MaxTokens,
+    /// A configured stop sequence ended generation.
+    StopSequence,
+    /// Claude paused a long-running server-tool turn and expects continuation.
+    PauseTurn,
+    /// Claude refused the request.
+    Refusal,
+    /// The model's context window was exceeded while generating.
+    ModelContextWindowExceeded,
+    /// The provider removed content under its safety policy.
+    ContentFilter,
+    /// A provider-specific terminal reason not otherwise classified.
+    Other(String),
+}
+
+/// A completed provider response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Completion {
-    /// Text answer.
-    pub text: String,
+    /// Ordered assistant blocks, including replay-required thinking and tool use.
+    pub content: Vec<ContentBlock>,
+    /// Why generation stopped. Callers continue `ToolUse` and must not seal `MaxTokens`.
+    pub stop_reason: StopReason,
+    /// Custom stop sequence, when [`StopReason::StopSequence`] applies.
+    pub stop_sequence: Option<String>,
+    /// Model identifier reported by the provider.
+    pub model: String,
+    /// Provider request identifier, when available.
+    pub request_id: Option<String>,
     /// What the provider reported. `None` when the provider omits usage (`Google`'s
     /// implicit caching reports `total_cached_tokens` unreliably, so absence is an
     /// answer, not an error).
     pub usage: Option<Usage>,
     /// The thinking budget the request carried, echoed for reconciliation.
     pub thinking: Thinking,
+}
+
+impl Completion {
+    /// Join visible text blocks in generation order.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Construct a terminal text completion for non-provider callers and tests.
+    #[must_use]
+    pub fn end_turn(text: impl Into<String>, usage: Option<Usage>, thinking: Thinking) -> Self {
+        Self {
+            content: vec![ContentBlock::text(text)],
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+            model: String::new(),
+            request_id: None,
+            usage,
+            thinking,
+        }
+    }
 }
 
 /// A provider client: policy, endpoint, and credential source.
@@ -268,23 +494,25 @@ impl Client {
     /// Send one request through the client, resolving the credential
     /// from the configuration on the way.
     ///
-    /// This is the one-call path a turn drives: provider entry for the
-    /// request's kind, secret from the named source, SDK transport
-    /// underneath. The request's own provider field selects the entry;
-    /// the client's policy still gates thinking and breakpoints.
+    /// This is the one-call path a turn drives: the client-bound provider
+    /// entry, its named secret source, and its SDK transport underneath.
+    /// A request naming another provider is rejected before secret resolution,
+    /// so a credential can never cross provider boundaries.
     ///
     /// # Errors
     ///
-    /// [`LlmError::Credential`] when the named source has nothing to
-    /// give; otherwise as [`Client::send`].
+    /// [`LlmError::ProviderMismatch`] when the request names a provider other
+    /// than this client; [`LlmError::Credential`] when the bound provider's
+    /// named source has nothing to give; otherwise as [`Client::send`].
     pub async fn send_with_config(
         &self,
         config: &supra_config::Config,
         manager: &supra_secrets::SecretManager,
         request: &Request,
     ) -> Result<Completion, LlmError> {
+        self.check_provider(request)?;
         let credential =
-            config.provider_secret(request.provider.name(), manager).map_err(LlmError::Credential)?;
+            config.provider_secret(self.policy.kind.name(), manager).map_err(LlmError::Credential)?;
         self.send(request, &credential).await
     }
 
@@ -340,13 +568,14 @@ impl Client {
         match self.policy.kind {
             ProviderKind::Anthropic => Self::render_anthropic(request, &mut body),
             ProviderKind::OpenAI => Self::render_openai(request, &mut body),
-            ProviderKind::Google => Self::render_google(request, &mut body),
+            ProviderKind::Google => Self::render_google(request, &mut body)?,
         }
         crate::canonicalize_value(&serde_json::Value::Object(body))
     }
 
     fn render_anthropic(request: &Request, body: &mut serde_json::Map<String, serde_json::Value>) {
         body.insert("max_tokens".to_owned(), serde_json::Value::from(32_000));
+        body.insert("stream".to_owned(), serde_json::Value::Bool(true));
         body.insert("messages".to_owned(), Self::messages_value(request));
         if !request.tools.is_empty() {
             if let Ok(tools) = Self::tools_value(request) {
@@ -354,30 +583,63 @@ impl Client {
             }
         }
         if request.thinking.enabled() {
-            body.insert(
-                "thinking".to_owned(),
+            let thinking = if anthropic_supports_adaptive_thinking(
+                body.get("model").and_then(serde_json::Value::as_str).unwrap_or_default(),
+            ) {
+                serde_json::json!({"type": "adaptive"})
+            } else {
                 serde_json::json!({
                     "type": "enabled",
                     "budget_tokens": request.thinking.budget_tokens,
-                }),
-            );
-        }
-        let policy = CachePolicy::for_kind(ProviderKind::Anthropic);
-        let breakpoints: Vec<serde_json::Value> = request
-            .effective_breakpoints()
-            .iter()
-            .map(|breakpoint| {
-                serde_json::json!({
-                    "type": "ephemeral",
-                    "ttl": match policy.ttl_for(*breakpoint) {
-                        supra_types::CacheTtl::OneHour => "1h",
-                        supra_types::CacheTtl::FiveMinutes => "5m",
-                    },
                 })
-            })
-            .collect();
-        if !breakpoints.is_empty() {
-            body.insert("cache_control".to_owned(), serde_json::Value::Array(breakpoints));
+            };
+            body.insert("thinking".to_owned(), thinking);
+        }
+        Self::apply_anthropic_cache_controls(request, body);
+    }
+
+    fn apply_anthropic_cache_controls(
+        request: &Request,
+        body: &mut serde_json::Map<String, serde_json::Value>,
+    ) {
+        let policy = CachePolicy::for_kind(ProviderKind::Anthropic);
+        for breakpoint in request.effective_breakpoints() {
+            let cache_control = serde_json::json!({
+                "type": "ephemeral",
+                "ttl": match policy.ttl_for(breakpoint) {
+                    supra_types::CacheTtl::OneHour => "1h",
+                    supra_types::CacheTtl::FiveMinutes => "5m",
+                },
+            });
+            match breakpoint {
+                supra_types::Breakpoint::Bp1Tools => {
+                    if let Some(tool) = body
+                        .get_mut("tools")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|tools| tools.last_mut())
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        tool.insert("cache_control".to_owned(), cache_control);
+                    }
+                }
+                supra_types::Breakpoint::Bp2System | supra_types::Breakpoint::Bp3MemoryIndex => {
+                    // `Request` does not carry system/memory blocks separately yet. Do not
+                    // invent a top-level cache-control shape the API does not accept.
+                }
+                supra_types::Breakpoint::Bp4PreviousTurn => {
+                    if let Some(block) = body
+                        .get_mut("messages")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|messages| messages.last_mut())
+                        .and_then(|message| message.get_mut("content"))
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|content| content.last_mut())
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        block.insert("cache_control".to_owned(), cache_control);
+                    }
+                }
+            }
         }
     }
 
@@ -394,25 +656,71 @@ impl Client {
         body.insert("prompt_cache_key".to_owned(), serde_json::Value::String("supra-prefix".to_owned()));
     }
 
-    fn render_google(request: &Request, body: &mut serde_json::Map<String, serde_json::Value>) {
-        let contents: Vec<serde_json::Value> = request
-            .messages
-            .iter()
-            .map(|message| {
-                serde_json::json!({
-                    "role": match message.role {
-                        Role::User => "user",
-                        Role::Assistant => "model",
-                    },
-                    "parts": [{"text": message.content}],
-                })
-            })
-            .collect();
+    fn render_google(
+        request: &Request,
+        body: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), crate::CanonicalError> {
+        let mut function_names = std::collections::BTreeMap::new();
+        for message in &request.messages {
+            if message.role != Role::Assistant {
+                continue;
+            }
+            for block in &message.content {
+                if let ContentBlock::ToolUse { id, name, .. } = block {
+                    function_names.insert(id.as_str(), name.as_str());
+                }
+            }
+        }
+
+        let mut contents = Vec::with_capacity(request.messages.len());
+        for message in &request.messages {
+            let mut parts = Vec::with_capacity(message.content.len());
+            for block in &message.content {
+                match block {
+                    ContentBlock::Text { text, .. } => {
+                        parts.push(serde_json::json!({"text": text}));
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        let mut call = serde_json::json!({"name": name, "args": input});
+                        if !id.is_empty() {
+                            call["id"] = serde_json::Value::String(id.clone());
+                        }
+                        parts.push(serde_json::json!({"functionCall": call}));
+                    }
+                    ContentBlock::ToolResult { tool_use_id, content, is_error: _ } => {
+                        let name = function_names.get(tool_use_id.as_str()).ok_or_else(|| {
+                            crate::CanonicalError::Invalid {
+                                detail: format!(
+                                    "Google tool result {tool_use_id:?} has no matching function call"
+                                ),
+                            }
+                        })?;
+                        let mut response = serde_json::json!({
+                            "name": name,
+                            "response": content,
+                        });
+                        if !tool_use_id.is_empty() {
+                            response["id"] = serde_json::Value::String(tool_use_id.clone());
+                        }
+                        parts.push(serde_json::json!({"functionResponse": response}));
+                    }
+                    ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::Unknown { .. } => {}
+                }
+            }
+            contents.push(serde_json::json!({
+                "role": match message.role {
+                    Role::User => "user",
+                    Role::Assistant => "model",
+                },
+                "parts": parts,
+            }));
+        }
         body.insert("contents".to_owned(), serde_json::Value::Array(contents));
         if !request.tools.is_empty() {
-            if let Ok(tools) = Self::tools_value(request) {
-                body.insert("tools".to_owned(), serde_json::json!([{"function_declarations": tools}]));
-            }
+            let declarations = Self::google_tools_value(request)?;
+            body.insert("tools".to_owned(), serde_json::json!([{"functionDeclarations": declarations}]));
         }
         if request.thinking.enabled() {
             body.insert(
@@ -422,6 +730,25 @@ impl Client {
                 }),
             );
         }
+        Ok(())
+    }
+
+    fn google_tools_value(request: &Request) -> Result<serde_json::Value, crate::CanonicalError> {
+        let parsed = Self::tools_value(request)?;
+        let serde_json::Value::Array(mut declarations) = parsed else {
+            return Err(crate::CanonicalError::Invalid {
+                detail: "Google tool declarations are not an array".to_owned(),
+            });
+        };
+        for declaration in &mut declarations {
+            let object = declaration.as_object_mut().ok_or_else(|| crate::CanonicalError::Invalid {
+                detail: "Google tool declaration is not an object".to_owned(),
+            })?;
+            if let Some(input_schema) = object.remove("input_schema") {
+                object.insert("parameters".to_owned(), input_schema);
+            }
+        }
+        Ok(serde_json::Value::Array(declarations))
     }
 
     fn messages_value(request: &Request) -> serde_json::Value {
@@ -454,10 +781,11 @@ impl Client {
 
     /// Send one request and read the completion.
     ///
-    /// Anthropic and `OpenAI` travel through their official SDKs; Google
-    /// keeps the hand-rolled transport (no official Rust SDK exists),
-    /// with the same body rendering, status mapping, and SSE reading as
-    /// before. The error contract is identical on every path.
+    /// Anthropic uses the canonical request bytes produced here directly;
+    /// `OpenAI` travels through its official SDK. Google keeps the
+    /// hand-rolled transport (no official Rust SDK exists), with the same
+    /// body rendering, status mapping, and SSE reading as before. The error
+    /// contract is identical on every path.
     ///
     /// # Errors
     ///
@@ -469,10 +797,12 @@ impl Client {
         request: &Request,
         credential: &supra_secrets::SecretString,
     ) -> Result<Completion, LlmError> {
+        self.check_provider(request)?;
         request.check()?;
         match self.policy.kind {
             ProviderKind::Anthropic => {
                 crate::providers::send_anthropic(
+                    self.http.clone(),
                     request,
                     sdk_endpoint(&self.endpoint),
                     &self.model,
@@ -493,6 +823,17 @@ impl Client {
                 .await
             }
             ProviderKind::Google => self.send_legacy(request, credential).await,
+        }
+    }
+
+    fn check_provider(&self, request: &Request) -> Result<(), LlmError> {
+        if request.provider == self.policy.kind {
+            Ok(())
+        } else {
+            Err(LlmError::ProviderMismatch {
+                client: self.policy.kind.name().to_owned(),
+                request: request.provider.name().to_owned(),
+            })
         }
     }
 
@@ -535,14 +876,43 @@ impl Client {
             });
         }
         if !status.is_success() {
-            return Err(LlmError::Transport {
-                provider: self.policy.kind.name().to_owned(),
-                detail: format!("HTTP {status}"),
-            });
+            let detail = response.text().await.unwrap_or_default();
+            let detail = format!("HTTP {status}: {detail}");
+            return if status.is_server_error() {
+                Err(LlmError::Transport { provider: self.policy.kind.name().to_owned(), detail })
+            } else {
+                Err(LlmError::BadResponse { provider: self.policy.kind.name().to_owned(), detail })
+            };
         }
 
-        read_sse(response, request.thinking).await
+        read_google_sse(response, request.thinking).await
     }
+}
+
+/// Adaptive thinking is accepted by current Claude 4.6+ and 5-series models.
+/// Older model families still require the budget-based request shape.
+fn anthropic_supports_adaptive_thinking(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+    ]
+    .iter()
+    .any(|family| model_family_matches(&model, family))
+}
+
+fn model_family_matches(model: &str, family: &str) -> bool {
+    model.match_indices(family).any(|(start, _)| {
+        let before = model[..start].chars().next_back();
+        let after = model[start + family.len()..].chars().next();
+        !before.is_some_and(|character| character.is_ascii_alphanumeric())
+            && !after.is_some_and(|character| character.is_ascii_alphanumeric())
+    })
 }
 
 /// The endpoint as an SDK base override: `None` when the configuration
@@ -601,6 +971,115 @@ fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
     60_000
 }
 
+/// Native Google stream state. `generateContent` returns candidate parts rather than
+/// OpenAI-style deltas; keeping ordered blocks here lets a function call replay byte-for-byte.
+#[derive(Default)]
+struct GoogleStreamState {
+    content: Vec<ContentBlock>,
+    stop_reason: Option<StopReason>,
+    model: String,
+    request_id: Option<String>,
+    usage: Option<Usage>,
+    saw_tool_use: bool,
+}
+
+impl GoogleStreamState {
+    fn apply_event(&mut self, json: &serde_json::Value) -> Result<(), String> {
+        let candidate = json
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|candidates| candidates.first());
+        if let Some(candidate) = candidate {
+            if let Some(parts) = candidate
+                .get("content")
+                .and_then(|content| content.get("parts"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                        self.content.push(ContentBlock::text(text));
+                    }
+                    if let Some(call) = part.get("functionCall") {
+                        let name = call
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| "Google functionCall has no string name".to_owned())?;
+                        let id = call.get("id").and_then(serde_json::Value::as_str).unwrap_or_default();
+                        let input = call
+                            .get("args")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                        self.content.push(ContentBlock::ToolUse {
+                            id: id.to_owned(),
+                            name: name.to_owned(),
+                            input,
+                        });
+                        self.saw_tool_use = true;
+                    }
+                }
+            }
+            if let Some(reason) = candidate.get("finishReason").and_then(serde_json::Value::as_str) {
+                let parsed = parse_stop_reason(reason);
+                self.stop_reason = Some(if self.saw_tool_use && parsed == StopReason::EndTurn {
+                    StopReason::ToolUse
+                } else {
+                    parsed
+                });
+            }
+        } else {
+            if let Some(delta) =
+                json.get("delta").and_then(|delta| delta.get("text")).and_then(serde_json::Value::as_str)
+            {
+                self.content.push(ContentBlock::text(delta));
+            } else if let Some(delta) =
+                json.get("choices").and_then(|choices| choices.get(0)).and_then(|choice| {
+                    choice
+                        .get("delta")
+                        .and_then(|delta| delta.get("content"))
+                        .and_then(serde_json::Value::as_str)
+                })
+            {
+                self.content.push(ContentBlock::text(delta));
+            }
+            if let Some(reason) = json.get("stop_reason").and_then(serde_json::Value::as_str).or_else(|| {
+                json.get("choices")
+                    .and_then(|choices| choices.get(0))
+                    .and_then(|choice| choice.get("finish_reason"))
+                    .and_then(serde_json::Value::as_str)
+            }) {
+                self.stop_reason = Some(parse_stop_reason(reason));
+            }
+        }
+
+        if let Some(model) =
+            json.get("modelVersion").or_else(|| json.get("model")).and_then(serde_json::Value::as_str)
+        {
+            model.clone_into(&mut self.model);
+        }
+        if let Some(id) =
+            json.get("responseId").or_else(|| json.get("id")).and_then(serde_json::Value::as_str)
+        {
+            self.request_id = Some(id.to_owned());
+        }
+        if let Some(usage) = parse_usage(json) {
+            self.usage = Some(usage);
+        }
+        Ok(())
+    }
+
+    fn into_completion(self, stop_reason: StopReason, thinking: Thinking) -> Completion {
+        Completion {
+            content: self.content,
+            stop_reason,
+            stop_sequence: None,
+            model: self.model,
+            request_id: self.request_id,
+            usage: self.usage,
+            thinking,
+        }
+    }
+}
+
 /// Read a server-sent-event stream into a completion.
 ///
 /// Splits on event boundaries (`\n\n`), parses each `data:` payload, accumulates `text`
@@ -610,7 +1089,8 @@ fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
 ///
 /// A stream that ends without a terminal marker is refused even when text arrived:
 /// partial text returned as a success is a wrong answer wearing a green light.
-async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Completion, LlmError> {
+#[allow(clippy::too_many_lines, reason = "the streaming parser keeps one explicit terminal-state machine")]
+async fn read_google_sse(response: reqwest::Response, thinking: Thinking) -> Result<Completion, LlmError> {
     use futures::StreamExt as _;
 
     // The provider name for errors. Recovered from the URL is wrong (a custom endpoint
@@ -619,9 +1099,7 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
     let provider = response.url().host_str().unwrap_or("unknown").to_owned();
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
-    let mut text = String::new();
-    let mut usage: Option<Usage> = None;
-    let mut terminal = false;
+    let mut state = GoogleStreamState::default();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
@@ -635,7 +1113,12 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
                 let Some(payload) = line.strip_prefix("data:") else { continue };
                 let payload = payload.trim();
                 if payload == "[DONE]" {
-                    return Ok(Completion { text, usage, thinking });
+                    let stop_reason = state.stop_reason.take().unwrap_or(if state.saw_tool_use {
+                        StopReason::ToolUse
+                    } else {
+                        StopReason::EndTurn
+                    });
+                    return Ok(state.into_completion(stop_reason, thinking));
                 }
                 let json: serde_json::Value =
                     serde_json::from_str(payload).map_err(|_| LlmError::BadResponse {
@@ -658,47 +1141,36 @@ async fn read_sse(response: reqwest::Response, thinking: Thinking) -> Result<Com
                         .unwrap_or("the provider sent an error object");
                     return Err(LlmError::BadResponse { provider, detail: detail.to_owned() });
                 }
-                if let Some(delta) =
-                    json.get("delta").and_then(|delta| delta.get("text")).and_then(serde_json::Value::as_str)
-                {
-                    text.push_str(delta);
-                } else if let Some(delta) =
-                    json.get("choices").and_then(|choices| choices.get(0)).and_then(|choice| {
-                        choice
-                            .get("delta")
-                            .and_then(|delta| delta.get("content"))
-                            .and_then(serde_json::Value::as_str)
-                    })
-                {
-                    text.push_str(delta);
-                }
-                // A message_delta with stop_reason, or a finish_reason, ends the answer
-                // even where the sentinel is absent.
-                if json.get("stop_reason").is_some()
-                    || json
-                        .get("choices")
-                        .and_then(|choices| choices.get(0))
-                        .and_then(|choice| choice.get("finish_reason"))
-                        .is_some()
-                {
-                    terminal = true;
-                }
-                // Usage arrives on the final event (Anthropic) or as usage (OpenAI).
-                if let Some(reported) = parse_usage(&json) {
-                    usage = Some(reported);
-                }
+                state
+                    .apply_event(&json)
+                    .map_err(|detail| LlmError::BadResponse { provider: provider.clone(), detail })?;
             }
         }
     }
-    if !terminal {
-        let detail = if text.is_empty() {
+    let Some(stop_reason) = state.stop_reason.take() else {
+        let detail = if state.content.is_empty() {
             "the stream ended with no events".to_owned()
         } else {
             "the stream ended before a terminal marker".to_owned()
         };
         return Err(LlmError::BadResponse { provider, detail });
+    };
+    Ok(state.into_completion(stop_reason, thinking))
+}
+
+fn parse_stop_reason(reason: &str) -> StopReason {
+    match reason {
+        "end_turn" | "stop" | "STOP" => StopReason::EndTurn,
+        "tool_use" | "tool_calls" | "function_call" => StopReason::ToolUse,
+        "max_tokens" | "length" | "MAX_TOKENS" => StopReason::MaxTokens,
+        "stop_sequence" => StopReason::StopSequence,
+        "pause_turn" => StopReason::PauseTurn,
+        "refusal" => StopReason::Refusal,
+        "model_context_window_exceeded" => StopReason::ModelContextWindowExceeded,
+        "content_filter" | "safety" | "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT"
+        | "SPII" | "IMAGE_SAFETY" => StopReason::ContentFilter,
+        other => StopReason::Other(other.to_owned()),
     }
-    Ok(Completion { text, usage, thinking })
 }
 
 /// Byte offset just past the next `\n\n` boundary, if one is buffered.
@@ -711,16 +1183,24 @@ fn find_event_end(buffer: &[u8]) -> Option<usize> {
 fn parse_usage(json: &serde_json::Value) -> Option<Usage> {
     // Anthropic: { usage: { input_tokens, output_tokens, cache_read_input_tokens } }.
     // OpenAI: { usage: { prompt_tokens, completion_tokens, prompt_tokens_details? } }.
-    let usage = json.get("usage")?;
+    // Google: { usageMetadata: { promptTokenCount, candidatesTokenCount, cachedContentTokenCount? } }.
+    let usage = json.get("usage").or_else(|| json.get("usageMetadata"))?;
     let input = usage
         .get("input_tokens")
         .or_else(|| usage.get("prompt_tokens"))
+        .or_else(|| usage.get("promptTokenCount"))
         .and_then(serde_json::Value::as_u64)?;
     let output = usage
         .get("output_tokens")
         .or_else(|| usage.get("completion_tokens"))
+        .or_else(|| usage.get("candidatesTokenCount"))
         .and_then(serde_json::Value::as_u64)?;
-    let cached = usage.get("cache_read_input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let cached = usage
+        .get("cache_read_input_tokens")
+        .or_else(|| usage.get("cachedContentTokenCount"))
+        .or_else(|| usage.get("prompt_tokens_details").and_then(|details| details.get("cached_tokens")))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     Some(Usage { input_tokens: input, output_tokens: output, cached_tokens: cached })
 }
 
@@ -746,7 +1226,7 @@ mod tests {
         let request = Request {
             provider: ProviderKind::Anthropic,
             model: "m".to_owned(),
-            messages: vec![Message { role: Role::User, content: "hi".to_owned() }],
+            messages: vec![Message::text(Role::User, "hi")],
             tools: vec![crate::canonicalize(r#"{"b":1,"a":2}"#).expect("canonical")],
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Vec::new(),
@@ -763,8 +1243,10 @@ mod tests {
         let request = Request {
             provider: ProviderKind::Anthropic,
             model: "m".to_owned(),
-            messages: Vec::new(),
-            tools: Vec::new(),
+            messages: vec![Message::text(Role::User, "cache me")],
+            tools: vec![
+                crate::canonicalize(r#"{"input_schema":{"type":"object"},"name":"lookup"}"#).expect("tool"),
+            ],
             thinking: Thinking { budget_tokens: 0 },
             breakpoints: Breakpoint::ALL.to_vec(),
         };
@@ -787,7 +1269,7 @@ mod tests {
 
     #[test]
     fn each_provider_renders_its_own_wire_shape() {
-        let messages = vec![Message { role: Role::User, content: "hi".to_owned() }];
+        let messages = vec![Message::text(Role::User, "hi")];
 
         let anthropic = test_client(ProviderKind::Anthropic);
         let request = Request {
@@ -801,7 +1283,7 @@ mod tests {
         let body = anthropic.render_body(&request).expect("anthropic renders");
         assert!(body.as_str().contains("\"max_tokens\""), "{}", body.as_str());
         assert!(
-            body.as_str().contains(r#""messages":[{"content":"hi","role":"user"}]"#),
+            body.as_str().contains(r#""messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}]"#),
             "{}",
             body.as_str()
         );
@@ -810,7 +1292,7 @@ mod tests {
         let request = Request { provider: ProviderKind::OpenAI, model: "m".to_owned(), ..request.clone() };
         let body = openai.render_body(&request).expect("openai renders");
         assert!(
-            body.as_str().contains(r#""messages":[{"content":"hi","role":"user"}]"#),
+            body.as_str().contains(r#""messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}]"#),
             "{}",
             body.as_str()
         );
@@ -825,6 +1307,174 @@ mod tests {
             body.as_str()
         );
         assert!(!body.as_str().contains("\"messages\""), "{}", body.as_str());
+    }
+
+    #[test]
+    fn google_native_tools_calls_and_results_have_exact_wire_shape() {
+        let client = test_client(ProviderKind::Google);
+        let request = Request {
+            provider: ProviderKind::Google,
+            model: "m".to_owned(),
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::ToolUse {
+                            id: "call-a".to_owned(),
+                            name: "lookup".to_owned(),
+                            input: serde_json::json!({"query": "a"}),
+                        },
+                        ContentBlock::ToolUse {
+                            id: "call-b".to_owned(),
+                            name: "lookup".to_owned(),
+                            input: serde_json::json!({"query": "b"}),
+                        },
+                    ],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call-b".to_owned(),
+                            content: serde_json::json!({"value": "B"}),
+                            is_error: false,
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call-a".to_owned(),
+                            content: serde_json::json!({"value": "A"}),
+                            is_error: false,
+                        },
+                    ],
+                },
+            ],
+            tools: vec![crate::canonicalize(
+                r#"{"description":"Lookup a value","input_schema":{"properties":{"query":{"type":"string"}},"required":["query"],"type":"object"},"name":"lookup"}"#,
+            )
+            .expect("tool")],
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+
+        let body = client.render_body(&request).expect("Google tool request renders");
+        assert_eq!(
+            body.as_str(),
+            r#"{"contents":[{"parts":[{"functionCall":{"args":{"query":"a"},"id":"call-a","name":"lookup"}},{"functionCall":{"args":{"query":"b"},"id":"call-b","name":"lookup"}}],"role":"model"},{"parts":[{"functionResponse":{"id":"call-b","name":"lookup","response":{"value":"B"}}},{"functionResponse":{"id":"call-a","name":"lookup","response":{"value":"A"}}}],"role":"user"}],"model":"test-model","tools":[{"functionDeclarations":[{"description":"Lookup a value","name":"lookup","parameters":{"properties":{"query":{"type":"string"}},"required":["query"],"type":"object"}}]}]}"#
+        );
+    }
+
+    #[test]
+    fn google_native_function_call_parses_and_replays_exactly() {
+        let mut state = GoogleStreamState::default();
+        state
+            .apply_event(&serde_json::json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "functionCall": {
+                                "args": {"query": "x"},
+                                "id": "call-7",
+                                "name": "lookup"
+                            }
+                        }],
+                        "role": "model"
+                    },
+                    "finishReason": "STOP"
+                }],
+                "modelVersion": "gemini-3-pro-preview",
+                "responseId": "response-7",
+                "usageMetadata": {
+                    "cachedContentTokenCount": 3,
+                    "candidatesTokenCount": 5,
+                    "promptTokenCount": 11
+                }
+            }))
+            .expect("native event parses");
+        assert_eq!(
+            state.content,
+            vec![ContentBlock::ToolUse {
+                id: "call-7".to_owned(),
+                name: "lookup".to_owned(),
+                input: serde_json::json!({"query": "x"}),
+            }]
+        );
+        assert_eq!(state.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(state.model, "gemini-3-pro-preview");
+        assert_eq!(state.request_id.as_deref(), Some("response-7"));
+        assert_eq!(state.usage, Some(Usage { input_tokens: 11, output_tokens: 5, cached_tokens: 3 }));
+
+        let client = test_client(ProviderKind::Google);
+        let request = Request {
+            provider: ProviderKind::Google,
+            model: "m".to_owned(),
+            messages: vec![Message { role: Role::Assistant, content: state.content }],
+            tools: Vec::new(),
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+        let body = client.render_body(&request).expect("parsed function call replays");
+        assert_eq!(
+            body.as_str(),
+            r#"{"contents":[{"parts":[{"functionCall":{"args":{"query":"x"},"id":"call-7","name":"lookup"}}],"role":"model"}],"model":"test-model"}"#
+        );
+    }
+
+    #[test]
+    fn google_refuses_a_result_without_its_function_call() {
+        let client = test_client(ProviderKind::Google);
+        let request = Request {
+            provider: ProviderKind::Google,
+            model: "m".to_owned(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "missing-call".to_owned(),
+                    content: serde_json::json!({"value": "orphaned"}),
+                    is_error: false,
+                }],
+            }],
+            tools: Vec::new(),
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+
+        let error = client.render_body(&request).expect_err("orphaned result must not be mislabeled");
+        assert!(error.to_string().contains("missing-call"), "{error}");
+    }
+
+    #[test]
+    fn anthropic_replay_bytes_keep_order_and_signatures() {
+        let client = test_client(ProviderKind::Anthropic);
+        let request = Request {
+            provider: ProviderKind::Anthropic,
+            model: "m".to_owned(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking { thinking: "trace".to_owned(), signature: "sig".to_owned() },
+                    ContentBlock::RedactedThinking { data: "opaque".to_owned() },
+                    ContentBlock::ToolUse {
+                        id: "tool-1".to_owned(),
+                        name: "lookup".to_owned(),
+                        input: serde_json::json!({"query": "x"}),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "tool-1".to_owned(),
+                        content: serde_json::Value::String("found".to_owned()),
+                        is_error: true,
+                    },
+                    ContentBlock::text("done"),
+                ],
+            }],
+            tools: Vec::new(),
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+
+        let body = client.render_body(&request).expect("replay renders");
+        assert_eq!(
+            body.as_str(),
+            r#"{"max_tokens":32000,"messages":[{"content":[{"signature":"sig","thinking":"trace","type":"thinking"},{"data":"opaque","type":"redacted_thinking"},{"id":"tool-1","input":{"query":"x"},"name":"lookup","type":"tool_use"},{"content":"found","is_error":true,"tool_use_id":"tool-1","type":"tool_result"},{"text":"done","type":"text"}],"role":"assistant"}],"model":"test-model","stream":true}"#
+        );
     }
 
     #[test]
@@ -888,11 +1538,15 @@ mod tests {
         );
 
         let openai = serde_json::json!({
-            "usage": {"prompt_tokens": 50, "completion_tokens": 10}
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 35}
+            }
         });
         assert_eq!(
             parse_usage(&openai),
-            Some(Usage { input_tokens: 50, output_tokens: 10, cached_tokens: 0 })
+            Some(Usage { input_tokens: 50, output_tokens: 10, cached_tokens: 35 })
         );
 
         assert_eq!(parse_usage(&serde_json::json!({})), None);
@@ -908,6 +1562,97 @@ mod tests {
 
         Client::new("anthropic", "https://x.invalid".to_owned(), "m".to_owned(), 1024).expect("at the floor");
         Client::new("openai", "https://x.invalid".to_owned(), "m".to_owned(), 1).expect("no floor");
+    }
+
+    #[test]
+    fn mismatched_provider_is_refused_before_credential_resolution() {
+        let client = test_client(ProviderKind::Anthropic);
+        let request = Request {
+            provider: ProviderKind::OpenAI,
+            model: "m".to_owned(),
+            messages: vec![Message::text(Role::User, "hi")],
+            tools: Vec::new(),
+            thinking: Thinking { budget_tokens: 0 },
+            breakpoints: Vec::new(),
+        };
+        let config = supra_config::resolve(&[]);
+        let manager = supra_secrets::SecretManager::open_with_file_store(
+            std::env::temp_dir().join("supra-provider-mismatch-unused-secrets"),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let error = runtime
+            .block_on(client.send_with_config(&config, &manager, &request))
+            .expect_err("provider mismatch must fail before looking up the missing OpenAI credential");
+        assert!(
+            matches!(
+                error,
+                LlmError::ProviderMismatch { ref client, ref request }
+                    if client == "anthropic" && request == "openai"
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_provider_is_refused_before_transport() {
+        let credential = supra_secrets::SecretString::new("must-not-leave-process".to_owned());
+        let providers = [ProviderKind::Anthropic, ProviderKind::OpenAI, ProviderKind::Google];
+
+        for client_kind in providers {
+            let client = test_client(client_kind);
+            for request_kind in providers {
+                if request_kind == client_kind {
+                    continue;
+                }
+                let request = Request {
+                    provider: request_kind,
+                    model: "m".to_owned(),
+                    messages: vec![Message::text(Role::User, "hi")],
+                    tools: Vec::new(),
+                    thinking: Thinking { budget_tokens: 0 },
+                    breakpoints: Vec::new(),
+                };
+                let error = client.send(&request, &credential).await.expect_err("provider mismatch");
+                assert_eq!(
+                    error,
+                    LlmError::ProviderMismatch {
+                        request: request_kind.name().to_owned(),
+                        client: client_kind.name().to_owned(),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_thinking_matches_only_complete_model_family_tokens() {
+        for model in [
+            "claude-opus-4-7-20260219",
+            "anthropic.claude-opus-4-8-v1:0",
+            "claude-sonnet-5-1",
+            "CLAUDE-FABLE-5",
+        ] {
+            assert!(anthropic_supports_adaptive_thinking(model), "{model}");
+        }
+
+        for model in ["claude-opus-4-70", "claude-opus-4-8preview", "claude-sonnet-50", "myclaude-opus-5"] {
+            assert!(!anthropic_supports_adaptive_thinking(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn current_anthropic_families_use_adaptive_thinking() {
+        for model in [
+            "claude-opus-4-7-20260219",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5-20260901",
+            "claude-fable-5-1",
+            "claude-sonnet-4-6",
+        ] {
+            assert!(anthropic_supports_adaptive_thinking(model), "{model}");
+        }
+        assert!(!anthropic_supports_adaptive_thinking("claude-opus-4-5-20251101"));
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! | ------- | ----- | -------- |
 //! | `libsupra_width` | T2 | cell width, grapheme segmentation, Unicode 17 tables |
 //! | `libsupra_ansi` | T3 | escape parsing, SGR state, style-safe truncation |
-//! | `libsupra_sandbox` | T4 | namespaces plus Landlock process isolation |
+//! | `libsupra_sandbox` | T4 | native process isolation: Linux namespaces/Landlock, macOS `sandbox_init`/SBPL, and Windows `AppContainer` with explicit handle inheritance and a job object |
 //!
 //! This crate wraps all three so that nothing above it needs `unsafe`. That
 //! confinement is a hard rule rather than a preference: `unsafe_code = "warn"` is
@@ -20,7 +20,7 @@
 //!
 //! # The layout ratchet
 //!
-//! The `extern` declarations in [`sys`] are hand-written, not generated. The ABI
+//! The `extern` declarations in the private `sys` module are hand-written, not generated. The ABI
 //! is small, stable, and authored in this repository, so a code generator would
 //! add a build dependency for no benefit - but hand-writing carries a real risk:
 //! a field added to a C++ header without a matching Rust change produces a layout
@@ -31,7 +31,7 @@
 //!
 //! - `build.rs` feeds every size and alignment to `abi_check.cpp`, where a
 //!   `static_assert` compares it against the real C++ `sizeof`.
-//! - [`sys`] asserts the same constants against Rust's `size_of` and `align_of`.
+//! - the private `sys` module asserts the same constants against Rust's `size_of` and `align_of`.
 //!
 //! A divergence fails to build on one side or the other, and neither check needs
 //! to run - which also keeps them valid when cross-compiling.

@@ -27,6 +27,15 @@ struct ClaimState {
     validators: BTreeMap<AgentId, Option<Vote>>,
 }
 
+fn ordinary_tally(k: usize) -> QuorumTally {
+    let mut tally = QuorumTally::new(k);
+    // Publishing a candidate is the proposer's affirmative vote. It is not a
+    // validator row: ordinary claims forbid the proposer from voting again.
+    let recorded = tally.record(Vote::Yes);
+    debug_assert_eq!(recorded, Ok(if k == 1 { QuorumStatus::Reached } else { QuorumStatus::Open }));
+    tally
+}
+
 /// The result of recording one vote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Outcome {
@@ -63,7 +72,9 @@ impl Blackboard {
         store.with_transaction::<_, BlackboardError>(TransactionBehavior::Deferred, |tx| {
             for (stored, validators, votes) in schema::read_all(tx)? {
                 let k = stored.k.max(1);
-                let mut tally = QuorumTally::new(k);
+                let blind_rederivation =
+                    k == 1 && validators.len() == 1 && validators.first() == Some(&stored.proposer);
+                let mut tally = if blind_rederivation { QuorumTally::new(k) } else { ordinary_tally(k) };
                 let mut state = ClaimState {
                     turn: stored.turn,
                     proposer: stored.proposer,
@@ -145,9 +156,48 @@ impl Blackboard {
                 proposer,
                 body: body.to_owned(),
                 k,
-                tally: QuorumTally::new(k),
+                tally: ordinary_tally(k),
                 status: QuorumStatus::Open,
                 validators: validators.iter().copied().map(|id| (id, None)).collect(),
+            },
+        );
+        Ok(claim)
+    }
+
+    /// Publish the bounded placeholder used by an E0 blind re-derivation.
+    ///
+    /// The proposer is persisted as the sole eligible validation pass while `k`
+    /// remains one, so quorum arithmetic keeps its documented `ceil(2k/3)` meaning.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish`].
+    pub fn publish_blind(
+        &mut self,
+        turn: TurnId,
+        proposer: AgentId,
+        body: &str,
+    ) -> Result<ClaimId, BlackboardError> {
+        if body.len() > MAX_BODY_BYTES {
+            return Err(BlackboardError::Store(supra_store::StoreError::Malformed {
+                detail: format!("claim body is {} bytes, the budget is {MAX_BODY_BYTES}", body.len()),
+            }));
+        }
+        let claim = ClaimId::generate();
+        self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
+            schema::insert_claim(tx, claim, turn, proposer, body, 1, "open", &[proposer])?;
+            Ok(())
+        })?;
+        self.claims.insert(
+            claim,
+            ClaimState {
+                turn,
+                proposer,
+                body: body.to_owned(),
+                k: 1,
+                tally: QuorumTally::new(1),
+                status: QuorumStatus::Open,
+                validators: [(proposer, None)].into_iter().collect(),
             },
         );
         Ok(claim)
@@ -175,6 +225,42 @@ impl Blackboard {
         if voter == state.proposer {
             return Err(BlackboardError::NotAProposer { agent: voter, claim });
         }
+        Self::record_vote(&self.store, claim, voter, verdict, state)
+    }
+
+    /// Record the E0 proposer's blind, reasoning-free second derivation.
+    ///
+    /// This is the only path where the proposer is also an eligible validator. The
+    /// roster must contain exactly that proposer, so callers cannot use it to widen
+    /// voting authority for an ordinary cohort.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::vote`], plus [`BlackboardError::NotInCohort`] unless this is the
+    /// single-member blind-rederivation roster.
+    pub fn vote_blind(
+        &mut self,
+        claim: ClaimId,
+        voter: AgentId,
+        verdict: &Verdict,
+    ) -> Result<Outcome, BlackboardError> {
+        let state = self.claims.get_mut(&claim).ok_or(BlackboardError::UnknownClaim { claim })?;
+        if state.status != QuorumStatus::Open {
+            return Err(BlackboardError::Closed { claim });
+        }
+        if state.proposer != voter || state.k != 1 || state.validators.len() != 1 {
+            return Err(BlackboardError::NotInCohort { agent: voter, claim });
+        }
+        Self::record_vote(&self.store, claim, voter, verdict, state)
+    }
+
+    fn record_vote(
+        store: &Store,
+        claim: ClaimId,
+        voter: AgentId,
+        verdict: &Verdict,
+        state: &mut ClaimState,
+    ) -> Result<Outcome, BlackboardError> {
         let Some(slot) = state.validators.get_mut(&voter) else {
             return Err(BlackboardError::NotInCohort { agent: voter, claim });
         };
@@ -182,36 +268,25 @@ impl Blackboard {
             return Err(BlackboardError::DuplicateVote { agent: voter, claim });
         }
 
-        // Persist first: if the store refuses the vote, memory must look
-        // as though the vote never happened, or a retry would read
-        // DuplicateVote while the store holds nothing.
+        // Evaluate against a copy before opening the transaction. Memory changes
+        // only after the vote and any terminal status transition commit together.
         let vote = verdict.vote();
-        self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
+        let mut next_tally = state.tally;
+        let outcome = next_tally.record(vote)?;
+        store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
             schema::insert_vote(tx, claim, voter, verdict)?;
+            if outcome != QuorumStatus::Open && !schema::update_status(tx, claim, status_text(outcome))? {
+                return Err(BlackboardError::Store(supra_store::StoreError::Malformed {
+                    detail: format!("claim {claim} closed concurrently while recording its terminal vote"),
+                }));
+            }
             Ok(())
         })?;
 
-        let outcome = match state.tally.record(vote) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
-                    schema::delete_vote(tx, claim, voter)?;
-                    Ok(())
-                })?;
-                return Err(BlackboardError::Tally(error));
-            }
-        };
         *slot = Some(vote);
+        state.tally = next_tally;
         state.status = outcome;
 
-        if outcome != QuorumStatus::Open {
-            self.store.with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
-                let _ = schema::update_status(tx, claim, status_text(outcome))?;
-                Ok(())
-            })?;
-        }
-
-        let state = &self.claims[&claim];
         Ok(Outcome { claim, status: outcome, tally: state.tally })
     }
 
@@ -292,15 +367,26 @@ mod tests {
     use super::*;
     use supra_types::Confidence;
 
+    fn scratch_tag() -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = DefaultHasher::new();
+        std::process::id().hash(&mut hasher);
+        std::thread::current().id().hash(&mut hasher);
+        std::time::SystemTime::now().hash(&mut hasher);
+        let slot = 0u8;
+        std::ptr::from_ref(&slot).hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
     fn board() -> Blackboard {
-        let dir = std::env::temp_dir().join(format!(
-            "supra-bb-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = std::env::temp_dir().join(format!("supra-bb-{}", scratch_tag()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            let dir = std::env::temp_dir().join(format!("supra-bb-{}", scratch_tag()));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let store = Store::open(dir.join("bb.db")).expect("store");
+            return Blackboard::open(Arc::new(store)).expect("board");
+        }
         let store = Store::open(dir.join("bb.db")).expect("store");
         Blackboard::open(Arc::new(store)).expect("board")
     }
@@ -310,14 +396,12 @@ mod tests {
     }
 
     fn store_path() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "supra-bb-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = std::env::temp_dir().join(format!("supra-bb-{}", scratch_tag()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            let dir = std::env::temp_dir().join(format!("supra-bb-{}", scratch_tag()));
+            std::fs::create_dir_all(&dir).expect("dir");
+            return dir.join("bb.db");
+        }
         dir.join("bb.db")
     }
 
@@ -325,7 +409,7 @@ mod tests {
     fn a_reopened_board_hydrates_claims_validators_and_votes() {
         let path = store_path();
         let proposer = AgentId::generate();
-        let validators = ids(2);
+        let validators = ids(3);
 
         {
             let store = Store::open(&path).expect("store");
@@ -342,13 +426,41 @@ mod tests {
         let claim = claims[0];
         assert_eq!(board.claim(claim).expect("stored").body, "the task");
         assert_eq!(board.votes(claim).expect("votes").len(), 1, "the vote survives");
-        assert!(board.reachable(claim).expect("reachable"), "an open claim with one yes is still live");
+        assert!(board.reachable(claim).expect("reachable"), "an open claim with two yes votes is still live");
         board.vote(claim, validators[1], &verdict(Vote::Yes)).expect("the roster survived too");
         assert!(board.outcome(claim).expect("outcome").is_reached(), "quorum across the restart");
     }
 
     fn ids(n: usize) -> Vec<AgentId> {
         (0..n).map(|_| AgentId::generate()).collect()
+    }
+
+    #[test]
+    fn a_blind_claim_survives_restart_with_its_single_validator() {
+        let path = store_path();
+        let proposer = AgentId::generate();
+        let claim;
+
+        {
+            let store = Store::open(&path).expect("store");
+            let mut board = Blackboard::open(Arc::new(store)).expect("board");
+            claim = board.publish_blind(TurnId::generate(), proposer, "candidate").expect("blind publish");
+        }
+
+        let store = Store::open(&path).expect("reopen");
+        let mut board = Blackboard::open(Arc::new(store)).expect("hydrate");
+        let outcome = board.vote_blind(claim, proposer, &verdict(Vote::Yes)).expect("persisted blind roster");
+        assert_eq!(outcome.status, QuorumStatus::Reached);
+        assert_eq!(board.votes(claim).expect("votes").len(), 1);
+    }
+
+    #[test]
+    fn an_oversized_blind_claim_leaves_no_state() {
+        let mut board = board();
+        let result =
+            board.publish_blind(TurnId::generate(), AgentId::generate(), &"x".repeat(MAX_BODY_BYTES + 1));
+        assert!(result.is_err());
+        assert!(board.claims.is_empty());
     }
 
     #[test]
@@ -359,19 +471,49 @@ mod tests {
         let claim = bb.publish(turn, agents[0], &agents[1..], "use exact ranges").expect("publish");
 
         let outcome = bb.vote(claim, agents[1], &verdict(Vote::Yes)).expect("vote");
-        assert_eq!(outcome.status, QuorumStatus::Open);
-        assert!(!outcome.is_reached());
-
-        let outcome = bb.vote(claim, agents[2], &verdict(Vote::Yes)).expect("vote");
         assert_eq!(outcome.status, QuorumStatus::Reached);
         assert!(outcome.is_reached());
 
-        let error = bb.vote(claim, agents[1], &verdict(Vote::Yes)).expect_err("closed");
+        let error = bb.vote(claim, agents[2], &verdict(Vote::Yes)).expect_err("closed");
         assert!(matches!(error, BlackboardError::Closed { .. }));
 
         let stored = bb.claim(claim).expect("claim");
         assert_eq!(stored.status, "reached");
-        assert_eq!(bb.votes(claim).expect("votes").len(), 2);
+        assert_eq!(bb.votes(claim).expect("votes").len(), 1);
+    }
+
+    #[test]
+    fn a_terminal_vote_rolls_back_when_status_persistence_fails() {
+        let mut bb = board();
+        let agents = ids(2);
+        let claim = bb.publish(TurnId::generate(), agents[0], &agents[1..], "body").expect("publish");
+        bb.store
+            .with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
+                tx.execute_batch(
+                    "CREATE TRIGGER refuse_terminal_status
+                     BEFORE UPDATE OF status ON bb_claim
+                     WHEN NEW.status != 'open'
+                     BEGIN SELECT RAISE(ABORT, 'injected status failure'); END;",
+                )?;
+                Ok(())
+            })
+            .expect("install failure injection");
+
+        let error = bb.vote(claim, agents[1], &verdict(Vote::Yes)).expect_err("status write must fail");
+        assert!(matches!(error, BlackboardError::Store(_) | BlackboardError::Sqlite(_)), "{error}");
+        let outcome = bb.outcome(claim).expect("outcome");
+        assert_eq!(outcome.tally.yes(), 1, "memory keeps only the proposer vote");
+        assert_eq!(outcome.status, QuorumStatus::Open);
+        assert!(bb.votes(claim).expect("votes").is_empty(), "the vote insert rolled back with status");
+
+        bb.store
+            .with_transaction::<_, BlackboardError>(TransactionBehavior::Immediate, |tx| {
+                tx.execute_batch("DROP TRIGGER refuse_terminal_status")?;
+                Ok(())
+            })
+            .expect("remove failure injection");
+        let retried = bb.vote(claim, agents[1], &verdict(Vote::Yes)).expect("retry");
+        assert_eq!(retried.status, QuorumStatus::Reached);
     }
 
     #[test]
@@ -430,8 +572,22 @@ mod tests {
         let outcome = bb.vote(claim, agents[1], &verdict(Vote::Yes)).expect("vote");
         assert_eq!(outcome.tally.k(), 3, "the tally spans proposer plus validators");
         assert_eq!(outcome.tally.needed(), supra_types::quorum(3));
-        assert_eq!(outcome.status, QuorumStatus::Open, "one yes of two needed is open");
-        let outcome = bb.vote(claim, agents[2], &verdict(Vote::Yes)).expect("second");
+        assert_eq!(outcome.tally.yes(), 2, "publishing is the proposer's implicit yes vote");
+        assert_eq!(outcome.status, QuorumStatus::Reached, "the proposer and one validator form quorum");
+    }
+
+    #[test]
+    fn a_two_peer_claim_can_reach_its_two_vote_quorum() {
+        let mut bb = board();
+        let agents = ids(2);
+        let claim = bb.publish(TurnId::generate(), agents[0], &agents[1..], "body").expect("publish");
+        let before = bb.outcome(claim).expect("outcome");
+        assert_eq!(before.tally.yes(), 1, "the proposer approves the candidate it published");
+        assert_eq!(before.tally.pending(), 1);
+        assert_eq!(before.status, QuorumStatus::Open);
+
+        let outcome = bb.vote(claim, agents[1], &verdict(Vote::Yes)).expect("validator");
+        assert_eq!(outcome.tally.yes(), 2);
         assert_eq!(outcome.status, QuorumStatus::Reached);
     }
 
@@ -443,9 +599,7 @@ mod tests {
         let first = bb.next_proposer(turn, &agents).expect("first");
         let validators: Vec<AgentId> = agents.iter().copied().filter(|a| *a != first).collect();
         let claim_a = bb.publish(turn, first, &validators, "a").expect("a");
-        for voter in &validators {
-            bb.vote(claim_a, *voter, &verdict(Vote::Yes)).expect("vote a");
-        }
+        bb.vote(claim_a, validators[0], &verdict(Vote::Yes)).expect("vote a");
         let second = bb.next_proposer(turn, &agents).expect("second");
         assert_ne!(first, second, "two proposals in one turn must not repeat a proposer");
     }
@@ -492,6 +646,7 @@ mod tests {
         assert_eq!(stored.k, 5);
         let outcome = bb.outcome(claim).expect("outcome");
         assert_eq!(outcome.tally.k(), 5);
-        assert_eq!(outcome.tally.pending(), 5, "no votes yet, proposer included in the span");
+        assert_eq!(outcome.tally.yes(), 1, "the proposer implicitly approves its candidate");
+        assert_eq!(outcome.tally.pending(), 4, "only validators remain in flight");
     }
 }

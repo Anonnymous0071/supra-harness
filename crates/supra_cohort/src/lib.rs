@@ -18,7 +18,7 @@
 //! |---|
 //! | [`signals`] | the evidence, as bands and counts - never prose, never floats |
 //! | [`score`] | the ladder: bands to tier, composing by maximum |
-//! | [`admit`] | the decision: tier under the limit, k, quorum, shards, escalation |
+//! | [`admit()`] | the decision: tier under the limit, k, quorum, shards, escalation |
 //! | [`profile`] | what past tasks taught: shape keys, saturating failures |
 //!
 //! # Zero LLM calls, structurally

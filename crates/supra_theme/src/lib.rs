@@ -14,7 +14,7 @@
 //!   mixes classes and a gauge silently changes length under a CJK
 //!   locale. `gauge_for` picks the block pair when it is stable and a
 //!   same-class portable pair otherwise.
-//! - [`banner`]: a responsive wordmark, every line measured against the
+//! - [`banner()`]: a responsive wordmark, every line measured against the
 //!   terminal it was asked for.
 //!
 //! ```

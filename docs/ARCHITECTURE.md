@@ -1,9 +1,13 @@
 # supra-harness architecture
 
-Status: T1-T28, T28.5, T28.7, T29, T30 complete. The 37-stage sequence is closed.
+Status: the 37 crate stages and their tested primitives are present. Executable
+integration is incomplete: `supra run` currently performs one provider proposal,
+sequential peer validation, and answer persistence; it does not execute tools or
+the full turn loop described in section 9.
 
-This document is normative. Where an implementation disagrees with an invariant
-stated here, the implementation is wrong.
+This document is normative for the crate contracts it describes. Statements about
+the complete executable turn loop are target architecture until the CLI integration
+is implemented and tested.
 
 ---
 
@@ -118,8 +122,8 @@ traffic above 15 requests/minute may migrate to another machine. Therefore: send
 Without this, 80 parallel requests are 80 cache writes - a 12.5x error.
 
 ### I7 - Canonical serialisation and cache-break attribution
-The serialiser emits stably sorted keys and canonical float formatting.
-Provider documentation names unstable `tool_use` key ordering as a cache
+The serialiser emits stably sorted keys and rejects floats rather than choosing
+a cross-library float representation. Provider documentation names unstable `tool_use` key ordering as a cache
 breaker; that bug class is removed at the type level rather than tested for.
 
 Every turn recomputes the prefix hash locally and compares. An unexpected change
@@ -279,10 +283,13 @@ Two axes are routinely conflated. They are separate here.
 | `ToolClass` (T12.5) | *who* may invoke: agent, host, or user | absence of the WASM capability | **never** |
 | Permission (T16.7) | does this need **user consent** | host-side gate at invocation | yes - that is what modes are for |
 
-`yolo` relaxes the second axis only. Guard layers L1-L7 have no off switch, the
-sandbox stays active, and the AST reparse gate still runs. Disabling the sandbox
-is a separate `--sandbox off` flag with its own confirmation and a persistent
-status-line warning.
+The permission, guard, sandbox, and AST crates implement these boundaries as
+library contracts. The current `supra run` request advertises no tools and
+rejects tool use, so these controls do not yet sit on an executable CLI tool
+path. When that path is integrated, `yolo` must relax the second axis only;
+guard layers L1-L7 and the AST reparse gate remain mandatory. Sandbox disablement
+is a separate `--sandbox off` flag requiring confirmation and must be surfaced
+persistently by any TUI that executes commands.
 
 ### Reversibility, not "danger"
 "Danger level" cannot be computed; reversibility can. Classification runs on the
@@ -375,10 +382,17 @@ which disappears on reconciliation. A divergence above 10% emits
 `Event::UsageDrift`: the token counter needs calibration, and that is worth
 knowing.
 
-Never shed at any width: context %, cache %, session spend, the cache-break
-marker, and the permission mode - the mode joins the four because a silently
-changed mode is a consent the operator never gave. An invisible cost leak is
-the failure this design exists to prevent.
+Protected from priority shedding: context %, cache %, session spend, the
+cache-break marker, and permission mode - the mode joins the four because a
+silently changed mode is a consent the operator never gave. Before any
+protected concept is clipped, T29 switches them to compact labels and removes
+optional status segments. That compact set has a finite physical minimum (for
+representative two-digit percentages and a live sub-dollar estimate, 18 cells
+with the marker and 16 without it); below the applicable minimum, a single line
+cannot identify every concept simultaneously and truncates to the terminal's
+actual cell budget. An invisible cost leak is the failure this design exists to
+prevent, but `NEVER_SHED` is a priority guarantee, not a claim that rendering
+can create cells.
 
 ---
 
@@ -392,9 +406,9 @@ backtracking.
 | Stage | Crate / directory | Delivers |
 | ----- | ----------------- | -------- |
 | T1 | (root) | workspace, pinning, quality gates, CMake root, CI, this document |
-| T2 | `cpp/libsupra_width` | cell width, grapheme segmentation, EAW + emoji tables |
-| T3 | `cpp/libsupra_ansi` | escape parser/serialiser, SGR-safe truncation |
-| T4 | `cpp/libsupra_sandbox` | bubblewrap+landlock, sandbox-exec, AppContainer |
+| T2 | `crates/supra_ffi/native/cpp/libsupra_width` | cell width, grapheme segmentation, EAW + emoji tables |
+| T3 | `crates/supra_ffi/native/cpp/libsupra_ansi` | escape parser/serialiser, SGR-safe truncation |
+| T4 | `crates/supra_ffi/native/cpp/libsupra_sandbox` | Linux namespaces/Landlock; macOS `sandbox_init`/SBPL; Windows AppContainer, explicit handle inheritance, and a kill-on-close job object; other platforms fail closed |
 | T5 | `supra_ffi` | safe RAII bindings; the only crate allowed `unsafe` |
 
 ### Layer B - contracts and infrastructure
@@ -464,9 +478,13 @@ built here.
 
 ## 9. Turn loop (T23)
 
-```
+The following loop is the target executable integration. The crates implement
+and test its component contracts, but the current `supra run` path implements
+only task estimation, one proposal, sequential validation through
+`supra_core::Turn`, and answer persistence.
+
+```text
  1  digest.retrieve(task)                -> ~300 token anchors      (0 LLM calls)
- 2  cohort.signals -> score -> tier      -> k, quorum, shards       (0 LLM calls)
  3  prompt.assemble()                    -> BP1..BP4, byte-stable prefix
  4  blackboard.publish(task, k)
  5  per shard: warm up -> first byte -> fan out   (non-blocking, JoinSet)

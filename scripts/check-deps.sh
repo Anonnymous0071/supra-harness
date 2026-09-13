@@ -35,20 +35,20 @@ req rustup "wasm targets for T20 agent components"
 req cmake "C++20 libraries (T2-T4)"
 req ctest "C++20 test suites"
 req clang++ "C++20 libraries; the pinned compiler for this tree"
+req clang-tidy "C++ lint via 'just tidy' and the full CI gate"
 req git "digest churn signals (T15)"
+req cargo-deny "supply-chain gate via 'just deny' and the full CI gate"
 
 echo
 echo "optional"
-opt clang-tidy "C++ lint via 'just tidy'"
 opt clang "clang static analyser in T22 introspector; skipped when absent"
 opt ninja "faster CMake builds"
-opt bwrap "Linux sandbox backend (T4); tool execution is unsandboxed without it"
-opt cargo-deny "supply-chain gate via 'just deny'"
+opt bwrap "detected for experiments only; the shipped Linux backend does not invoke it"
 opt cargo-nextest "faster test runs"
 
 echo
 echo "rustup targets"
-for target in wasm32-wasip2 wasm32-wasip1; do
+for target in wasm32-wasip2; do
     if rustup target list --installed 2>/dev/null | grep -qx "$target"; then
         printf '  \033[32m ok \033[0m %s\n' "$target"
     else

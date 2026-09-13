@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use supra_llm::canonicalize;
+use supra_llm::{canonicalize, canonicalize_value};
 use supra_permission::Effect;
 use supra_types::{CanonicalJson, ToolClass};
 
@@ -295,6 +295,38 @@ impl Registry {
     ///
     /// The refusal shapes above, each carrying what the retry needs.
     pub fn invoke(&self, name: &str, arguments: &str, facts: &SessionFacts) -> Result<Invocation, ToolError> {
+        let tool = self.available_tool(name)?;
+
+        // Canonicalisation first, validation on the parsed value: one
+        // canonical argument producer and no re-serialisation. The strict
+        // parser retains duplicate-key refusal for raw provider text.
+        let canonical = canonicalize(arguments)?;
+        let parsed = supra_llm::parse_strict(arguments).map_err(ToolError::from)?;
+        Self::finish_invocation(tool, name, &parsed, canonical, facts)
+    }
+
+    /// Validate an invocation whose provider arguments are already parsed.
+    ///
+    /// Provider clients commonly expose tool input as [`serde_json::Value`].
+    /// This entry point canonicalises that value directly, then follows the
+    /// same object-shape, schema, precondition, and effect-resolution path as
+    /// [`Self::invoke`].
+    ///
+    /// # Errors
+    ///
+    /// The same structured refusal shapes as [`Self::invoke`].
+    pub fn invoke_value(
+        &self,
+        name: &str,
+        arguments: &Value,
+        facts: &SessionFacts,
+    ) -> Result<Invocation, ToolError> {
+        let tool = self.available_tool(name)?;
+        let canonical = canonicalize_value(arguments)?;
+        Self::finish_invocation(tool, name, arguments, canonical, facts)
+    }
+
+    fn available_tool(&self, name: &str) -> Result<&Tool, ToolError> {
         let tool = self
             .tools
             .get(name)
@@ -304,22 +336,29 @@ impl Registry {
             return Err(ToolError::Disabled { name: name.to_owned() });
         }
 
-        // Canonicalisation first, validation on the parsed value: one
-        // parse (T13's strict parser, duplicate-refusing), no
-        // re-serialisation, and the argument bytes that reach the ledger
-        // are the bytes the model produced in canonical form. The same
-        // strict parser reads the map back - never a second serialiser
-        // whose output could disagree with the first.
-        let canonical = canonicalize(arguments)?;
-        let parsed = supra_llm::parse_strict(arguments).map_err(ToolError::from)?;
-        let Value::Object(map) = &parsed else {
+        Ok(tool)
+    }
+
+    fn finish_invocation(
+        tool: &Tool,
+        name: &str,
+        arguments: &Value,
+        canonical: CanonicalJson,
+        facts: &SessionFacts,
+    ) -> Result<Invocation, ToolError> {
+        let Value::Object(map) = arguments else {
             return Err(ToolError::BadArguments { tool: name.to_owned(), got: "not an object".to_owned() });
         };
 
         tool.validate(map)?;
         tool.check_precondition(map, facts)?;
 
-        Ok(Invocation { tool: name.to_owned(), arguments: canonical, effect: tool.resolve_effect(map) })
+        Ok(Invocation {
+            tool: name.to_owned(),
+            class: tool.class(),
+            arguments: canonical,
+            effect: tool.resolve_effect(map),
+        })
     }
 }
 
@@ -332,11 +371,13 @@ impl Default for Registry {
 /// The validated invocation the turn loop receives.
 ///
 /// `arguments` is the canonical text - the same string the ledger's
-/// `ToolUse` block will hold, produced by the same serialiser. `effect`
-/// is what the permission gate classifies.
+/// `ToolUse` block will hold, produced by the same serialiser. `class` and
+/// `effect` are copied from the resolved registered [`Tool`], so dispatch
+/// cannot reconstruct authority from guest-controlled input.
 #[derive(Clone, Debug)]
 pub struct Invocation {
     tool: String,
+    class: ToolClass,
     arguments: CanonicalJson,
     effect: Effect,
 }
@@ -346,6 +387,15 @@ impl Invocation {
     #[must_use]
     pub fn tool(&self) -> &str {
         &self.tool
+    }
+
+    /// The registered authority class, copied from the resolved tool.
+    ///
+    /// Dispatch must use this value for the permission request rather than
+    /// accepting a class from guest arguments or other untrusted metadata.
+    #[must_use]
+    pub const fn class(&self) -> ToolClass {
+        self.class
     }
 
     /// The canonical argument text, as the ledger will hold it.
@@ -434,6 +484,39 @@ mod tests {
     }
 
     #[test]
+    fn value_input_checks_nested_json_recursively() {
+        let registry = registry();
+        let facts = SessionFacts { files_read: ["a.rs".to_owned()].into_iter().collect() };
+        let arguments = json!({
+            "path": "a.rs",
+            "old": "x",
+            "new": "y",
+            "metadata": {"layers": [{"ratio": 1.5}]}
+        });
+
+        let error = registry
+            .invoke_value("edit_file", &arguments, &facts)
+            .expect_err("a nested float has no canonical representation");
+        assert!(
+            matches!(error, ToolError::BadArguments { ref got, .. }
+                if got.contains("$[\"metadata\"][\"layers\"][0][\"ratio\"]")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn value_input_refuses_non_objects() {
+        let registry = registry();
+        let arguments = json!(["not", "an", "object"]);
+
+        let error = registry
+            .invoke_value("edit_file", &arguments, &SessionFacts::default())
+            .expect_err("tool arguments must be objects");
+        assert!(matches!(error, ToolError::BadArguments { tool, got }
+                if tool == "edit_file" && got == "not an object"));
+    }
+
+    #[test]
     fn schema_refusals_carry_the_field() {
         let registry = registry();
         let facts = SessionFacts { files_read: ["a.rs".to_owned()].into_iter().collect() };
@@ -447,6 +530,34 @@ mod tests {
         assert!(
             matches!(error, ToolError::WrongFieldType { field, expected, .. } if field == "path" && expected == "string")
         );
+    }
+
+    #[test]
+    fn value_input_uses_the_registered_schema() {
+        let registry = registry();
+        let facts = SessionFacts { files_read: ["a.rs".to_owned()].into_iter().collect() };
+        let arguments = json!({"path": 3, "old": "x", "new": "y"});
+
+        let error = registry
+            .invoke_value("edit_file", &arguments, &facts)
+            .expect_err("the shared schema rejects a wrong type");
+        assert!(matches!(error, ToolError::WrongFieldType { tool, field, expected, .. }
+                if tool == "edit_file" && field == "path" && expected == "string"));
+    }
+
+    #[test]
+    fn value_and_text_inputs_produce_the_same_invocation() {
+        let registry = registry();
+        let facts = SessionFacts { files_read: ["a.rs".to_owned()].into_iter().collect() };
+        let text = r#"{ "new": "y", "path": "a.rs", "old": "x" }"#;
+        let value = json!({"old": "x", "new": "y", "path": "a.rs"});
+
+        let from_text = registry.invoke("edit_file", text, &facts).expect("text invocation");
+        let from_value = registry.invoke_value("edit_file", &value, &facts).expect("value invocation");
+
+        assert_eq!(from_value.tool(), from_text.tool());
+        assert_eq!(from_value.arguments(), from_text.arguments());
+        assert_eq!(from_value.effect(), from_text.effect());
     }
 
     #[test]
@@ -486,6 +597,34 @@ mod tests {
             "canonical: sorted keys, no whitespace"
         );
         assert!(matches!(invocation.effect(), EffectShape::BlindEdit));
+        assert_eq!(invocation.class(), ToolClass::Agent, "authority came from registration");
+    }
+
+    #[test]
+    fn the_invocation_carries_registered_authority_not_guest_input() {
+        let mut registry = Registry::new();
+        registry
+            .register(
+                Tool::register(
+                    "host_dispatch",
+                    ToolClass::Host,
+                    vec![Field {
+                        name: "class".into(),
+                        field_type: FieldType::Text,
+                        required: true,
+                        description: "Guest-supplied, non-authoritative data.".into(),
+                    }],
+                    |_| EffectShape::ScratchWork,
+                )
+                .expect("register"),
+            )
+            .expect("register host tool");
+
+        let invocation = registry
+            .invoke("host_dispatch", r#"{ "class": "agent" }"#, &SessionFacts::default())
+            .expect("invoke");
+        assert_eq!(invocation.class(), ToolClass::Host);
+        assert_eq!(invocation.tool(), "host_dispatch");
     }
 
     #[test]

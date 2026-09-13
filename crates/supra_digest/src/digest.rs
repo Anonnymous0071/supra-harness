@@ -11,13 +11,13 @@
 //!
 //! # The four parts
 //!
-//! - [`SymbolIndex`](index::SymbolIndex): what is defined where, rebuilt from the
+//! - [`SymbolIndex`]: what is defined where, rebuilt from the
 //!   working tree by scan and patched by watcher event.
-//! - [`DependencyGraph`](graph::DependencyGraph): what imports what, from the
+//! - [`DependencyGraph`](crate::DependencyGraph): what imports what, from the
 //!   import symbols; blast radius by reverse walk.
-//! - [`churn`](graph::churn): commits per path in 90 days, from git; zero where
+//! - [`churn`](crate::churn): commits per path in 90 days, from git; zero where
 //!   git cannot answer.
-//! - [`Anchor`](anchors::Anchor) selection: symbols plus gist text into T11,
+//! - [`Anchor`] selection: symbols plus gist text into T11,
 //!   fused ranks out, budget-checked pointers appended in the suffix.
 //!
 //! # Zero LLM calls, stated as a property

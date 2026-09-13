@@ -66,7 +66,7 @@ pub const SIZEOF_SANDBOX_POLICY: usize = 1104;
 pub const ALIGNOF_SANDBOX_POLICY: usize = 8;
 
 /// Size of `supra_sandbox_process` in bytes.
-pub const SIZEOF_SANDBOX_PROCESS: usize = 272;
+pub const SIZEOF_SANDBOX_PROCESS: usize = 288;
 /// Alignment of `supra_sandbox_process` in bytes.
 pub const ALIGNOF_SANDBOX_PROCESS: usize = 8;
 

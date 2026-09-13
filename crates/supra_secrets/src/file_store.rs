@@ -6,7 +6,7 @@
 //! "SUPRA1" | salt (16) | nonce (12) | ciphertext (payload, AES-256-GCM with tag appended)
 //! ```
 //!
-//! The key is 32 bytes derived from a passphrase by PBKDF2-HMAC-SHA256, 600 000 iterations, over
+//! The key is 32 bytes derived from a passphrase by PBKDF2-HMAC-SHA256, 100 000 iterations, over
 //! the stored salt. The payload is a JSON object mapping `service/account` records to secrets.
 //! The magic header is passed to GCM as additional authenticated data, so a file that does not
 //! start with it cannot decrypt by accident.
@@ -35,6 +35,7 @@ use std::sync::PoisonError;
 
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
+use fs2::FileExt as _;
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -232,6 +233,7 @@ impl FileStore {
     ///
     /// As [`FileStore::get`], plus [`SecretsError::Crypto`] when encryption fails.
     pub fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), SecretsError> {
+        let _transaction = self.lock_transaction()?;
         let mut vault = match self.load() {
             Ok(vault) => vault,
             Err(SecretsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -263,7 +265,14 @@ impl FileStore {
     ///
     /// As [`FileStore::get`].
     pub fn delete(&self, service: &str, account: &str) -> Result<bool, SecretsError> {
-        let mut vault = self.load()?;
+        let _transaction = self.lock_transaction()?;
+        let mut vault = match self.load() {
+            Ok(vault) => vault,
+            Err(SecretsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(other) => return Err(other),
+        };
         let before = vault.records.len();
         vault.records.retain(|record| record.service != service || record.account != account);
         if vault.records.len() == before {
@@ -271,6 +280,26 @@ impl FileStore {
         }
         self.save(&vault)?;
         Ok(true)
+    }
+
+    fn lock_transaction(&self) -> Result<TransactionLock, SecretsError> {
+        let directory = self.path.parent().unwrap_or_else(|| Path::new("."));
+        ensure_private_directory(directory)?;
+        let lock_path = transaction_lock_path(&self.path);
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&lock_path)
+            .map_err(|error| SecretsError::Io { path: lock_path.clone(), source: error })?;
+        #[cfg(unix)]
+        set_mode(&lock_path, 0o600)?;
+        file.lock_exclusive().map_err(|error| SecretsError::Io { path: lock_path.clone(), source: error })?;
+        Ok(TransactionLock { file, path: lock_path })
     }
 
     fn load(&self) -> Result<Vault, SecretsError> {
@@ -321,6 +350,14 @@ impl FileStore {
     }
 
     fn save(&self, vault: &Vault) -> Result<(), SecretsError> {
+        self.save_with_temp_suffixes(vault, random_temp_suffix)
+    }
+
+    fn save_with_temp_suffixes(
+        &self,
+        vault: &Vault,
+        mut next_suffix: impl FnMut() -> Result<String, SecretsError>,
+    ) -> Result<(), SecretsError> {
         let passphrase = self.passphrase()?;
         let salt = random_bytes(SALT_LEN)?;
         let nonce = random_bytes(NONCE_LEN)?;
@@ -343,8 +380,7 @@ impl FileStore {
             .map_err(|_| SecretsError::Crypto { detail: "encryption failed".to_owned() })?;
 
         let directory = self.path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(directory)
-            .map_err(|error| SecretsError::Io { path: directory.to_path_buf(), source: error })?;
+        ensure_private_directory(directory)?;
 
         let file_name = self
             .path
@@ -358,7 +394,7 @@ impl FileStore {
         output.extend_from_slice(&ciphertext);
 
         let mut attempts = 0u8;
-        let (mut file, temp_path) = loop {
+        let (file, temp_path) = loop {
             attempts += 1;
             if attempts > 32 {
                 return Err(SecretsError::Io {
@@ -369,11 +405,7 @@ impl FileStore {
                     ),
                 });
             }
-            let suffix: String = random_bytes(6)?.iter().fold(String::new(), |mut hex, byte| {
-                use std::fmt::Write as _;
-                let _ = write!(hex, "{byte:02x}");
-                hex
-            });
+            let suffix = next_suffix()?;
             let candidate = self.path.with_file_name(format!(".{file_name}.{suffix}.tmp"));
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -390,23 +422,17 @@ impl FileStore {
                 }
             }
         };
-        file.write_all(&output)
-            .map_err(|error| SecretsError::Io { path: temp_path.clone(), source: error })?;
-        file.sync_all().map_err(|error| SecretsError::Io { path: temp_path.clone(), source: error })?;
-        drop(file);
+        let mut temp = TempFile::new(file, temp_path);
+        temp.write_all(&output).map_err(|error| SecretsError::Io { path: temp.path_buf(), source: error })?;
+        temp.sync_all().map_err(|error| SecretsError::Io { path: temp.path_buf(), source: error })?;
+        let temp_path = temp.close();
         fs::rename(&temp_path, &self.path)
             .map_err(|error| SecretsError::Io { path: temp_path.clone(), source: error })?;
+        temp.commit();
 
-        // Rename preserves the temp file's mode on the same filesystem, but a reviewer reading
-        // only this function sees the chmod *before* the rename and may wonder whether the
-        // final path is covered. Belt and suspenders: re-assert on the destination. Cheap,
-        // idempotent, and the failure is reported rather than ignored.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))
-                .map_err(|error| SecretsError::Io { path: self.path.clone(), source: error })?;
-        }
+        set_mode(&self.path, 0o600)?;
+        sync_directory(directory)?;
         // The derived key is now wrapped by `cipher`, and both drop at the end of this
         // function: `Aes256Gcm` owns its key material inside a `Zeroizing`-backed key, so the
         // secret does not outlive the write. The passphrase guard drops here as well.
@@ -451,6 +477,104 @@ impl FileStore {
     fn provider(&self) -> Option<PassphraseProvider> {
         self.passphrase_provider.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
+}
+
+struct TransactionLock {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl Drop for TransactionLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs2::FileExt::unlock(&self.file) {
+            debug_assert!(false, "could not unlock {}: {error}", self.path.display());
+        }
+    }
+}
+
+struct TempFile {
+    file: Option<fs::File>,
+    path: Option<PathBuf>,
+}
+
+impl TempFile {
+    fn new(file: fs::File, path: PathBuf) -> Self {
+        Self { file: Some(file), path: Some(path) }
+    }
+
+    fn write_all(&mut self, output: &[u8]) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => file.write_all(output),
+            None => Err(std::io::Error::other("temporary file is already closed")),
+        }
+    }
+
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => file.sync_all(),
+            None => Err(std::io::Error::other("temporary file is already closed")),
+        }
+    }
+
+    fn path_buf(&self) -> PathBuf {
+        self.path.clone().unwrap_or_default()
+    }
+
+    fn close(&mut self) -> PathBuf {
+        drop(self.file.take());
+        self.path_buf()
+    }
+
+    fn commit(mut self) {
+        let _ = self.path.take();
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn transaction_lock_path(vault_path: &Path) -> PathBuf {
+    let file_name = vault_path
+        .file_name()
+        .map_or_else(|| "secrets.enc".to_owned(), |name| name.to_string_lossy().into_owned());
+    vault_path.with_file_name(format!(".{file_name}.lock"))
+}
+
+fn ensure_private_directory(directory: &Path) -> Result<(), SecretsError> {
+    let created = match fs::create_dir(directory) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(directory)
+                .map_err(|source| SecretsError::Io { path: directory.to_path_buf(), source })?;
+            true
+        }
+        Err(source) => return Err(SecretsError::Io { path: directory.to_path_buf(), source }),
+    };
+    #[cfg(unix)]
+    if created {
+        set_mode(directory, 0o700)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<(), SecretsError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|error| SecretsError::Io { path: path.to_path_buf(), source: error })
+}
+
+fn sync_directory(directory: &Path) -> Result<(), SecretsError> {
+    let file = fs::File::open(directory)
+        .map_err(|error| SecretsError::Io { path: directory.to_path_buf(), source: error })?;
+    file.sync_all().map_err(|error| SecretsError::Io { path: directory.to_path_buf(), source: error })
 }
 
 /// A callback that supplies the vault passphrase when neither memory nor the environment has
@@ -503,6 +627,14 @@ fn random_bytes(len: usize) -> Result<Vec<u8>, SecretsError> {
     Ok(bytes)
 }
 
+fn random_temp_suffix() -> Result<String, SecretsError> {
+    Ok(random_bytes(16)?.iter().fold(String::new(), |mut hex, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    }))
+}
+
 // `set_var`/`remove_var` are `unsafe` in the current toolchain. Every block below documents
 // the same invariant - the module lock serialises all environment access in these tests -
 // and each carries its own allow, because an inner attribute cannot live between the
@@ -517,7 +649,19 @@ mod tests {
 
     fn scratch_path() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("supra-secrets-file-store-{n}.enc"))
+        let directory = std::env::temp_dir().join(format!("supra-secrets-file-store-{n}"));
+        let _ = fs::remove_dir_all(&directory);
+        directory.join("secrets.enc")
+    }
+
+    fn remove_scratch(path: &Path) {
+        if let Some(directory) = path.parent() {
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+
+    fn create_scratch_directory(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new("."))).expect("scratch directory");
     }
 
     /// One serialisation lock for every environment mutation in these tests.
@@ -574,21 +718,21 @@ mod tests {
     #[test]
     fn a_secret_round_trips_through_the_store() {
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
         with_master_key(|| {
             let store = FileStore::new(&path);
             store.set("openai", "primary", "sk-test-1234567890").expect("set");
             let read = store.get("openai", "primary").expect("get");
             assert_eq!(read, "sk-test-1234567890");
             assert!(store.exists());
-            let _ = fs::remove_file(&path);
+            remove_scratch(&path);
         });
     }
 
     #[test]
     fn multiple_records_do_not_clobber_each_other() {
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
         with_master_key(|| {
             let store = FileStore::new(&path);
             store.set("openai", "primary", "value-a").expect("set a");
@@ -598,14 +742,14 @@ mod tests {
             assert_eq!(store.get("openai", "primary").expect("get"), "value-a");
             assert_eq!(store.get("anthropic", "primary").expect("get"), "value-b");
             assert_eq!(store.get("openai", "secondary").expect("get"), "value-c");
-            let _ = fs::remove_file(&path);
+            remove_scratch(&path);
         });
     }
 
     #[test]
     fn a_wrong_passphrase_refuses_a_write_instead_of_erasing_the_vault() {
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
         with_key(
             || {
                 let store = FileStore::new(&path);
@@ -624,7 +768,7 @@ mod tests {
             },
             "unused",
         );
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
     }
 
     #[test]
@@ -633,9 +777,11 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
+        create_scratch_directory(&path);
         let victim = scratch_path().with_extension("victim");
-        let _ = fs::remove_file(&victim);
+        remove_scratch(&victim);
+        create_scratch_directory(&victim);
         let guessed = path.with_extension("tmp");
         let _ = fs::remove_file(&guessed);
         fs::write(&victim, b"do not touch").expect("victim");
@@ -648,41 +794,97 @@ mod tests {
         });
         assert_eq!(fs::read(&victim).expect("read"), b"do not touch", "the link target is untouched");
 
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
         let _ = fs::remove_file(&victim);
         let _ = fs::remove_file(&guessed);
     }
 
     #[test]
+    #[cfg(unix)]
+    fn an_exact_temp_symlink_collision_is_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let path = scratch_path();
+        remove_scratch(&path);
+        create_scratch_directory(&path);
+        let victim = path.with_file_name("victim");
+        fs::write(&victim, b"do not touch").expect("victim");
+        let collision = path.with_file_name(".secrets.enc.collision.tmp");
+        symlink(&victim, &collision).expect("symlink");
+
+        with_master_key(|| {
+            let store = FileStore::new(&path);
+            let vault = Vault {
+                records: vec![Record {
+                    service: "svc".to_owned(),
+                    account: "one".to_owned(),
+                    secret: "secret".to_owned(),
+                }],
+            };
+            let suffixes = ["collision", "fresh"];
+            let mut index = 0;
+            store
+                .save_with_temp_suffixes(&vault, || {
+                    let suffix = suffixes[index].to_owned();
+                    index += 1;
+                    Ok(suffix)
+                })
+                .expect("save after collision");
+            assert_eq!(store.get("svc", "one").expect("get"), "secret");
+        });
+        assert_eq!(fs::read(&victim).expect("read victim"), b"do not touch");
+        assert!(fs::symlink_metadata(&collision).expect("collision remains").file_type().is_symlink());
+        remove_scratch(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn newly_created_directory_and_vault_have_private_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = scratch_path();
+        remove_scratch(&path);
+        with_master_key(|| {
+            FileStore::new(&path).set("svc", "acct", "secret").expect("set");
+        });
+        let directory_mode =
+            fs::metadata(path.parent().expect("parent")).expect("directory metadata").permissions().mode();
+        let vault_mode = fs::metadata(&path).expect("vault metadata").permissions().mode();
+        assert_eq!(directory_mode & 0o777, 0o700);
+        assert_eq!(vault_mode & 0o777, 0o600);
+        remove_scratch(&path);
+    }
+
+    #[test]
     fn a_record_can_be_replaced() {
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
         with_master_key(|| {
             let store = FileStore::new(&path);
             store.set("openai", "primary", "first").expect("set");
             store.set("openai", "primary", "second").expect("replace");
             let read = store.get("openai", "primary").expect("get");
             assert_eq!(read, "second");
-            let _ = fs::remove_file(&path);
+            remove_scratch(&path);
         });
     }
 
     #[test]
     fn a_missing_record_is_not_found() {
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
         with_master_key(|| {
             let store = FileStore::new(&path);
             let error = store.get("openai", "nope").expect_err("must be not found");
             assert!(matches!(error, SecretsError::NotFound { .. }), "{error}");
-            let _ = fs::remove_file(&path);
+            remove_scratch(&path);
         });
     }
 
     #[test]
     fn delete_removes_a_record() {
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
         with_master_key(|| {
             let store = FileStore::new(&path);
             store.set("openai", "primary", "value").expect("set");
@@ -690,14 +892,14 @@ mod tests {
             assert!(!store.delete("openai", "primary").expect("delete again"));
             let error = store.get("openai", "primary").expect_err("must be gone");
             assert!(matches!(error, SecretsError::NotFound { .. }), "{error}");
-            let _ = fs::remove_file(&path);
+            remove_scratch(&path);
         });
     }
 
     #[test]
     fn a_wrong_passphrase_is_a_crypto_error_not_a_wrong_answer() {
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
         with_key(
             || {
                 let store = FileStore::new(&path);
@@ -717,13 +919,13 @@ mod tests {
             },
             "wrong-key",
         );
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
     }
 
     #[test]
     fn a_tampered_file_is_a_crypto_error_not_a_wrong_answer() {
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
         with_master_key(|| {
             let store = FileStore::new(&path);
             store.set("openai", "primary", "secret-value").expect("set");
@@ -735,14 +937,15 @@ mod tests {
 
             let error = store.get("openai", "primary").expect_err("tampering must be detected");
             assert!(matches!(error, SecretsError::Crypto { .. }), "{error}");
-            let _ = fs::remove_file(&path);
+            remove_scratch(&path);
         });
     }
 
     #[test]
     fn a_file_without_the_magic_is_refused() {
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
+        create_scratch_directory(&path);
         with_master_key(|| {
             let store = FileStore::new(&path);
             // Long enough to pass the length gate (6 magic + 16 salt + 12 nonce + 16 tag) but
@@ -753,7 +956,7 @@ mod tests {
             let error = store.get("openai", "primary").expect_err("must be refused");
             assert!(matches!(error, SecretsError::Crypto { .. }), "{error}");
             assert!(error.to_string().contains("magic"), "{error}");
-            let _ = fs::remove_file(&path);
+            remove_scratch(&path);
         });
     }
 
@@ -769,7 +972,7 @@ mod tests {
         // that for a non-root owner; running as root reads through file modes, so the test
         // reports a skip on stderr rather than asserting a false failure.
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
         with_master_key(|| {
             let store = FileStore::new(&path);
             store.set("openai", "primary", "value").expect("seed the vault");
@@ -793,7 +996,7 @@ mod tests {
                     Ok(_) => panic!("expected an I/O fault, got a value"),
                 }
             }
-            let _ = fs::remove_file(&path);
+            remove_scratch(&path);
         });
     }
 
@@ -801,14 +1004,15 @@ mod tests {
     fn a_truncated_file_is_refused() {
         // The other half of the length gate: too short to even hold the header fields.
         let path = scratch_path();
-        let _ = fs::remove_file(&path);
+        remove_scratch(&path);
+        create_scratch_directory(&path);
         with_master_key(|| {
             let store = FileStore::new(&path);
             fs::write(&path, b"not a vault at all").expect("write");
             let error = store.get("openai", "primary").expect_err("must be refused");
             assert!(matches!(error, SecretsError::Crypto { .. }), "{error}");
             assert!(error.to_string().contains("too short"), "{error}");
-            let _ = fs::remove_file(&path);
+            remove_scratch(&path);
         });
     }
 
@@ -827,7 +1031,7 @@ mod tests {
         with_key(
             || {
                 let path = scratch_path();
-                let _ = fs::remove_file(&path);
+                remove_scratch(&path);
                 // Seed a vault first with the key the helper holds, so the later read reaches
                 // the passphrase lookup instead of failing on a missing file.
                 FileStore::new(&path).set("openai", "primary", "value").expect("seed the vault");
@@ -844,7 +1048,7 @@ mod tests {
                 let store = FileStore::new(&path);
                 let error = store.get("openai", "primary").expect_err("no passphrase available");
                 assert!(matches!(error, SecretsError::NoStore { .. }), "expected NoStore, got: {error}");
-                let _ = fs::remove_file(&path);
+                remove_scratch(&path);
             },
             "seed-key",
         );
