@@ -3123,6 +3123,7 @@ dependencies = [
  "supra_store",
  "supra_telemetry",
  "supra_theme",
+ "supra_tui",
  "supra_types",
  "supra_update",
  "supra_vector",
@@ -3467,6 +3468,7 @@ version = "0.2.0"
 dependencies = [
  "supra_ffi",
  "supra_theme",
+ "supra_types",
 ]
 
 [[package]]

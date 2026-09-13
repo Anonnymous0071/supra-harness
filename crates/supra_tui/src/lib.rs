@@ -21,6 +21,8 @@
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::print_stderr))]
 
+/// Live counters folded from one bus drain.
+pub mod frame;
 /// The gauge meter.
 pub mod meter;
 /// Bordered panels.
@@ -34,6 +36,7 @@ pub mod thinking;
 /// The scroll viewport.
 pub mod viewport;
 
+pub use frame::FrameState;
 pub use meter::Meter;
 pub use panel::Panel;
 pub use spinner::{SPINNER_FRAMES, Spinner};

@@ -11,6 +11,7 @@
 
 mod args;
 mod registry;
+mod render;
 mod runtime;
 mod startup;
 

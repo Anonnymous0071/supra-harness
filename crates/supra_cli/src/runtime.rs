@@ -179,6 +179,7 @@ async fn execute_turn_with_backend<B: ProviderBackend>(
     let board = supra_blackboard::Blackboard::open(store)?;
     let bus = Arc::new(supra_eventbus::Bus::new());
     let mut turn = supra_core::Turn::start_shared(board, Arc::clone(&bus), task, agents.clone())?;
+    let mut frame = supra_tui::FrameState::default();
 
     let completion = send_with_retry(backend.as_ref(), request(backend.as_ref(), task)).await?;
     emit_usage(&bus, agents[0], &completion);
@@ -206,38 +207,15 @@ async fn execute_turn_with_backend<B: ProviderBackend>(
         });
     }
 
-    let mut reached = false;
-    let mut first_failure: Option<anyhow::Error> = None;
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((agent, Ok(verdict))) => {
-                match turn.record(supra_core::PeerAnswer::validation(agent, verdict))? {
-                    supra_core::Step::Reached => {
-                        abort_and_drain(&mut tasks).await;
-                        reached = true;
-                        break;
-                    }
-                    supra_core::Step::Escalate => {
-                        abort_and_drain(&mut tasks).await;
-                        anyhow::bail!("peer quorum rejected the provider answer");
-                    }
-                    supra_core::Step::Collecting => {}
-                }
-            }
-            Ok((_, Err(error))) => {
-                if first_failure.is_none() {
-                    first_failure = Some(error);
-                }
-            }
-            Err(error) => {
-                if first_failure.is_none() {
-                    first_failure = Some(anyhow::anyhow!("validator task failed: {error}"));
-                }
-            }
-        }
-    }
-    if !reached {
-        if let Some(error) = first_failure {
+    let watcher = bus.subscribe(
+        supra_eventbus::TopicSet::of(supra_types::Topic::Turn)
+            .union(supra_eventbus::TopicSet::of(supra_types::Topic::Provider))
+            .union(supra_eventbus::TopicSet::of(supra_types::Topic::Cohort))
+            .union(supra_eventbus::TopicSet::of(supra_types::Topic::Cache)),
+    );
+    let outcome = collect_validations(&mut tasks, &mut turn, &watcher, &mut frame).await?;
+    if !outcome.reached {
+        if let Some(error) = outcome.first_failure {
             return Err(anyhow::anyhow!("peer validation ended before quorum: {error}"));
         }
         anyhow::bail!("peer validators completed without reaching quorum");
@@ -261,6 +239,61 @@ async fn execute_turn_with_backend<B: ProviderBackend>(
 async fn abort_and_drain<T: 'static>(tasks: &mut tokio::task::JoinSet<T>) {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+}
+
+struct ValidationOutcome {
+    reached: bool,
+    first_failure: Option<anyhow::Error>,
+}
+
+async fn collect_validations(
+    tasks: &mut tokio::task::JoinSet<(supra_types::AgentId, anyhow::Result<supra_types::Verdict>)>,
+    turn: &mut supra_core::Turn,
+    watcher: &supra_eventbus::Subscription,
+    frame: &mut supra_tui::FrameState,
+) -> anyhow::Result<ValidationOutcome> {
+    let mut reached = false;
+    let mut first_failure: Option<anyhow::Error> = None;
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((agent, Ok(verdict))) => {
+                match turn.record(supra_core::PeerAnswer::validation(agent, verdict))? {
+                    supra_core::Step::Reached => {
+                        abort_and_drain(tasks).await;
+                        reached = true;
+                        let frame_deliveries = watcher.drain();
+                        for line in super::render::render_drain(
+                            frame,
+                            &frame_deliveries,
+                            "auto",
+                            "turn",
+                            &supra_theme::Theme::default_dark(),
+                            80,
+                        ) {
+                            println!("{line}");
+                        }
+                        break;
+                    }
+                    supra_core::Step::Escalate => {
+                        abort_and_drain(tasks).await;
+                        anyhow::bail!("peer quorum rejected the provider answer");
+                    }
+                    supra_core::Step::Collecting => {}
+                }
+            }
+            Ok((_, Err(error))) => {
+                if first_failure.is_none() {
+                    first_failure = Some(error);
+                }
+            }
+            Err(error) => {
+                if first_failure.is_none() {
+                    first_failure = Some(anyhow::anyhow!("validator task failed: {error}"));
+                }
+            }
+        }
+    }
+    Ok(ValidationOutcome { reached, first_failure })
 }
 
 /// Publish this completion's usage to the bus as reconciled provider events.
