@@ -9,9 +9,9 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 use std::collections::HashSet;
-use std::fs::{self, File};
 #[cfg(unix)]
 use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
