@@ -124,7 +124,12 @@ fn exact_archive_filename_target_size_and_hash_are_bound() {
         fixture(&[("bundle/supra", executable, tar::EntryType::Regular)], "bundle/supra", executable);
     let manifest_bytes = fs::read(&fixture.manifest).expect("manifest");
     let parsed = parse_manifest(&manifest_bytes).expect("parse");
-    let wrong_target = LocalUpdate { expected_target: "aarch64-apple-darwin", ..input(&fixture) };
+    // A target that is guaranteed to differ from the current one, whatever
+    // platform the test runs on - a hardcoded triple would match the runner
+    // that happens to be it and make the "wrong" case vacuous.
+    let current = current_target();
+    let mismatched = format!("{current}-mismatch");
+    let wrong_target = LocalUpdate { expected_target: &mismatched, ..input(&fixture) };
     // Signature is intentionally invalid, and verification happens first; direct helpers
     // exercise the authenticated binding checks without a private test key.
     assert!(matches!(

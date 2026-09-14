@@ -921,6 +921,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(session_dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn a_resumed_turn_fires_session_resumed_not_started() {
         let config = config_with_limit(1);
