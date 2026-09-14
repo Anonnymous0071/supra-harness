@@ -104,6 +104,7 @@ const _: () = {
 /// tests that run a real spawn whose audit must see a clean host. In
 /// production nothing shares a process this way - the turn loop is the only
 /// spawner and it never clears flags - so the lock exists only under
-/// `cfg(test)`.
-#[cfg(test)]
+/// `cfg(test)`. Its consumers are the Linux-only descriptor tests, so the
+/// lock is scoped to that target too; elsewhere it would be dead.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) static AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
