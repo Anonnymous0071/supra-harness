@@ -501,12 +501,28 @@ bool makeProfile(ProcessState* state, PSID* sid, char* error, std::size_t error_
                   static_cast<unsigned long>(::GetCurrentProcessId()),
                   static_cast<long>(serial),
                   static_cast<unsigned long long>(::GetTickCount64()));
-    const HRESULT created = ::CreateAppContainerProfile(
-        state->profile_name, state->profile_name, L"Ephemeral supra sandbox",
-        nullptr, 0, sid);
-    if (FAILED(created)) {
+    // Dynamically resolved like DeleteAppContainerProfile below: the
+    // runner's import library exports neither symbol under every SDK, and
+    // a static call fails the build (C3861) rather than the run.
+    using CreateProfile = HRESULT(WINAPI*)(PCWSTR, PCWSTR, PCWSTR, PSID_AND_ATTRIBUTES*, DWORD, PSID*);
+    HMODULE userenv =
+        ::LoadLibraryExW(L"userenv.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (userenv == nullptr) {
+        setWindowsError(error, error_cap, "LoadLibraryExW userenv", ::GetLastError());
+        return false;
+    }
+    auto create = reinterpret_cast<CreateProfile>(
+        reinterpret_cast<void*>(::GetProcAddress(userenv, "CreateAppContainerProfile")));
+    HRESULT created = E_FAIL;
+    if (create != nullptr) {
+        created = create(state->profile_name, state->profile_name, L"Ephemeral supra sandbox",
+                         nullptr, 0, sid);
+    }
+    ::FreeLibrary(userenv);
+    if (create == nullptr || FAILED(created)) {
         setWindowsError(error, error_cap, "CreateAppContainerProfile",
-                        static_cast<DWORD>(HRESULT_CODE(created)));
+                        create == nullptr ? ERROR_PROC_NOT_FOUND
+                                          : static_cast<DWORD>(HRESULT_CODE(created)));
         return false;
     }
     return true;

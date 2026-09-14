@@ -263,8 +263,13 @@ mod tests {
 
         let mut registry = Registry::new();
         registry.register_named("turn-start", "sh -c 'exit 42'").expect("register");
-        let outcome = registry.fire(HookPoint::TurnStart, &context()).expect("fire");
-        assert_eq!(outcome, HookOutcome::Stop);
+        match registry.fire(HookPoint::TurnStart, &context()) {
+            Ok(HookOutcome::Stop) => {}
+            Err(error) => panic!("a stop must not surface as a command failure: {error}"),
+            Ok(HookOutcome::Continue) => {
+                panic!("sh -c 'exit 42' exited without requesting a stop on this host")
+            }
+        }
     }
 
     #[test]

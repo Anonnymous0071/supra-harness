@@ -105,6 +105,10 @@ supra_sandbox_policy basePolicy(const std::string& shell) {
     supra_sandbox_policy policy{};
     supra_sandbox_policy_init(&policy);
 #if defined(__APPLE__)
+    // The shell argument is unused here: macOS rules pin system
+    // directories, not the interpreter path. The parameter stays so
+    // both platforms share one call shape.
+    static_cast<void>(shell);
     supra_sandbox_policy_allow(&policy, "/bin", SUPRA_SANDBOX_READ | SUPRA_SANDBOX_EXECUTE);
     supra_sandbox_policy_allow(&policy, "/usr/lib", SUPRA_SANDBOX_READ | SUPRA_SANDBOX_EXECUTE);
     supra_sandbox_policy_allow(&policy, "/dev/null", SUPRA_SANDBOX_READ | SUPRA_SANDBOX_WRITE);

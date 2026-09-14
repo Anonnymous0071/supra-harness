@@ -24,7 +24,7 @@ use core::ffi::{c_char, c_int, c_void};
 /// itself. Inside a private module that reads as unreachable-pub, hence the
 /// targeted allow: the visibility is a requirement of the sharing mechanism, not
 /// an intent to export.
-#[allow(unreachable_pub)]
+#[allow(unreachable_pub, dead_code)]
 mod abi {
     include!("../abi_sizes.rs");
 }
