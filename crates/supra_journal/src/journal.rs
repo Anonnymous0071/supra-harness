@@ -543,7 +543,13 @@ mod tests {
 
         let (journal, dir) = journal();
         let file = dir.join(std::ffi::OsString::from_vec(b"bad-\xff.rs".to_vec()));
-        write_file(&file, b"original");
+        if let Err(error) = std::fs::write(&file, b"original") {
+            // APFS stores names as UTF-8 only, so 0xFF cannot be named and this
+            // precondition cannot be built; the invariant is vacuous on such a
+            // filesystem. Byte-addressable filesystems (ext4) do reach it.
+            eprintln!("skipped: cannot create a non-UTF-8 path on this filesystem: {error}");
+            return;
+        }
         assert!(matches!(journal.snapshot(&file), Err(JournalError::NonUtf8Path { .. })));
     }
 
