@@ -409,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_uninspectable_candidate_refuses_instead_of_being_skipped() {
         // A regular file where the walk expects a directory makes every candidate
         // below it uninspectable. `exists` would report "no file" and keep walking

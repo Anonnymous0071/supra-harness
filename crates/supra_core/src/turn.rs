@@ -334,13 +334,16 @@ mod tests {
 
     use super::*;
 
+    /// One store per test, in its own directory. A process-wide sequence number
+    /// keeps the dirs distinct even when parallel test threads call within the
+    /// same clock tick - two stores on one file is a `database is locked` fail.
+    static BOARD_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn board() -> Blackboard {
         let dir = std::env::temp_dir().join(format!(
             "supra-core-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
+            BOARD_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         Blackboard::open(Arc::new(Store::open(dir.join("bb.db")).expect("store"))).expect("board")
