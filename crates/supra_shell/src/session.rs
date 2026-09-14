@@ -10,8 +10,8 @@
 //!    exec. The sandbox is not an option here: the child gets the workspace
 //!    policy or it does not run. `yolo` does not skip this; there is no
 //!    unsandboxed spawn path in this crate.
-//! 3. [`Pty::take_slave`] closes the parent's copy of the slave the moment
-//!    the spawn succeeds (the T4 note binds T16.5: "close descriptors they
+//! 3. [`supra_ffi::pty::Pty::take_slave`] closes the parent's copy of the slave the
+//!    moment the spawn succeeds (the T4 note binds T16.5: "close descriptors they
 //!    do not intend to pass"). The child holds its own copies on 0/1/2; the
 //!    parent-held copy would keep the pair alive after the child exits and
 //!    master reads would never see EOF.

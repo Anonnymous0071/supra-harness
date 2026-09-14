@@ -21,6 +21,7 @@
 
 use std::io;
 
+#[cfg(unix)]
 use crate::sys;
 
 /// Read whether `fd` will close at the next `exec`.

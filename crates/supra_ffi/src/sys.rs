@@ -263,8 +263,11 @@ unsafe extern "C" {
 // and fd.rs records why. Values are stable across POSIX platforms.
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 pub(crate) const F_GETFD: c_int = 1;
+#[cfg(unix)]
 pub(crate) const F_SETFD: c_int = 2;
+#[cfg(unix)]
 pub(crate) const FD_CLOEXEC: c_int = 1;
 
 // ---------------------------------------------------------------------------
