@@ -374,6 +374,13 @@ fn ensure_private_store_files(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+// The Unix twin can fail and so must keep the `Result` to match its signature;
+// the Windows no-op cannot fail, but the shared call site maps the `Result`,
+// so the wrap is load-bearing here even though it never yields an `Err`.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix signature; the shared call site maps the Result"
+)]
 fn ensure_private_store_files(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }

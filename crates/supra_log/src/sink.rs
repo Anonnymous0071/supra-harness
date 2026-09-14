@@ -378,6 +378,12 @@ fn refuse_blocking_target(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+// No mode or file-type bits to check on this platform, but the Unix twin and
+// the shared call site expect the same `Result`, so the no-op keeps the wrap.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix signature; the call site propagates the Result"
+)]
 fn refuse_blocking_target(_path: &Path) -> io::Result<()> {
     Ok(())
 }

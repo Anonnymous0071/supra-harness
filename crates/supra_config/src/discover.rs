@@ -224,7 +224,13 @@ fn check_private(layer: ConfigSource, path: &Path, metadata: &Metadata) -> Resul
     Err(ConfigError::TooPermissive { layer, path: path.to_path_buf(), mode })
 }
 
+// Windows has no mode bits to inspect, so the check is a no-op, but it keeps
+// the shared `Result` the Unix twin and the call site expect.
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix signature; the call site propagates the Result"
+)]
 fn check_private(_layer: ConfigSource, _path: &Path, _metadata: &Metadata) -> Result<(), ConfigError> {
     Ok(())
 }
