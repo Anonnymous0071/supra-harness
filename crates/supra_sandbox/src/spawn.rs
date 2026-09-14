@@ -276,7 +276,7 @@ pub fn status_summary(status: ExitStatus) -> &'static str {
 }
 
 #[cfg(test)]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod tests {
     use std::os::fd::AsRawFd as _;
 

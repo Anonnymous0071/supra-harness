@@ -158,7 +158,7 @@ pub fn path_of(record: &DescriptorRecord) -> &str {
 }
 
 #[cfg(test)]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod tests {
     use std::io::Write as _;
     use std::os::fd::AsRawFd as _;
