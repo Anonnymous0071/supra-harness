@@ -570,6 +570,7 @@ fn openai_message(
     }
 }
 
+#[allow(deprecated)]
 fn openai_assistant_message(
     message: &crate::client::Message,
 ) -> Result<async_openai::types::chat::ChatCompletionRequestMessage, LlmError> {
@@ -602,7 +603,6 @@ fn openai_assistant_message(
         name: None,
         audio: None,
         tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-        #[allow(deprecated)]
         function_call: None,
     }))
 }
@@ -949,6 +949,7 @@ mod tests {
         }
     }
 
+    #[allow(deprecated)]
     fn sample_blocking_response(
         choices: Vec<async_openai::types::chat::ChatChoice>,
         usage: Option<async_openai::types::chat::CompletionUsage>,
@@ -959,7 +960,6 @@ mod tests {
             created: 0,
             model: "m".to_owned(),
             service_tier: None,
-            #[allow(deprecated)]
             system_fingerprint: None,
             object: "chat.completion".to_owned(),
             usage,
@@ -1162,6 +1162,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn blocking_answers_read_text_and_usage() {
         use async_openai::types::chat::{
             ChatChoice, ChatCompletionResponseMessage, CompletionUsage, CreateChatCompletionResponse,
@@ -1179,7 +1180,6 @@ mod tests {
                     annotations: None,
                     role: async_openai::types::chat::Role::Assistant,
                     audio: None,
-                    #[allow(deprecated)]
                     function_call: None,
                 },
                 finish_reason: Some(async_openai::types::chat::FinishReason::Stop),
@@ -1188,7 +1188,6 @@ mod tests {
             created: 0,
             model: "m".to_owned(),
             service_tier: None,
-            #[allow(deprecated)]
             system_fingerprint: None,
             object: "chat.completion".to_owned(),
             usage: Some(CompletionUsage {
