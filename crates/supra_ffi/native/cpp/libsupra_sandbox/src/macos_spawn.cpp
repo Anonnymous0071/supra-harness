@@ -421,6 +421,11 @@ int supra_sandbox_spawn(const supra_sandbox_policy* policy, const supra_sandbox_
                  "policy requests per-port network but macOS SBPL cannot enforce it");
         return 0;
     }
+    if (policy->isolate_processes != 0U || policy->isolate_ipc != 0U) {
+        setError(out->error, sizeof out->error,
+                 "macOS SBPL backend cannot enforce process or IPC namespace isolation");
+        return 0;
+    }
 
     ProfileBuffer profile{};
     if (!buildProfile(*policy, profile, out->error, sizeof out->error)) {

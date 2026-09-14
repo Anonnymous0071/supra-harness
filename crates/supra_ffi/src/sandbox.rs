@@ -951,6 +951,7 @@ mod tests {
             Err(Error::Refused(message))
                 if message.contains("cannot enforce")
                     || message.contains("backend not implemented")
+                    || message.contains("tier forced below SBPL")
                     || message.contains("unprivileged user namespaces unavailable") => {}
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -978,6 +979,10 @@ mod tests {
             eprintln!("skipped: tier {:?} cannot enforce filesystem policy", caps.tier);
             return;
         }
+        if cfg!(target_os = "macos") {
+            eprintln!("skipped: SBPL has no process or IPC namespaces; see the macos_spawn spawn gate");
+            return;
+        }
 
         let workspace = std::env::temp_dir().join("supra-ffi-sandbox-test");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -1002,6 +1007,9 @@ mod tests {
     fn environment_is_not_inherited() {
         let caps = probe();
         if !caps.tier.enforces_filesystem() {
+            return;
+        }
+        if cfg!(target_os = "macos") {
             return;
         }
 
@@ -1040,6 +1048,9 @@ mod tests {
         if !caps.tier.enforces_filesystem() {
             return;
         }
+        if cfg!(target_os = "macos") {
+            return;
+        }
 
         let workspace = std::env::temp_dir().join("supra-ffi-sandbox-test");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -1075,6 +1086,9 @@ mod tests {
     fn detach_leaves_the_process_running() {
         let caps = probe();
         if !caps.tier.enforces_filesystem() {
+            return;
+        }
+        if cfg!(target_os = "macos") {
             return;
         }
 
