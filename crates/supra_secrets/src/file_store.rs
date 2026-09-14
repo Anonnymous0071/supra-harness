@@ -547,7 +547,7 @@ fn transaction_lock_path(vault_path: &Path) -> PathBuf {
 }
 
 fn ensure_private_directory(directory: &Path) -> Result<(), SecretsError> {
-    let created = match fs::create_dir(directory) {
+    let _created = match fs::create_dir(directory) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -558,7 +558,7 @@ fn ensure_private_directory(directory: &Path) -> Result<(), SecretsError> {
         Err(source) => return Err(SecretsError::Io { path: directory.to_path_buf(), source }),
     };
     #[cfg(unix)]
-    if created {
+    if _created {
         set_mode(directory, 0o700)?;
     }
     Ok(())
