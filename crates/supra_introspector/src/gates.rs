@@ -175,6 +175,9 @@ const GATE_QUIESCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Kill the child's whole process group, grandchildren included.
 fn kill_group(child: &mut std::process::Child) {
+    // Group kill is a POSIX facility; on Windows the leader is killed alone
+    // and the native sandbox's job object owns the rest of the tree.
+    #[cfg(unix)]
     supra_ffi::process::kill_process_group(child.id());
     let _ = child.kill();
     let _ = child.wait();

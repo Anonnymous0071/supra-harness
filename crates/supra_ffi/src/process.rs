@@ -14,7 +14,10 @@
 /// Kill the process group led by `pid`, if it still exists.
 ///
 /// Idempotent: a group that is already gone is not an error, because
-/// the caller is cleaning up, not asking a question.
+/// the caller is cleaning up, not asking a question. Process groups and
+/// `killpg` are POSIX facilities, so the primitive is Unix-only; callers
+/// that must run on Windows gate this away and kill the leader alone.
+#[cfg(unix)]
 pub fn kill_process_group(pid: u32) {
     let Some(group) = i32::try_from(pid).ok().filter(|pid| *pid > 0) else {
         return;
@@ -30,10 +33,14 @@ pub fn kill_process_group(pid: u32) {
 ///
 /// The caller supplies the path of the *protected* artefact; the lock
 /// lives in a sibling dot-file so locking never truncates or creates
-/// the artefact itself. `flock` is whole-file and advisory - every
-/// writer that cooperates is serialised, and a non-cooperating reader
-/// is unaffected.
+/// the artefact itself. The lock is whole-file and advisory on every
+/// platform - every writer that cooperates is serialised, and a
+/// non-cooperating reader is unaffected. Dropping the guard drops the
+/// open file, which releases the lock.
 pub struct FileLock {
+    /// Holds the open lock file; never read, kept alive so the lock
+    /// lasts for the guard's whole scope and releases on drop.
+    #[allow(dead_code)]
     file: std::fs::File,
     lock_path: std::path::PathBuf,
 }
@@ -41,12 +48,16 @@ pub struct FileLock {
 impl FileLock {
     /// Take the exclusive lock for `target_path`, blocking until free.
     ///
+    /// Cross-platform: the blocking whole-file advisory lock is provided
+    /// by `fs2` (`flock` on Unix, `LockFileEx` on Windows), so the guard's
+    /// shape and the sibling-dotfile layout are identical everywhere.
+    ///
     /// # Errors
     ///
     /// Whatever opening the lock file reports; the lock itself only
     /// fails with the descriptor's own errors.
     pub fn acquire(target_path: &std::path::Path) -> std::io::Result<Self> {
-        use std::os::fd::AsRawFd as _;
+        use fs2::FileExt as _;
 
         let file_name = target_path
             .file_name()
@@ -58,12 +69,7 @@ impl FileLock {
             }
         }
         let file = std::fs::OpenOptions::new().create(true).append(true).open(&lock_path)?;
-        // SAFETY: `flock` on a just-opened descriptor; the only kernel
-        // state touched is the advisory lock bit on this file.
-        let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if outcome != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        file.lock_exclusive()?;
         Ok(Self { file, lock_path })
     }
 
@@ -71,17 +77,6 @@ impl FileLock {
     #[must_use]
     pub fn lock_path(&self) -> &std::path::Path {
         &self.lock_path
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd as _;
-
-        // SAFETY: releasing the lock this guard holds; a failure here
-        // only delays release to the descriptor's close, which Drop
-        // performs immediately after.
-        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 

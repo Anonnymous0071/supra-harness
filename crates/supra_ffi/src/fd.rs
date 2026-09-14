@@ -83,6 +83,7 @@ pub fn set_cloexec(_fd: core::ffi::c_int, _cloexec: bool) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::io::Write as _;
     use std::os::fd::AsRawFd as _;

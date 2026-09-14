@@ -25,6 +25,7 @@ workspace = true
 
 [dependencies]
 libc = { workspace = true }
+fs2 = { workspace = true }
 
 [build-dependencies]
 cmake = "0.1.58"

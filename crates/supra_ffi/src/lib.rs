@@ -82,6 +82,11 @@
 
 pub mod ansi;
 pub mod fd;
+// A poll-deadline reader over a file descriptor: `poll` and `read` on an
+// `AsRawFd` are POSIX facilities, so the module does not exist on Windows.
+// The language- and debug-server clients that need it gate on `cfg(unix)`,
+// matching the pty module - a caller checks the gate, never "is it linked".
+#[cfg(unix)]
 pub mod piped;
 pub mod process;
 // Pseudo-terminals are a Unix facility; the module's `posix_openpt`,

@@ -3230,6 +3230,7 @@ version = "0.2.0"
 dependencies = [
  "cc",
  "cmake",
+ "fs2",
  "libc",
 ]
 

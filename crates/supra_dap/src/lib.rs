@@ -25,7 +25,9 @@
 
 /// The adapter catalogue and language coverage.
 pub mod adapters;
-/// The live client: initialize, breakpoint, launch, stack trace.
+/// The live client: initialize, breakpoint, launch, stack trace. The timed
+/// pipe reader it builds on is a POSIX facility, so the client is Unix-only.
+#[cfg(unix)]
 pub mod client;
 /// The refusal shapes.
 pub mod error;
@@ -33,10 +35,12 @@ pub mod error;
 pub mod framing;
 
 pub use adapters::Adapter;
+#[cfg(unix)]
 pub use client::{Breakpoint, Client, StackTrace};
 pub use error::DapError;
 pub use framing::{Source, StackFrame};
 
+#[cfg(unix)]
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<Client>();

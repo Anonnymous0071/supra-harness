@@ -34,7 +34,9 @@
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::print_stderr))]
 
-/// The live client: spawn, initialize, references, restart.
+/// The live client: spawn, initialize, references, restart. The timed
+/// pipe reader it builds on is a POSIX facility, so the client is Unix-only.
+#[cfg(unix)]
 pub mod client;
 /// The refusal shapes.
 pub mod error;
@@ -43,11 +45,13 @@ pub mod framing;
 /// The five configured servers and their language coverage.
 pub mod servers;
 
+#[cfg(unix)]
 pub use client::{Client, SemanticReferences};
 pub use error::LspError;
 pub use framing::{Location, Position, Range};
 pub use servers::Server;
 
+#[cfg(unix)]
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<Client>();
