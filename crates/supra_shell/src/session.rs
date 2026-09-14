@@ -245,6 +245,11 @@ pub fn spawn_simple(
 }
 
 #[cfg(test)]
+// These tests spawn a real pty child under the native sandbox. CI only runs
+// that reliably on the Linux runner: the headless macOS runner's SBPL profile
+// aborts the confined exec, so the composition tests are scoped to Linux,
+// where pty and spawn both work, and left to the native suites elsewhere.
+#[cfg(target_os = "linux")]
 mod tests {
     use std::time::{Duration, Instant};
 

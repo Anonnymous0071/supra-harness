@@ -49,7 +49,9 @@
 //! the first one restored the older bytes.
 
 use std::fs::File;
-use std::io::{Read as _, Write as _};
+#[cfg(unix)]
+use std::io::Read as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use rusqlite::TransactionBehavior;
