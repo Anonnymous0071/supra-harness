@@ -68,7 +68,13 @@ impl FileLock {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(&lock_path)?;
+        // `write(true)` rather than `append(true)`: the Windows `LockFileEx`
+        // call that backs `fs2::lock_exclusive` needs GENERIC_WRITE access on
+        // the handle, and an append-only handle is refused with
+        // ERROR_ACCESS_DENIED. `truncate(false)` is explicit: the lock is a
+        // sentinel we never write to or shorten, so the content question is
+        // moot - the open mode only matters for what the lock call accepts.
+        let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path)?;
         file.lock_exclusive()?;
         Ok(Self { file, lock_path })
     }

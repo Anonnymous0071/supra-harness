@@ -16,11 +16,17 @@ impl Drop for Fixture {
     }
 }
 
+// One directory per fixture, kept distinct by a process-wide sequence number.
+// A wall-clock timestamp collides on the coarse macOS clock when parallel test
+// threads call within the same tick, and two fixtures sharing a directory share
+// an archive name - so one test reads the archive another just wrote.
+static FIXTURE_ROOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn root() -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "supra-update-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos()
+        FIXTURE_ROOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     fs::create_dir_all(&path).expect("fixture root");
     path

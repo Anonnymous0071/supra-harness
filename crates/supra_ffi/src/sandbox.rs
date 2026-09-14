@@ -848,6 +848,7 @@ mod tests {
         assert_eq!(fixed_string(&buffer), String::from('\u{FFFD}'));
     }
 
+    #[cfg(not(windows))]
     fn workspace_policy(workspace: &Path) -> Policy {
         let mut policy = Policy::new();
         policy
@@ -892,16 +893,26 @@ mod tests {
     #[test]
     fn interior_nul_is_rejected() {
         let mut policy = Policy::new();
-        assert_eq!(policy.allow("/tmp/a\0b", Access::READ).err(), Some(Error::InteriorNul));
+        // An interior NUL must be the error, not the absolute-path check, so the
+        // fixture path is absolute on the target platform and carries the NUL.
+        #[cfg(not(windows))]
+        let path = "/tmp/a\0b";
+        #[cfg(windows)]
+        let path = "C:\\a\0b";
+        assert_eq!(policy.allow(path, Access::READ).err(), Some(Error::InteriorNul));
     }
 
     #[test]
     fn path_table_is_bounded() {
         let mut policy = Policy::new();
+        #[cfg(not(windows))]
+        let path = "/tmp";
+        #[cfg(windows)]
+        let path = "C:\\tmp";
         for _ in 0..sys::SANDBOX_MAX_PATHS {
-            policy.allow("/tmp", Access::READ).expect("within the limit");
+            policy.allow(path, Access::READ).expect("within the limit");
         }
-        assert_eq!(policy.allow("/tmp", Access::READ).err(), Some(Error::TableFull));
+        assert_eq!(policy.allow(path, Access::READ).err(), Some(Error::TableFull));
     }
 
     #[test]
@@ -913,7 +924,11 @@ mod tests {
         assert_eq!(policy.network, Network::Ports);
     }
 
+    // The raw-policy normalisation (MANAGE implies WRITE) is a property of the
+    // native library the caller links; Windows native enforcement is covered by
+    // the C++ AppContainer suites rather than this synthetic path.
     #[test]
+    #[cfg(not(windows))]
     fn manage_implies_write_in_the_raw_policy() {
         let mut policy = Policy::new();
         policy.allow("/tmp", Access::MANAGE).expect("allow");
@@ -936,7 +951,10 @@ mod tests {
         }
     }
 
+    // The forced-tier refusal is reachable on Unix backends; on Windows the
+    // forced tier is not a Windows one, so the refusal message differs.
     #[test]
+    #[cfg(not(windows))]
     fn unenforceable_policy_is_refused() {
         force_tier_for_testing(Some(Tier::Namespaces));
 
@@ -957,7 +975,11 @@ mod tests {
         }
     }
 
+    // Requiring a tier above the platform's best is a Unix-backend property; on
+    // Windows the required AppContainer tier is the platform's own, so the spawn
+    // reaches the (absent) program instead of the tier refusal.
     #[test]
+    #[cfg(not(windows))]
     fn required_tier_is_honoured() {
         let mut policy = Policy::new();
         policy.require_tier(Tier::AppContainer);
@@ -972,7 +994,11 @@ mod tests {
         }
     }
 
+    // A real spawn under the native backend: Unix-only, since it drives
+    // `workspace_policy`, `/bin/sh`, and `/proc` reaping; native Windows
+    // enforcement is covered by the C++ AppContainer suites.
     #[test]
+    #[cfg(not(windows))]
     fn runs_a_command_and_reports_its_status() {
         let caps = probe();
         if !caps.tier.enforces_filesystem() {
@@ -1003,7 +1029,9 @@ mod tests {
         assert_eq!(status, 9, "the payload's own exit code reaches the caller");
     }
 
+    // A real spawn under the native backend: Unix-only (see the first spawn test).
     #[test]
+    #[cfg(not(windows))]
     fn environment_is_not_inherited() {
         let caps = probe();
         if !caps.tier.enforces_filesystem() {
@@ -1042,7 +1070,9 @@ mod tests {
         assert_eq!(status, 0, "the host environment leaked into the sandbox");
     }
 
+    // A real spawn under the native backend: Unix-only (see the first spawn test).
     #[test]
+    #[cfg(not(windows))]
     fn dropping_a_handle_kills_the_process() {
         let caps = probe();
         if !caps.tier.enforces_filesystem() {
@@ -1082,7 +1112,9 @@ mod tests {
         assert!(!still_running, "dropping the handle must terminate the process");
     }
 
+    // A real spawn under the native backend: Unix-only (see the first spawn test).
     #[test]
+    #[cfg(not(windows))]
     fn detach_leaves_the_process_running() {
         let caps = probe();
         if !caps.tier.enforces_filesystem() {
@@ -1113,7 +1145,10 @@ mod tests {
         // panicking on drop.
     }
 
+    // The `/bin/sh` identity fixture is a Unix path; on Windows the running
+    // binary and its identity are exercised by the C++ suites instead.
     #[test]
+    #[cfg(not(windows))]
     fn self_identity_matches_the_running_binary() {
         let path = self_path().expect("self path");
         assert!(path.is_absolute());
