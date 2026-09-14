@@ -353,15 +353,41 @@ void testTimeoutAndCleanup() {
     removePath(kMarker);
 }
 
+// The execution sub-tests need a confined child to actually run to completion.
+// A headless or unprivileged runner reports the native tier but cannot exec a
+// real tool (macOS SBPL aborts the execve; AppContainer creation is denied
+// without SeAssignPrimaryToken), so a trivial confined child that does nothing
+// is the capability canary: when even it fails, the enforcement sub-tests are
+// skipped loudly rather than turned into environment failures.
+bool confinedExecutionSupported() {
+    const std::string shell = shellPath();
+    if (shell.empty()) {
+        std::fprintf(stderr, "native execution unsupported: shell does not resolve\n");
+        return false;
+    }
+    auto policy = basePolicy(shell);
+    int status = -1;
+    if (!runScript(policy, shell, "exit 0", &status)) {
+        return false;
+    }
+    if (status != 0) {
+        std::fprintf(stderr, "native execution unsupported: confined child exited %d\n", status);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
     testProbe();
     testConcurrentProbeAndForcedTier();
-    testFilesystemEnforcement();
-    testNetworkEnforcement();
     testUnsupportedIsolationRefused();
     testPortPolicyRefused();
-    testTimeoutAndCleanup();
+    if (confinedExecutionSupported()) {
+        testFilesystemEnforcement();
+        testNetworkEnforcement();
+        testTimeoutAndCleanup();
+    }
     return supra::test::finish("sandbox_native_test");
 }

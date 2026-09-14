@@ -8,6 +8,12 @@
 
 namespace {
 
+#if defined(_WIN32)
+const char* kAbsolute = "C:\\supra-native-policy-test";
+#else
+const char* kAbsolute = "/tmp";
+#endif
+
 /// Zeroing must be the most restrictive state, so a caller that forgets a field
 /// gets less access rather than more.
 void testInitIsRestrictive() {
@@ -41,7 +47,7 @@ void testRelativePathRejected() {
                        "null path refused");
     SUPRA_CHECK_EQ_MSG(policy.path_count, std::uint8_t{0}, "nothing recorded");
 
-    SUPRA_CHECK_EQ_MSG(supra_sandbox_policy_allow(&policy, "/absolute", SUPRA_SANDBOX_READ), 1,
+    SUPRA_CHECK_EQ_MSG(supra_sandbox_policy_allow(&policy, kAbsolute, SUPRA_SANDBOX_READ), 1,
                        "absolute path accepted");
     SUPRA_CHECK_EQ(policy.path_count, std::uint8_t{1});
 }
@@ -49,7 +55,7 @@ void testRelativePathRejected() {
 void testZeroAccessRejected() {
     supra_sandbox_policy policy{};
     supra_sandbox_policy_init(&policy);
-    SUPRA_CHECK_EQ_MSG(supra_sandbox_policy_allow(&policy, "/tmp", 0), 0,
+    SUPRA_CHECK_EQ_MSG(supra_sandbox_policy_allow(&policy, kAbsolute, 0), 0,
                        "a rule granting nothing is a caller error");
     SUPRA_CHECK_EQ(policy.path_count, std::uint8_t{0});
 }
@@ -60,7 +66,7 @@ void testManageImpliesWrite() {
     supra_sandbox_policy policy{};
     supra_sandbox_policy_init(&policy);
 
-    SUPRA_CHECK_EQ(supra_sandbox_policy_allow(&policy, "/tmp", SUPRA_SANDBOX_MANAGE), 1);
+    SUPRA_CHECK_EQ(supra_sandbox_policy_allow(&policy, kAbsolute, SUPRA_SANDBOX_MANAGE), 1);
     SUPRA_CHECK_MSG((policy.paths[0].access & SUPRA_SANDBOX_WRITE) != 0,
                     "MANAGE implies WRITE");
     SUPRA_CHECK_MSG((policy.paths[0].access & SUPRA_SANDBOX_MANAGE) != 0, "MANAGE retained");
@@ -71,10 +77,10 @@ void testTableFull() {
     supra_sandbox_policy_init(&policy);
 
     for (int i = 0; i < SUPRA_SANDBOX_MAX_PATHS; ++i) {
-        SUPRA_CHECK_EQ_MSG(supra_sandbox_policy_allow(&policy, "/tmp", SUPRA_SANDBOX_READ), 1,
+        SUPRA_CHECK_EQ_MSG(supra_sandbox_policy_allow(&policy, kAbsolute, SUPRA_SANDBOX_READ), 1,
                            "rule " + std::to_string(i) + " accepted");
     }
-    SUPRA_CHECK_EQ_MSG(supra_sandbox_policy_allow(&policy, "/tmp", SUPRA_SANDBOX_READ), 0,
+    SUPRA_CHECK_EQ_MSG(supra_sandbox_policy_allow(&policy, kAbsolute, SUPRA_SANDBOX_READ), 0,
                        "refuses past the limit rather than overflowing");
     SUPRA_CHECK_EQ(policy.path_count, std::uint8_t{SUPRA_SANDBOX_MAX_PATHS});
 }
