@@ -72,12 +72,22 @@ pub fn set_cloexec(fd: core::ffi::c_int, cloexec: bool) -> io::Result<()> {
 /// POSIX platforms without this module's `fcntl` (non-Unix) refuse rather than
 /// pretend: a caller that cannot even read the flag cannot guarantee hygiene,
 /// and a silent `Ok` would certify a sweep that never ran.
+///
+/// # Errors
+///
+/// [`io::Error`] with [`io::ErrorKind::Unsupported`]: descriptor flags need a
+/// POSIX platform.
 #[cfg(not(unix))]
 pub fn cloexec_flag(_fd: core::ffi::c_int) -> io::Result<bool> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "descriptor flags need a POSIX platform"))
 }
 
 /// See [`cloexec_flag`].
+///
+/// # Errors
+///
+/// [`io::Error`] with [`io::ErrorKind::Unsupported`]: descriptor flags need a
+/// POSIX platform.
 #[cfg(not(unix))]
 pub fn set_cloexec(_fd: core::ffi::c_int, _cloexec: bool) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "descriptor flags need a POSIX platform"))
