@@ -226,7 +226,11 @@ mod tests {
         assert!(policy.inherited_paths().is_empty());
     }
 
+    // The bootstrap set is a Linux floor; on Windows those paths are not
+    // absolute, so `default_policy` rejects them and only the workspace rule
+    // lands. The count assertion is therefore a Unix-only invariant.
     #[test]
+    #[cfg(not(windows))]
     fn default_policy_grants_the_bootstrap_set() {
         let workspace = std::env::temp_dir().join("supra-sandbox-policy-default");
         let _ = std::fs::create_dir_all(&workspace);

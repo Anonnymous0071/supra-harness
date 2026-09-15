@@ -275,12 +275,16 @@ mod tests {
     #[test]
     fn the_default_path_lands_under_state_not_cache() {
         // A cache directory is something a user or a cleanup tool may delete at any
-        // time, and a log's whole value is historical.
+        // time, and a log's whole value is historical. Check the path's components
+        // rather than its spelling so the assertion holds on every separator.
         match default_log_path() {
             Ok(path) => {
-                let text = path.to_string_lossy().into_owned();
-                assert!(text.ends_with("supra/supra.log"), "{text}");
-                assert!(!text.contains("/cache/"), "{text}");
+                let file = path.file_name().expect("a leaf");
+                let dir = path.parent().expect("a parent").file_name();
+                assert_eq!(file, std::ffi::OsStr::new(LOG_FILE), "{path:?}");
+                assert_eq!(dir, Some(std::ffi::OsStr::new(LOG_DIR)), "{path:?}");
+                let under_cache = path.components().any(|component| component.as_os_str() == "cache");
+                assert!(!under_cache, "{path:?}");
             }
             Err(LogError::NoStateDirectory) => {
                 eprintln!("skipped: neither XDG_STATE_HOME nor HOME is set");
