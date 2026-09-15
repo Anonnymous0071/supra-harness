@@ -65,17 +65,6 @@ pub fn generate_key() -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Replace the process key. Test-only: production rotates the key by restarting the process,
-/// which is the only rotation that also wipes the old key's heap.
-#[cfg(test)]
-pub(crate) fn rotate_test_key() -> Result<(), Refusal> {
-    let mut slot = KEY.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut key = Zeroizing::new([0_u8; 32]);
-    getrandom::fill(key.as_mut_slice()).map_err(|_| Refusal::NoEntropy { at: "test key rotation" })?;
-    *slot = Some(key);
-    Ok(())
-}
-
 /// Whether a key has been generated.
 #[must_use]
 pub fn has_key() -> bool {
@@ -118,6 +107,16 @@ pub fn issue() -> Result<Option<String>, Refusal> {
 /// not authenticate under this process key. No I/O, no allocation beyond the message - so no
 /// other failure mode exists.
 pub fn verify(marker: Option<&str>) -> Result<(), Refusal> {
+    let slot = KEY.lock().unwrap_or_else(PoisonError::into_inner);
+    verify_with(slot.as_ref(), marker)
+}
+
+/// The body of [`verify`] with the key supplied by the caller. `verify` reads the process
+/// key and delegates; the test that proves a *foreign* key refuses a marker passes its own.
+/// Supplying the key instead of rotating the process slot keeps that slot stable for every
+/// test running concurrently in this binary - a rotation would pull the key out from under
+/// another test's `issue`/`verify` pair and fail an honest marker.
+fn verify_with(key: Option<&Zeroizing<[u8; 32]>>, marker: Option<&str>) -> Result<(), Refusal> {
     let Some(marker) = marker else {
         return Err(Refusal::BadMarker { detail: "no marker in the environment".to_owned() });
     };
@@ -133,8 +132,7 @@ pub fn verify(marker: Option<&str>) -> Result<(), Refusal> {
     if nonce_hex.len() != 32 || !nonce_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(Refusal::BadMarker { detail: "the nonce is not 16 hex bytes".to_owned() });
     }
-    let slot = KEY.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(key) = slot.as_ref() else {
+    let Some(key) = key else {
         return Err(Refusal::BadMarker { detail: "this process holds no marker key".to_owned() });
     };
     let body = format!("{version}:{nonce_hex}");
@@ -250,11 +248,12 @@ mod tests {
     #[test]
     fn a_marker_from_another_key_is_refused() {
         // The copy scenario: a marker minted under one process key does not verify under
-        // another. Rotating the key stands in for "another process".
+        // another. The foreign key is supplied explicitly rather than rotated into the
+        // process slot, which every test in this binary shares.
         keyed();
-        let marker = issue().expect("keyed").expect("minted under the old key");
-        rotate_test_key().expect("rotation");
-        let error = verify(Some(&marker)).expect_err("wrong key");
+        let marker = issue().expect("keyed").expect("minted under the process key");
+        let foreign = Zeroizing::new([0x5A_u8; 32]);
+        let error = verify_with(Some(&foreign), Some(&marker)).expect_err("wrong key");
         assert!(error.to_string().contains("does not authenticate"), "{error}");
     }
 
