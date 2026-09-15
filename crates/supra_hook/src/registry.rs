@@ -189,9 +189,9 @@ fn shell_words(line: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use supra_types::Event;
-    use supra_types::TurnId;
     #[cfg(unix)]
     use supra_types::SessionId;
+    use supra_types::TurnId;
 
     fn context() -> HookContext {
         HookContext { event: Event::TurnStarted { turn: TurnId::generate() }, turn_count: 3 }
