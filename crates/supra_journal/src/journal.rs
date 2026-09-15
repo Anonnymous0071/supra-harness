@@ -411,6 +411,9 @@ fn restore_bytes(
         return Err(injected_fault("injected rename failure"));
     }
     std::fs::rename(&temporary.path, target)?;
+    // A directory fsync is a POSIX durability guarantee; on other platforms the
+    // filesystem owns it, so the rename is the last thing the restore does.
+    #[cfg(unix)]
     File::open(&directory)?.sync_all()?;
     Ok(())
 }

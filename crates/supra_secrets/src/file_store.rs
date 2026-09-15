@@ -574,10 +574,25 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), SecretsError> {
         .map_err(|error| SecretsError::Io { path: path.to_path_buf(), source: error })
 }
 
+/// Persist a renamed directory entry. On Unix this fsyncs the directory so the
+/// rename is durable. On other platforms the filesystem owns metadata durability,
+/// and a directory cannot be opened the same way, so the call is a no-op there.
+#[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<(), SecretsError> {
     let file = fs::File::open(directory)
         .map_err(|error| SecretsError::Io { path: directory.to_path_buf(), source: error })?;
     file.sync_all().map_err(|error| SecretsError::Io { path: directory.to_path_buf(), source: error })
+}
+
+#[cfg(not(unix))]
+// The Unix twin and the shared call site both use the `Result`, so the no-op
+// keeps the same signature even though it never fails.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix signature; the call site propagates the Result"
+)]
+fn sync_directory(_directory: &Path) -> Result<(), SecretsError> {
+    Ok(())
 }
 
 /// A callback that supplies the vault passphrase when neither memory nor the environment has
