@@ -19,9 +19,8 @@ arch=$(uname -m)
 case "$os-$arch" in
     linux-x86_64) target="x86_64-unknown-linux-gnu" ;;
     linux-aarch64) target="aarch64-unknown-linux-gnu" ;;
-    darwin-x86_64) target="x86_64-apple-darwin" ;;
-    darwin-arm64) target="aarch64-apple-darwin" ;;
-    *) echo "install: unsupported platform $os-$arch" >&2; exit 1 ;;
+    darwin-*) echo "install: no macOS binaries in this release; build from the tag-pinned source (README)" >&2; exit 1 ;;
+    *) echo "install: unsupported platform $os-$arch (Windows users run the .exe from the release)" >&2; exit 1 ;;
 esac
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "install: need $1 ($2)" >&2; exit 1; }; }

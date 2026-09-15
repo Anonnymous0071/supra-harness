@@ -65,20 +65,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # gnu x86_64 (native on ubuntu-latest) rather than musl: the musl
-          # target needed a prebuilt toolchain from the external musl.cc host,
-          # which has timed out from runners. gnu links against glibc, which is
-          # present on every major Linux distribution.
+          # Linux + Windows only. The macOS targets are not shipped in this
+          # release: x86_64-apple needed a scarce macos-13 runner and
+          # cross-building x86_64 on the ARM runner proved unreliable, so Mac
+          # users build from the tag-pinned source (README) until that is
+          # revisited.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          # x86_64 macOS is cross-built on the (more available) ARM runner with
-          # Apple's x86_64 cross-clang, rather than waiting on scarce macos-13.
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
@@ -109,26 +104,13 @@ jobs:
         if: >-
           matrix.target != 'x86_64-unknown-linux-gnu' &&
           matrix.target != 'aarch64-unknown-linux-gnu'
-        env:
-          SUPRA_CPP: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64-apple-clang' || '' }}
-          SUPRA_CXX: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64-apple-clang++' || '' }}
-        run: |
-          if [[ -n "$SUPRA_CXX" ]]; then
-            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_C_COMPILER="$SUPRA_CPP" -DCMAKE_CXX_COMPILER="$SUPRA_CXX"
-          else
-            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          fi
-          cmake --build build --parallel
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
 
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Smoke native release binary
-        if: >-
-          (runner.os == 'Windows' && matrix.target == 'x86_64-pc-windows-msvc') ||
-          (runner.os == 'macOS' && matrix.target == 'x86_64-apple-darwin') ||
-          (runner.os == 'macOS' && matrix.target == 'aarch64-apple-darwin')
+        if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
         run: |
           binary="target/${{ matrix.target }}/release/supra"
@@ -217,7 +199,7 @@ jobs:
 
             Or grab the per-target `.tar.gz`, matching `.manifest.json`, and
             `.manifest.json.minisig`; the required signature binds the exact archive
-            and its sole executable member. The Homebrew formula is published
-            separately after its version and SHA-256 values have been updated from
-            `SHA256SUMS`. Build from source with the tag-pinned checkout
-            instructions in the README.
+            and its sole executable member. This release ships `x86_64` and
+            `aarch64` Linux (gnu) and `x86_64` Windows; macOS builds from the
+            tag-pinned source (README). Build from source with the tag-pinned
+            checkout instructions in the README.
