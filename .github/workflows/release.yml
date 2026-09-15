@@ -193,13 +193,20 @@ jobs:
           body: |
             ## Install
 
+            Linux / Windows (PowerShell or cmd):
+
             ```sh
+            # Linux:
             curl -fsSL "https://raw.githubusercontent.com/Anonnymous0071/supra-harness/${{ needs.preflight.outputs.tag }}/scripts/install.sh" | SUPRA_VERSION="${{ needs.preflight.outputs.tag }}" SUPRA_PUBKEY='<published minisign public key>' bash
+            ```
+            ```powershell
+            # Windows (PowerShell):
+            $env:SUPRA_VERSION='${{ needs.preflight.outputs.tag }}'; $env:SUPRA_PUBKEY='<published minisign public key>'
+            irm "https://raw.githubusercontent.com/Anonnymous0071/supra-harness/${{ needs.preflight.outputs.tag }}/scripts/install.ps1" | iex
             ```
 
             Or grab the per-target `.tar.gz`, matching `.manifest.json`, and
-            `.manifest.json.minisig`; the required signature binds the exact archive
-            and its sole executable member. This release ships `x86_64` and
-            `aarch64` Linux (gnu) and `x86_64` Windows; macOS builds from the
-            tag-pinned source (README). Build from source with the tag-pinned
-            checkout instructions in the README.
+            `.manifest.json.minisig`; the required signature binds the exact
+            archive and its sole executable member. This release ships
+            `x86_64` and `aarch64` Linux (gnu) and `x86_64` Windows; macOS
+            builds from the tag-pinned source (README).
