@@ -465,6 +465,7 @@ mod tests {
         format!("{:016x}", hasher.finish())
     }
 
+    #[cfg(unix)]
     fn write_file(path: &Path, contents: &[u8]) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("parent");
@@ -473,6 +474,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_snapshot_round_trips_through_undo() {
         let (journal, dir) = journal();
         let file = dir.join("a.rs");
@@ -486,6 +488,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_relative_snapshot_restores_from_any_working_directory() {
         static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _lock = CWD_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -555,6 +558,7 @@ mod tests {
         assert!(matches!(journal.snapshot(&file), Err(JournalError::NonUtf8Path { .. })));
     }
 
+    #[cfg(unix)]
     fn undo_temporary_paths(dir: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(dir)
             .expect("read dir")
@@ -568,6 +572,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn pre_rename_faults_clean_temporary_files_and_allow_retry() {
         for fault in [UndoFault::Create, UndoFault::Write, UndoFault::Sync, UndoFault::Rename] {
             let (journal, dir) = journal();
@@ -585,6 +590,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_database_mark_fault_leaves_no_temp_and_remains_retryable() {
         let (journal, dir) = journal();
         let file = dir.join("a.rs");
@@ -616,6 +622,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn snapshot_commits_before_the_edit_may_proceed() {
         // The write-ahead order, observed: snapshot() must return Ok with
         // the row committed even though the file has not changed yet, and a
@@ -642,6 +649,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn undo_twice_is_refused() {
         let (journal, dir) = journal();
         let file = dir.join("a.rs");
@@ -670,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_damaged_snapshot_restores_nothing() {
         // I4's reasoning: the bytes are not returned, the undo is refused.
         // Damaged here means the stored blob no longer hashes to the digest
@@ -708,6 +717,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn concurrent_undos_of_one_row_one_wins() {
         // The store lock is the arbiter: both undoes target the same row,
         // and only one may restore-and-mark. The other must refuse with
@@ -739,6 +749,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn newest_for_path_reports_the_live_head() {
         let (journal, dir) = journal();
         let file = dir.join("a.rs");
@@ -769,6 +780,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn created_at_is_the_ids_own_timestamp_not_a_second_clock_read() {
         // The flake that closed structurally: reading the clock twice (once
         // inside Ulid::generate, once for created_at) disagreed whenever the
@@ -800,6 +812,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlinked_temp_directory_reports_its_snapshots() {
         // macOS CI proved the shape: $TMPDIR resolves through /var/folders
         // to /private/var, snapshot stored the resolved path, and a query
@@ -840,6 +853,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn undo_restores_bytes_not_metadata() {
         // `created_at` is outside the digest on purpose; the same bytes
         // snapshotted twice still verify. This pins that the restore path
