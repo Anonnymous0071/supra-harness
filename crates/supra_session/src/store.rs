@@ -468,13 +468,15 @@ mod tests {
     #[cfg(unix)]
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// One directory per test, kept distinct by a process-wide sequence number so
+    /// parallel test threads never share a directory on a coarse clock.
+    static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "supra-session-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
+            SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
