@@ -17,7 +17,7 @@ PUBKEY="${SUPRA_PUBKEY:?install: SUPRA_PUBKEY is required}"
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 arch=$(uname -m)
 case "$os-$arch" in
-    linux-x86_64) target="x86_64-unknown-linux-musl" ;;
+    linux-x86_64) target="x86_64-unknown-linux-gnu" ;;
     linux-aarch64) target="aarch64-unknown-linux-gnu" ;;
     darwin-x86_64) target="x86_64-apple-darwin" ;;
     darwin-arm64) target="aarch64-apple-darwin" ;;

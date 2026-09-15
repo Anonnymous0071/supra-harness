@@ -65,14 +65,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # musl first: the statically linked Linux artefact is the primary
-          # distribution form.
-          - target: x86_64-unknown-linux-musl
+          # gnu x86_64 (native on ubuntu-latest) rather than musl: the musl
+          # target needed a prebuilt toolchain from the external musl.cc host,
+          # which has timed out from runners. gnu links against glibc, which is
+          # present on every major Linux distribution.
+          - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+          # x86_64 macOS is cross-built on the (more available) ARM runner with
+          # Apple's x86_64 cross-clang, rather than waiting on scarce macos-13.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
@@ -85,37 +89,14 @@ jobs:
       - name: Add target
         run: rustup target add ${{ matrix.target }}
 
-      # The musl target links C++ statically: cc-rs needs a musl-targeting
-      # g++, and musl-tools alone only ships musl-gcc (C). The prebuilt
-      # toolchain is accepted only at the reviewed SHA-256 digest.
+      # x86_64-unknown-linux-gnu is native on ubuntu-latest (host g++, no
+      # external toolchain). Only the aarch64 gnu target needs a cross g++.
       - name: Install build deps (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang ninja-build musl-tools
-          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-            archive=x86_64-linux-musl-cross.tgz
-            sha256=c5d410d9f82a4f24c549fe5d24f988f85b2679b452413a9f7e5f7b956f2fe7ea
-            mkdir -p /tmp/musl-cross
-            cd /tmp/musl-cross
-            curl -fsSLo "$archive" "https://musl.cc/$archive" || true
-            # musl.cc is an external prebuilt-toolchain host that has timed out
-            # from runners; retry a few times before giving up.
-            for attempt in 1 2 3 4; do
-              if [[ -s "$archive" ]] && echo "$sha256  $archive" | sha256sum -c - >/dev/null 2>&1; then
-                break
-              fi
-              [[ "$attempt" -eq 4 ]] && { echo "musl.cc toolchain did not download in time" >&2; exit 1; }
-              echo "retrying musl.cc download (attempt $attempt)..." >&2
-              sleep 30
-              curl -fsSLo "$archive" "https://musl.cc/$archive" || true
-            done
-            echo "$sha256  $archive" | sha256sum -c -
-            sudo mkdir -p /opt/musl-cross
-            sudo tar xzf "$archive" -C /opt/musl-cross --strip-components=1
-            echo "/opt/musl-cross/bin" >> "$GITHUB_PATH"
-            echo "CXX_x86_64_unknown_linux_musl=x86_64-linux-musl-g++" >> "$GITHUB_ENV"
-          elif [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+          sudo apt-get install -y clang ninja-build
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
             sudo apt-get install -y g++-aarch64-linux-gnu
             echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
           fi
@@ -126,9 +107,19 @@ jobs:
 
       - name: Build C++ libraries
         if: >-
-          matrix.target != 'x86_64-unknown-linux-musl' &&
+          matrix.target != 'x86_64-unknown-linux-gnu' &&
           matrix.target != 'aarch64-unknown-linux-gnu'
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
+        env:
+          SUPRA_CPP: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64-apple-clang' || '' }}
+          SUPRA_CXX: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64-apple-clang++' || '' }}
+        run: |
+          if [[ -n "$SUPRA_CXX" ]]; then
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER="$SUPRA_CPP" -DCMAKE_CXX_COMPILER="$SUPRA_CXX"
+          else
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          fi
+          cmake --build build --parallel
 
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
