@@ -66,9 +66,13 @@ def main() -> None:
         "version": version.removeprefix("v"),
     }
     # Sorted keys, compact separators, UTF-8, and one final LF are the
-    # canonical bytes signed by scripts/sign-release.sh.
+    # canonical bytes signed by scripts/sign-release.sh. Written as bytes so
+    # the file ends in a single LF on every platform (text-mode writes would
+    # translate the trailing LF to CRLF on a Windows runner, breaking the
+    # canonical byte check in sign-release.sh).
     output = archive.with_name(f"supra-{target}.manifest.json")
-    output.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+    output.write_bytes(canonical.encode("utf-8"))
     print(output)
 
 
