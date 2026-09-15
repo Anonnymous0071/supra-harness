@@ -995,7 +995,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(session_dir);
     }
 
+    // A `sh -c 'exit 42'` stop is a Unix-shell contract; on Windows `sh`
+    // does not exist, so the exit-code stop cannot be exercised.
     #[tokio::test(start_paused = true)]
+    #[cfg(unix)]
     async fn a_turn_start_hook_stop_aborts_before_any_provider_call() {
         let backend = Arc::new(MockProvider::new([text_reply("never sent", Duration::ZERO)]));
         let session_dir = scratch("hook-stop-start");
@@ -1010,7 +1013,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(session_dir);
     }
 
+    // A `sh -c 'exit 42'` stop is a Unix-shell contract; on Windows `sh`
+    // does not exist, so the exit-code stop cannot be exercised.
     #[tokio::test(start_paused = true)]
+    #[cfg(unix)]
     async fn a_turn_end_hook_stop_fails_the_turn_after_persistence() {
         let backend = Arc::new(MockProvider::new([
             text_reply("accepted answer", Duration::ZERO),

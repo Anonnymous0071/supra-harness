@@ -379,10 +379,10 @@ fn answer(response: Response) -> Result<serde_json::Value, McpError> {
 mod tests {
     use super::*;
 
-    /// A tiny in-process MCP server as a shell command: reads one line,
-    /// answers one line. This is the stdio shape end to end - spawn,
-    /// write, read, reap - without a network or a real third-party
-    /// binary.
+    // A tiny in-process MCP server as a `python3` command - spawn, write, read,
+    // reap - without a network or a real third-party binary. Unix-only, since
+    // the responder is `python3` and the stdio tests below spawn it.
+    #[cfg(unix)]
     fn python_responder(script: &str) -> Endpoint {
         Endpoint::Stdio {
             argv: vec![
@@ -398,7 +398,9 @@ mod tests {
         }
     }
 
+    // Spawns a `python3` responder: Unix-only.
     #[tokio::test]
+    #[cfg(unix)]
     async fn stdio_round_trips_one_call() {
         let endpoint = python_responder(
             r#"import sys, json
@@ -412,7 +414,9 @@ print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"echo": True
         assert_eq!(result, serde_json::json!({"echo": true}));
     }
 
+    // Spawns a `python3` responder: Unix-only.
     #[tokio::test]
+    #[cfg(unix)]
     async fn notifications_and_foreign_ids_are_skipped_not_confused() {
         let endpoint = python_responder(
             r#"import sys, json
@@ -428,7 +432,9 @@ print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"ours": True
         assert_eq!(result, serde_json::json!({"ours": true}));
     }
 
+    // Spawns a `python3` responder: Unix-only.
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_response_that_does_not_claim_jsonrpc_20_is_refused() {
         let endpoint = python_responder(
             r#"import sys, json
@@ -442,7 +448,9 @@ print(json.dumps({"id": request["id"], "result": {"version": "1.0"}}))
         assert!(error.to_string().contains("JSON-RPC"), "{error}");
     }
 
+    // Spawns a `python3` responder: Unix-only.
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_silent_server_times_out_rather_than_hanging() {
         let endpoint = python_responder("import time\ntime.sleep(60)\n");
         let mut transport = Transport::stdio(&endpoint).expect("spawn");
@@ -453,7 +461,9 @@ print(json.dumps({"id": request["id"], "result": {"version": "1.0"}}))
         assert!(start.elapsed() < Duration::from_secs(10), "the deadline bounded the wait");
     }
 
+    // Spawns a `python3` responder: Unix-only.
     #[tokio::test]
+    #[cfg(unix)]
     async fn an_oversized_line_is_refused_not_buffered() {
         let endpoint = python_responder(
             r#"import sys, json

@@ -189,7 +189,9 @@ fn shell_words(line: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use supra_types::Event;
-    use supra_types::{SessionId, TurnId};
+    use supra_types::TurnId;
+    #[cfg(unix)]
+    use supra_types::SessionId;
 
     fn context() -> HookContext {
         HookContext { event: Event::TurnStarted { turn: TurnId::generate() }, turn_count: 3 }
@@ -231,7 +233,9 @@ mod tests {
         assert!(matches!(error, Err(HookError::Command(_))), "{error:?}");
     }
 
+    // Fires a real `sh -c` hook: Unix-only, since `sh` is not on Windows.
     #[test]
+    #[cfg(unix)]
     fn a_hook_does_not_inherit_the_host_environment() {
         // CARGO is set in the test harness's own environment; the hook
         // must not see it. The command exits 7 when the variable leaked.
@@ -241,7 +245,9 @@ mod tests {
         assert_eq!(outcome, HookOutcome::Continue);
     }
 
+    // Fires a real `python3` responder: Unix-only.
     #[test]
+    #[cfg(unix)]
     fn a_running_hook_sees_the_event_and_the_point() {
         let mut registry = Registry::new();
         registry
@@ -254,7 +260,9 @@ mod tests {
         assert_eq!(outcome, HookOutcome::Continue);
     }
 
+    // `true` and `sh -c` are Unix commands: Unix-only.
     #[test]
+    #[cfg(unix)]
     fn exit_42_stops_and_zero_continues() {
         let mut registry = Registry::new();
         registry.register_named("turn-start", "true").expect("register");
@@ -272,7 +280,9 @@ mod tests {
         }
     }
 
+    // `sh -c` and `true` are Unix commands: Unix-only.
     #[test]
+    #[cfg(unix)]
     fn a_failing_hook_reports_but_does_not_stop_the_others() {
         let mut registry = Registry::new();
         registry.register_named("turn-start", "sh -c 'exit 1'").expect("register");
@@ -296,7 +306,9 @@ mod tests {
         assert_eq!(outcome, HookOutcome::Continue);
     }
 
+    // Fires a real `python3` responder: Unix-only.
     #[test]
+    #[cfg(unix)]
     fn the_payload_is_real_event_json() {
         let mut registry = Registry::new();
         registry
