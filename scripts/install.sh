@@ -40,7 +40,21 @@ url="https://github.com/$REPO/releases/download/${VERSION}"
 for file in "$archive" "$manifest" "$signature"; do
     curl -fsSLO "$url/$file"
 done
-printf '%s\n' "$PUBKEY" > supra.pub
+# minisign refuses a bare key: the public-key file is a comment line followed by
+# the base64 key. Accept either spelling and normalize to the two-line form.
+if [[ "$PUBKEY" == "untrusted comment:"* ]]; then
+    printf '%s\n' "$PUBKEY" > supra.pub
+else
+    key_id=$(python3 - "$PUBKEY" <<'PY'
+import base64, sys
+raw = base64.b64decode("".join(sys.argv[1].split()), validate=True)
+if len(raw) != 42:
+    raise SystemExit("not a minisign public key")
+print(raw[2:10].hex().upper())
+PY
+) || { echo "install: SUPRA_PUBKEY is not a minisign public key" >&2; exit 1; }
+    printf 'untrusted comment: minisign public key %s\n%s\n' "$key_id" "$PUBKEY" > supra.pub
+fi
 minisign -Vm "$manifest" -p supra.pub -x "$signature" || { echo "install: manifest signature FAILED" >&2; exit 1; }
 
 python3 - "$manifest" "$archive" "${VERSION#v}" "$target" <<'PY'

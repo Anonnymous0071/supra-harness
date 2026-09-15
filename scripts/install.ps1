@@ -50,7 +50,20 @@ try {
     # 2. If a minisign binary is present, verify the manifest signature.
     $ms = Get-Command minisign -ErrorAction SilentlyContinue
     if ($ms) {
-        Set-Content -Path (Join-Path $tmp "supra.pub") -Value $PubKey -NoNewline
+        # minisign refuses a bare key: the public-key file is a comment line plus
+        # the base64 key. Accept either spelling and normalize to the two-line form.
+        $pubFile = if ($PubKey -match '^untrusted comment:') {
+            $PubKey
+        }
+        else {
+            try { $rawKey = [System.Convert]::FromBase64String(($PubKey -replace '\s', '')) }
+            catch { Fail "SUPRA_PUBKEY is not a minisign public key" }
+            if ($rawKey.Length -ne 42) { Fail "SUPRA_PUBKEY is not a minisign public key" }
+            $keyId = ([System.BitConverter]::ToString($rawKey[2..9])).Replace("-", "")
+            "untrusted comment: minisign public key $keyId`n$PubKey"
+        }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText((Join-Path $tmp "supra.pub"), ($pubFile.TrimEnd("`r", "`n") + "`n"), $utf8)
         & minisign -Vm (Join-Path $tmp $manifest) -p (Join-Path $tmp "supra.pub") -x (Join-Path $tmp $signature) 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { Fail "manifest signature verification FAILED" }
         Write-Host "install: manifest signature verified"

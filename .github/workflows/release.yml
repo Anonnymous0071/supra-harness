@@ -197,11 +197,11 @@ jobs:
 
             ```sh
             # Linux:
-            curl -fsSL "https://raw.githubusercontent.com/Anonnymous0071/supra-harness/${{ needs.preflight.outputs.tag }}/scripts/install.sh" | SUPRA_VERSION="${{ needs.preflight.outputs.tag }}" SUPRA_PUBKEY='<published minisign public key>' bash
+            curl -fsSL "https://raw.githubusercontent.com/Anonnymous0071/supra-harness/${{ needs.preflight.outputs.tag }}/scripts/install.sh" | SUPRA_VERSION="${{ needs.preflight.outputs.tag }}" SUPRA_PUBKEY='RWQp+dJ2ZJWAdRuh+T1KGgZH5ctMahJ3Uyh35QT1Yy74vY3r3wBmd80f' bash
             ```
             ```powershell
             # Windows (PowerShell):
-            $env:SUPRA_VERSION='${{ needs.preflight.outputs.tag }}'; $env:SUPRA_PUBKEY='<published minisign public key>'
+            $env:SUPRA_VERSION='${{ needs.preflight.outputs.tag }}'; $env:SUPRA_PUBKEY='RWQp+dJ2ZJWAdRuh+T1KGgZH5ctMahJ3Uyh35QT1Yy74vY3r3wBmd80f'
             irm "https://raw.githubusercontent.com/Anonnymous0071/supra-harness/${{ needs.preflight.outputs.tag }}/scripts/install.ps1" | iex
             ```
 
