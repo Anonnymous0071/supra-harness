@@ -92,13 +92,24 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang ninja-build musl-tools rpm
+          sudo apt-get install -y clang ninja-build musl-tools
           if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
             archive=x86_64-linux-musl-cross.tgz
             sha256=c5d410d9f82a4f24c549fe5d24f988f85b2679b452413a9f7e5f7b956f2fe7ea
             mkdir -p /tmp/musl-cross
             cd /tmp/musl-cross
-            curl -fsSLo "$archive" "https://musl.cc/$archive"
+            curl -fsSLo "$archive" "https://musl.cc/$archive" || true
+            # musl.cc is an external prebuilt-toolchain host that has timed out
+            # from runners; retry a few times before giving up.
+            for attempt in 1 2 3 4; do
+              if [[ -s "$archive" ]] && echo "$sha256  $archive" | sha256sum -c - >/dev/null 2>&1; then
+                break
+              fi
+              [[ "$attempt" -eq 4 ]] && { echo "musl.cc toolchain did not download in time" >&2; exit 1; }
+              echo "retrying musl.cc download (attempt $attempt)..." >&2
+              sleep 30
+              curl -fsSLo "$archive" "https://musl.cc/$archive" || true
+            done
             echo "$sha256  $archive" | sha256sum -c -
             sudo mkdir -p /opt/musl-cross
             sudo tar xzf "$archive" -C /opt/musl-cross --strip-components=1
@@ -138,27 +149,9 @@ jobs:
         shell: bash
         run: |
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct '${{ needs.preflight.outputs.tag }}')"
+          # Per-target signed archive only; OS packages (.deb/.rpm) are not
+          # shipped - install.sh installs from the verified .tar.gz.
           bash scripts/package.sh "${{ matrix.target }}" "${{ needs.preflight.outputs.tag }}"
-          if [[ "${{ matrix.target }}" == *linux* ]]; then
-            bash scripts/package-os.sh "${{ matrix.target }}" "${{ needs.preflight.outputs.tag }}"
-          fi
-
-      - name: Validate native Linux packages
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          dpkg-deb --info dist/*.deb >/dev/null
-          dpkg-deb --contents dist/*.deb | grep -q './usr/bin/supra$'
-          dpkg-deb --contents dist/*.deb | grep -q './usr/share/doc/supra/changelog.gz$'
-          dpkg-deb --contents dist/*.deb | grep -q './usr/share/doc/supra/copyright$'
-          rpmdb="$RUNNER_TEMP/supra-rpmdb"
-          mkdir -p "$rpmdb"
-          rpm --dbpath "$rpmdb" --initdb
-          rpm --dbpath "$rpmdb" --checksig dist/*.rpm
-          rpm --dbpath "$rpmdb" -qip dist/*.rpm >/dev/null
-          rpm --dbpath "$rpmdb" -qlp dist/*.rpm | grep -qx '/usr/bin/supra'
-          rpm --dbpath "$rpmdb" -qlp dist/*.rpm | grep -qx '/usr/share/doc/supra/CHANGELOG.md'
-          rpm --dbpath "$rpmdb" -qlp dist/*.rpm | grep -qx '/usr/share/licenses/supra/LICENSE-APACHE'
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -233,7 +226,7 @@ jobs:
 
             Or grab the per-target `.tar.gz`, matching `.manifest.json`, and
             `.manifest.json.minisig`; the required signature binds the exact archive
-            and its sole executable member. `.deb`/`.rpm` are also available on Linux.
-            The Homebrew formula is published separately after its version and SHA-256
-            values have been updated from `SHA256SUMS`. Build from source with the
-            tag-pinned checkout instructions in the README.
+            and its sole executable member. The Homebrew formula is published
+            separately after its version and SHA-256 values have been updated from
+            `SHA256SUMS`. Build from source with the tag-pinned checkout
+            instructions in the README.
